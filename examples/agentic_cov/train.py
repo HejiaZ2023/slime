@@ -4,12 +4,14 @@ Usage (in place of ``python train.py`` in slime's docs):
 
     python -m examples.agentic_cov.train \
         --rollout-function-path examples.agentic_cov.rollout.generate_rollout \
-        --eval-function-path    examples.agentic_cov.rollout.generate_rollout \
+        --eval-function-path    examples.agentic_cov.rollout.eval_rollout \
         --data-source-path      examples.agentic_cov.data_source.LlmCovDataSource \
         --num-agentic-rounds 2 \
         --eval-num-agentic-rounds 1 \
-        --llm4cov-dataset-name  hez2024/cvdp_ecov_eval \
-        --llm4cov-dataset-split train \
+        --llm4cov-dataset-name       zhuyaoyu/CodeV-R1-dataset \
+        --llm4cov-dataset-split      train \
+        --llm4cov-eval-dataset-name  hez2024/cvdp_ecov_eval \
+        --llm4cov-eval-dataset-split eval \
         --eda-server            paladin_centos \
         --eda-repo-dir          /workspace/llm4cov_eda \
         --advantage-estimator grpo \
@@ -41,14 +43,26 @@ def add_agentic_args(parser):
     parser.add_argument(
         "--llm4cov-dataset-name",
         type=str,
-        default="hez2024/cvdp_ecov_eval",
-        help="HF dataset name passed to llm4cov.datasets.load.load_dataset_by_name.",
+        default="zhuyaoyu/CodeV-R1-dataset",
+        help="HF dataset name for training prompts (llm4cov.datasets.load.load_dataset_by_name).",
     )
     parser.add_argument(
         "--llm4cov-dataset-split",
         type=str,
         default="train",
-        help="Split name for the llm4cov dataset.",
+        help="Split name for the training dataset.",
+    )
+    parser.add_argument(
+        "--llm4cov-eval-dataset-name",
+        type=str,
+        default="hez2024/cvdp_ecov_eval",
+        help="HF dataset name for evaluation prompts. Loaded independently from training.",
+    )
+    parser.add_argument(
+        "--llm4cov-eval-dataset-split",
+        type=str,
+        default="eval",
+        help="Split name for the eval dataset.",
     )
     parser.add_argument(
         "--eda-server",

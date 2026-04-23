@@ -1,11 +1,19 @@
 """Multi-round agentic GRPO rollout for llm4cov testbench generation.
 
-Contract:
-* Each rollout step processes ``rollout_batch_size // K`` prompts where ``K``
-  comes from ``--num-agentic-rounds`` (or ``--eval-num-agentic-rounds``).
-* For each prompt we run ``K`` rounds in sequence. Within each round we sample
-  a group of ``n_samples_per_prompt`` completions, score each one with the
-  llm4cov EDA reward, and pick one winner:
+Two entry points — slime wires each independently:
+
+* ``generate_rollout``  → ``--rollout-function-path`` (training). Pulls prompts
+  from the ``LlmCovDataSource`` instance that slime already built from
+  ``--llm4cov-dataset-name`` / ``--llm4cov-dataset-split``.
+* ``eval_rollout``      → ``--eval-function-path`` (evaluation). Loads its own
+  llm4cov dataset directly from ``--llm4cov-eval-dataset-name`` /
+  ``--llm4cov-eval-dataset-split`` and iterates over *all* eval prompts —
+  ``rollout_batch_size`` does not constrain eval.
+
+Both paths share the same K-round core:
+
+* For each prompt we sample a group of ``n_samples_per_prompt`` completions,
+  score each with the llm4cov EDA reward, and pick one winner:
     - training: the *worst* scoring sample drives the next round's prompt
       (focus training on the branch the model is most wrong about)
     - evaluation: the *best* scoring sample drives the next round.
@@ -35,11 +43,14 @@ from slime.rollout.sglang_rollout import GenerateState, generate
 from slime.utils.async_utils import run
 from slime.utils.types import Sample
 
+from .dataset import build_samples_from_llm4cov
 from .reward import compute_reward
 
 logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+_EVAL_SAMPLE_CACHE: dict[tuple, list[Sample]] = {}
 
 
 def _strip_think(text: str) -> str:
@@ -59,7 +70,7 @@ def _build_tool_feedback(reward: float) -> str:
     coverage = reward - 1.0
     return (
         "EDA tool feedback:\n"
-        f"- status: success\n"
+        "- status: success\n"
         f"- overall coverage: {coverage * 100:.2f}%\n"
         "This is the previous attempt. Try to push coverage higher by exercising "
         "more RTL paths. Same output format (filename line + fenced systemverilog block)."
@@ -140,7 +151,6 @@ async def _rollout_one_prompt(
 
     base_messages = list(initial_group[0].metadata.get("initial_messages") or [])
 
-    # Round 0 uses the already-prepared group (prompt already chat-templated by data source).
     rounds_output: list[list[Sample]] = []
     current_group = initial_group
     for round_idx in range(num_rounds):
@@ -185,39 +195,34 @@ async def _rollout_one_prompt(
     return rounds_output
 
 
+# ---------------------------------------------------------------------------
+# Training entry point
+# ---------------------------------------------------------------------------
+
+
 async def _generate_rollout_async(
-    args: Namespace,
-    rollout_id: int,
-    data_source: Any,
-    evaluation: bool,
-) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
+    args: Namespace, rollout_id: int, data_source: Any
+) -> RolloutFnTrainOutput:
     state = GenerateState(args)
-
-    if evaluation:
-        num_rounds = int(getattr(args, "eval_num_agentic_rounds", 1) or 1)
-    else:
-        num_rounds = int(args.num_agentic_rounds)
-
+    num_rounds = int(args.num_agentic_rounds)
     if num_rounds < 1:
-        raise ValueError(f"num_agentic_rounds must be >= 1, got {num_rounds}")
+        raise ValueError(f"--num-agentic-rounds must be >= 1, got {num_rounds}")
 
     batch_size = args.rollout_batch_size
     if batch_size % num_rounds != 0:
         raise ValueError(
-            f"rollout_batch_size ({batch_size}) must be divisible by num_agentic_rounds "
-            f"({num_rounds}) so that K rounds * N prompts == batch_size."
+            f"rollout_batch_size ({batch_size}) must be divisible by num-agentic-rounds "
+            f"({num_rounds}) so K rounds * num_prompts == rollout_batch_size."
         )
     num_prompts = batch_size // num_rounds
 
-    # We pull num_prompts prompts; each returns num_rounds groups.
     initial_groups = data_source.get_samples(num_prompts)
     assert len(initial_groups) == num_prompts, (
         f"data_source returned {len(initial_groups)} prompt-groups, expected {num_prompts}"
     )
 
-    # Allocators for fresh group_index / sample_index for rounds > 0.
-    # The data_source already stamped the round-0 groups; we only need new ids
-    # for the rounds we construct inline.
+    # Share allocators with the data_source so group_index / sample_index values
+    # remain unique across rollouts.
     next_group_index = {"v": data_source.sample_group_index}
     next_sample_index = {"v": data_source.sample_index}
 
@@ -240,49 +245,21 @@ async def _generate_rollout_async(
             initial_group=group,
             num_rounds=num_rounds,
             sampling_params=sampling_params,
-            evaluation=evaluation,
+            evaluation=False,
             group_index_allocator=allocate_group_index,
             sample_index_allocator=allocate_sample_indices,
         )
 
-    all_rounds_per_prompt = await asyncio.gather(*[_one_prompt(g) for g in initial_groups])
+    all_rounds = await asyncio.gather(*[_one_prompt(g) for g in initial_groups])
 
-    # Persist the updated allocators back on the data_source so subsequent
-    # rollouts continue with non-colliding ids.
     data_source.sample_group_index = next_group_index["v"]
     data_source.sample_index = next_sample_index["v"]
 
-    # Flatten: list[prompt][round] -> list[group] in prompt-major round-major order.
-    flat_groups: list[list[Sample]] = []
-    for rounds_list in all_rounds_per_prompt:
-        flat_groups.extend(rounds_list)
-
-    total_groups = len(flat_groups)
-    assert total_groups == batch_size, (
-        f"Produced {total_groups} groups, expected rollout_batch_size={batch_size}."
+    flat_groups = [g for rounds_list in all_rounds for g in rounds_list]
+    assert len(flat_groups) == batch_size, (
+        f"Produced {len(flat_groups)} groups, expected rollout_batch_size={batch_size}."
     )
-
-    if evaluation:
-        # Match slime's eval contract: dict of per-dataset results.
-        flat_samples: list[Sample] = [s for grp in flat_groups for s in grp]
-        reward_key = args.eval_reward_key or args.reward_key
-        dataset_name = getattr(args, "llm4cov_dataset_name", "llm4cov")
-        return RolloutFnEvalOutput(
-            data={
-                dataset_name: {
-                    "rewards": [
-                        s.reward if not reward_key else s.reward[reward_key] for s in flat_samples
-                    ],
-                    "truncated": [s.status == Sample.Status.TRUNCATED for s in flat_samples],
-                    "samples": flat_samples,
-                }
-            }
-        )
-
-    # Sort groups by their first sample's index so downstream code sees a
-    # deterministic, index-ordered batch.
     flat_groups.sort(key=lambda g: g[0].index if g and g[0].index is not None else 0)
-
     return RolloutFnTrainOutput(samples=flat_groups, metrics=None)
 
 
@@ -292,5 +269,124 @@ def generate_rollout(
     data_source: Any,
     evaluation: bool = False,
 ) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
-    """Custom rollout entry point wired via ``--rollout-function-path``."""
-    return run(_generate_rollout_async(args, rollout_id, data_source, evaluation))
+    """Training entry point. Wired via ``--rollout-function-path``.
+
+    ``evaluation`` is part of slime's contract but always ``False`` here — eval
+    is dispatched to :func:`eval_rollout` via ``--eval-function-path``.
+    """
+    if evaluation:
+        # Defensive: if a user wires this same function as --eval-function-path,
+        # fall through to the eval entry point rather than polluting train data.
+        return eval_rollout(args, rollout_id, data_source, evaluation=True)
+    return run(_generate_rollout_async(args, rollout_id, data_source))
+
+
+# ---------------------------------------------------------------------------
+# Evaluation entry point
+# ---------------------------------------------------------------------------
+
+
+def _get_or_load_eval_samples(args: Namespace, state: GenerateState) -> list[Sample]:
+    cache_key = (
+        args.llm4cov_eval_dataset_name,
+        args.llm4cov_eval_dataset_split,
+        args.hf_checkpoint,
+        bool(args.apply_chat_template),
+    )
+    if cache_key not in _EVAL_SAMPLE_CACHE:
+        _EVAL_SAMPLE_CACHE[cache_key] = build_samples_from_llm4cov(
+            args=args,
+            tokenizer=state.tokenizer,
+            dataset_name=args.llm4cov_eval_dataset_name,
+            split=args.llm4cov_eval_dataset_split,
+        )
+    return _EVAL_SAMPLE_CACHE[cache_key]
+
+
+async def _eval_rollout_async(args: Namespace, rollout_id: int) -> RolloutFnEvalOutput:
+    state = GenerateState(args)
+    num_rounds = int(getattr(args, "eval_num_agentic_rounds", 1) or 1)
+    if num_rounds < 1:
+        raise ValueError(f"--eval-num-agentic-rounds must be >= 1, got {num_rounds}")
+
+    eval_prompts = _get_or_load_eval_samples(args, state)
+    n_per_prompt = max(
+        1,
+        int(getattr(args, "n_samples_per_eval_prompt", 0) or args.n_samples_per_prompt or 1),
+    )
+
+    # Local allocators — eval ids live in their own namespace so they can't
+    # collide with the training data_source counters.
+    next_gi = {"v": 0}
+    next_si = {"v": 0}
+
+    def alloc_gi() -> int:
+        v = next_gi["v"]
+        next_gi["v"] += 1
+        return v
+
+    def alloc_si(n: int) -> int:
+        s = next_si["v"]
+        next_si["v"] += n
+        return s
+
+    # Seed round-0 groups for every eval prompt.
+    initial_groups: list[list[Sample]] = []
+    for base in eval_prompts:
+        gi = alloc_gi()
+        start = alloc_si(n_per_prompt)
+        group = []
+        for k in range(n_per_prompt):
+            clone = copy.deepcopy(base)
+            clone.group_index = gi
+            clone.index = start + k
+            clone.session_id = str(uuid.uuid4())
+            group.append(clone)
+        initial_groups.append(group)
+
+    sampling_params = state.sampling_params.copy()
+
+    async def _one(group: list[Sample]) -> list[list[Sample]]:
+        return await _rollout_one_prompt(
+            args=args,
+            state=state,
+            initial_group=group,
+            num_rounds=num_rounds,
+            sampling_params=sampling_params,
+            evaluation=True,
+            group_index_allocator=alloc_gi,
+            sample_index_allocator=alloc_si,
+        )
+
+    all_rounds = await asyncio.gather(*[_one(g) for g in initial_groups])
+    flat_groups = [g for rounds_list in all_rounds for g in rounds_list]
+    flat_samples = [s for g in flat_groups for s in g]
+    flat_samples.sort(key=lambda s: s.index if s.index is not None else 0)
+
+    reward_key = args.eval_reward_key or args.reward_key
+    return RolloutFnEvalOutput(
+        data={
+            args.llm4cov_eval_dataset_name: {
+                "rewards": [
+                    s.reward if not reward_key else s.reward[reward_key] for s in flat_samples
+                ],
+                "truncated": [s.status == Sample.Status.TRUNCATED for s in flat_samples],
+                "samples": flat_samples,
+            }
+        }
+    )
+
+
+def eval_rollout(
+    args: Namespace,
+    rollout_id: int,
+    data_source: Any,
+    evaluation: bool = True,
+) -> RolloutFnEvalOutput:
+    """Eval entry point. Wired via ``--eval-function-path``.
+
+    ``data_source`` is accepted for slime's signature but ignored — eval
+    prompts come from ``--llm4cov-eval-dataset-{name,split}``.
+    """
+    del data_source
+    return run(_eval_rollout_async(args, rollout_id))

@@ -1,0 +1,3 @@
+[submodule "third_party/llm4cov_oss"]
+	path = third_party/llm4cov_oss
+	url = https://github.com/HejiaZ2023/llm4cov_oss.git
