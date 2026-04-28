@@ -1,0 +1,193 @@
+#!/bin/bash
+# Multi-round agentic GRPO training for Qwen3-4B on 4x H200 (141 GB HBM).
+# - DAPO-style: asymmetric clipping (low=0.2, high=0.28) + sequence-normalized
+#   loss (--calculate-per-token-loss). NO dynamic sampling.
+# - Collocated rollout + training (--colocate).
+# - No eval (no --eval-interval / --eval-function-path).
+# - No KL, no weight decay.
+# - 40k total context: rollout response 32k, max packed train tokens 24k/GPU.
+#
+# Run from the slime repo root (e.g. /root/slime in the docker image):
+#   bash examples/agentic_cov/run-qwen3-4B-4xH200-noeval.sh
+#
+# Required env:
+#   EDA_SERVER     SSH alias of the llm4cov_eda worker
+#   EDA_REPO_DIR   path to the llm4cov_eda checkout on that host
+# Optional overrides documented in examples/agentic_cov/README.md.
+
+set -ex
+
+# clean up stale ray / sglang / python from prior runs
+pkill -9 sglang 2>/dev/null || true
+sleep 2
+ray stop --force 2>/dev/null || true
+pkill -9 ray 2>/dev/null || true
+pkill -9 python 2>/dev/null || true
+sleep 2
+
+export PYTHONBUFFERED=1
+
+# -------------------- topology --------------------
+NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
+
+DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')
+NUM_GPUS=${NUM_GPUS:-${DETECTED_GPUS:-4}}
+if [ "$NUM_GPUS" -lt 4 ]; then
+    echo "ERROR: this recipe targets 4 GPUs (TP=2, CP=2). Got NUM_GPUS=$NUM_GPUS." >&2
+    exit 1
+fi
+
+# -------------------- required external state --------------------
+: "${EDA_SERVER:?Set EDA_SERVER to the SSH alias of the llm4cov_eda worker}"
+: "${EDA_REPO_DIR:?Set EDA_REPO_DIR to the path of llm4cov_eda on that worker}"
+
+HF_CKPT=${HF_CKPT:-/root/Qwen3-4B}
+REF_LOAD=${REF_LOAD:-/root/Qwen3-4B_torch_dist}
+SAVE_DIR=${SAVE_DIR:-/root/Qwen3-4B_slime}
+LLM4COV_DATASET=${LLM4COV_DATASET:-zhuyaoyu/CodeV-R1-dataset}
+LLM4COV_SPLIT=${LLM4COV_SPLIT:-train}
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+SLIME_ROOT="$(cd "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
+if [ "$(pwd)" != "${SLIME_ROOT}" ]; then
+    echo "ERROR: run this script from the slime repo root (${SLIME_ROOT}), got $(pwd)" >&2
+    exit 1
+fi
+source "${SLIME_ROOT}/scripts/models/qwen3-4B.sh"
+
+# -------------------- checkpoint paths --------------------
+CKPT_ARGS=(
+   --hf-checkpoint "${HF_CKPT}"
+   --ref-load      "${REF_LOAD}"
+   --load          "${SAVE_DIR}"
+   --save          "${SAVE_DIR}"
+   --save-interval 50
+)
+
+# -------------------- rollout / batching --------------------
+# group_size = n_samples_per_prompt = 4
+# global_batch_size = 16  ->  rollout_batch_size = 16 / 4 = 4
+# 300 steps total -> --num-rollout 300 (default num_steps_per_rollout=1)
+# response 32k + prompt budget ~8k = 40k total context
+ROLLOUT_ARGS=(
+   --rollout-shuffle
+   --num-rollout            300
+   --rollout-batch-size     4
+   --n-samples-per-prompt   4
+   --rollout-max-response-len 32768
+   --rollout-temperature    1.0
+
+   --global-batch-size      16
+   --balance-data
+)
+
+# -------------------- llm4cov agentic config --------------------
+AGENTIC_ARGS=(
+   --rollout-function-path examples.agentic_cov.rollout.generate_rollout
+   --data-source-path      examples.agentic_cov.data_source.LlmCovDataSource
+   --num-agentic-rounds    2
+   --llm4cov-dataset-name  "${LLM4COV_DATASET}"
+   --llm4cov-dataset-split "${LLM4COV_SPLIT}"
+   --eda-server            "${EDA_SERVER}"
+   --eda-repo-dir          "${EDA_REPO_DIR}"
+)
+
+# -------------------- parallelism / memory --------------------
+# 4 GPUs split as TP=2 x CP=2 x PP=1. With CP=2 a 40k sequence is sharded
+# to ~20k tokens per CP rank; --max-tokens-per-gpu 24576 leaves headroom for
+# packing a few short sequences alongside one long one.
+PERF_ARGS=(
+   --tensor-model-parallel-size  2
+   --sequence-parallel
+   --pipeline-model-parallel-size 1
+   --context-parallel-size       2
+   --expert-model-parallel-size  1
+   --expert-tensor-parallel-size 1
+
+   --recompute-granularity full
+   --recompute-method      uniform
+   --recompute-num-layers  1
+
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu    24576
+)
+
+# -------------------- DAPO ----------------------
+# Asymmetric clipping + token-level (sequence-normalized) loss.
+# No dynamic sampling (--dynamic-sampling-filter-path is left unset).
+# No KL, no entropy bonus.
+GRPO_ARGS=(
+   --advantage-estimator     grpo
+   --calculate-per-token-loss
+   --use-kl-loss=false
+   --kl-loss-coef            0.0
+   --entropy-coef            0.0
+   --eps-clip                0.2
+   --eps-clip-high           0.28
+)
+
+# -------------------- optimizer --------------------
+OPTIMIZER_ARGS=(
+   --optimizer       adam
+   --lr              1e-6
+   --lr-decay-style  constant
+   --weight-decay    0.0
+   --adam-beta1      0.9
+   --adam-beta2      0.95
+)
+
+# -------------------- sglang (rollout engine) --------------------
+# 2 engines, each TP=2, on the same 4 GPUs as training (--colocate).
+SGLANG_ARGS=(
+   --rollout-num-gpus-per-engine 2
+   --sglang-mem-fraction-static  0.5
+)
+
+MISC_ARGS=(
+   --attention-dropout 0.0
+   --hidden-dropout    0.0
+   --accumulate-allreduce-grads-in-fp32
+   --attention-softmax-in-fp32
+   --attention-backend flash
+)
+
+WANDB_ARGS=(
+   # --use-wandb
+   # --wandb-project slime-llm4cov
+   # --wandb-group qwen3-4B-4xH200-noeval
+)
+
+# -------------------- launch --------------------
+export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+ray start --head \
+    --node-ip-address "${MASTER_ADDR}" \
+    --num-gpus "${NUM_GPUS}" \
+    --disable-usage-stats \
+    --dashboard-host=0.0.0.0 \
+    --dashboard-port=8265
+
+RUNTIME_ENV_JSON="{
+  \"env_vars\": {
+    \"PYTHONPATH\": \"/root/Megatron-LM/:/root/slime\",
+    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+  }
+}"
+
+ray job submit --address="http://127.0.0.1:8265" \
+    --runtime-env-json="${RUNTIME_ENV_JSON}" \
+    -- python3 -m examples.agentic_cov.train \
+    --actor-num-nodes 1 \
+    --actor-num-gpus-per-node "${NUM_GPUS}" \
+    --colocate \
+    "${MODEL_ARGS[@]}" \
+    "${CKPT_ARGS[@]}" \
+    "${ROLLOUT_ARGS[@]}" \
+    "${AGENTIC_ARGS[@]}" \
+    "${OPTIMIZER_ARGS[@]}" \
+    "${GRPO_ARGS[@]}" \
+    "${PERF_ARGS[@]}" \
+    "${SGLANG_ARGS[@]}" \
+    "${MISC_ARGS[@]}" \
+    "${WANDB_ARGS[@]}"
