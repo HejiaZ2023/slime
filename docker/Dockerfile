@@ -133,8 +133,8 @@ RUN if [ -f /root/slime/third_party/llm4cov_oss/pyproject.toml ]; then \
       pip install --no-deps -e /root/slime/third_party/llm4cov_oss && \
       pip install \
         'datasets>=4.4.1' \
-        'pydantic>=2.12.5' \
-        'transformers>=4.57.3' \
+        'pydantic>=2.0' \
+        'transformers>=4.40' \
         'tree-sitter>=0.25.2' \
         'tree-sitter-systemverilog>=0.3.1' \
         'jinja2>=3.1.6' \
