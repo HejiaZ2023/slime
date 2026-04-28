@@ -104,13 +104,17 @@ RUN git clone https://github.com/THUDM/slime.git /root/slime && \
     pip install -e . --no-deps
 
 # slime.patch — applied to the cloned slime source (editable install picks it up).
+# Copied from the build context so the upstream repo at SLIME_COMMIT does not need to
+# already contain the A100 patch directory.
+COPY docker/patch/${PATCH_VERSION}/slime.patch /tmp/slime.patch
 RUN cd /root/slime && \
     git update-index --refresh && \
-    git apply docker/patch/${PATCH_VERSION}/slime.patch --3way && \
+    git apply /tmp/slime.patch --3way && \
     if grep -R -n '^<<<<<<< ' .; then \
       echo "slime.patch failed to apply cleanly." && \
       exit 1; \
-    fi
+    fi && \
+    rm /tmp/slime.patch
 
 RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat && \
     pip install . --no-build-isolation
