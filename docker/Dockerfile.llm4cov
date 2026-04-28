@@ -1,0 +1,42 @@
+# Thin overlay: slimerl/slime base + our fork of slime + llm4cov_oss submodule.
+#
+# Use this instead of docker/Dockerfile when you only need the agentic_cov
+# additions on top of an already-published slimerl/slime image. ~5 min build,
+# <100 MB of new layer content vs the ~54 GB monolithic build.
+#
+# slimerl/slime:v0.2.4 already ships the same package set we need
+# (transformers 4.57.1, sglang 0.5.9, openai 2.6.1, pydantic 2.12.5, datasets
+# 4.5.0, flash-attn 2.7.4 + flash-attn-3, apex, TE 2.10, megatron-core,
+# sgl-router, all megatron sibling dirs). The only runtime additions for
+# llm4cov are tree-sitter + tree-sitter-systemverilog.
+
+ARG BASE_IMAGE_TAG=v0.2.4
+FROM slimerl/slime:${BASE_IMAGE_TAG}
+
+ARG SLIME_REPO_URL=https://github.com/HejiaZ2023/slime.git
+ARG SLIME_COMMIT=main
+
+# Replace upstream THUDM/slime checkout with our fork. --recurse-submodules
+# pulls third_party/llm4cov_oss as recorded in .gitmodules.
+RUN rm -rf /root/slime && \
+    git clone --recurse-submodules ${SLIME_REPO_URL} /root/slime && \
+    cd /root/slime && \
+    git checkout ${SLIME_COMMIT} && \
+    git submodule update --init --recursive && \
+    pip install --no-deps --no-build-isolation -e .
+
+# int4_qat extension is built against the slime source tree, so rebuild
+# against our fork's copy (kernel sources are identical to upstream today,
+# but this keeps the binary in sync if either side changes).
+RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat && \
+    pip install . --no-build-isolation
+
+# llm4cov_oss editable install; --no-deps preserves the carefully pinned
+# Megatron / TE / transformers / etc. from the base image. tree-sitter is the
+# only runtime dep not already satisfied.
+RUN pip install --no-deps -e /root/slime/third_party/llm4cov_oss && \
+    pip install 'tree-sitter>=0.25.2' 'tree-sitter-systemverilog>=0.3.1' && \
+    python -c 'from llm4cov.datasets.load import load_dataset_by_name; print("llm4cov import OK")'
+
+WORKDIR /root/slime
+CMD ["/bin/bash"]

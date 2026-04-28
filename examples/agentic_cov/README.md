@@ -14,36 +14,56 @@ reward via multi-round agentic GRPO.
 
 ## Build the docker image
 
-The image bundles slime, Megatron-LM, sglang, TransformerEngine, and the
-`third_party/llm4cov_oss` submodule (for `llm4cov.datasets`, `llm4cov.llm_query`,
-`llm4cov.eda_client`).
+There are two paths. Prefer the overlay unless you are bootstrapping from
+nothing — it is ~5 min vs ~50 min and yields a tiny push delta.
+
+### Overlay (recommended) — `docker/Dockerfile.llm4cov`
+
+Stacks our fork of slime + the llm4cov_oss submodule on top of an already
+published `slimerl/slime:vX.Y.Z` base, which ships the matching pin set
+(transformers 4.57.1, sglang 0.5.9, openai 2.6.1, pydantic 2.12.5,
+datasets 4.5.0, flash-attn 2/3, apex, TE, megatron-core, sgl-router).
 
 From the slime repo root:
 
 ```bash
-SLIME_REPO_URL=https://github.com/HejiaZ2023/slime.git
 SLIME_COMMIT=$(git rev-parse HEAD)        # or a fixed sha
 
-docker build -f docker/Dockerfile . \
-    --build-arg SLIME_REPO_URL="${SLIME_REPO_URL}" \
+docker build -f docker/Dockerfile.llm4cov . \
+    --build-arg BASE_IMAGE_TAG=v0.2.4 \
+    --build-arg SLIME_REPO_URL=https://github.com/HejiaZ2023/slime.git \
     --build-arg SLIME_COMMIT="${SLIME_COMMIT}" \
-    --build-arg HTTP_PROXY="$http_proxy" \
-    --build-arg HTTPS_PROXY="$https_proxy" \
-    --build-arg NO_PROXY="localhost,127.0.0.1" \
     -t slime-llm4cov:${SLIME_COMMIT::7}
 ```
 
-The build clones `${SLIME_REPO_URL}@${SLIME_COMMIT}` with
-`--recurse-submodules`, so the llm4cov_oss submodule pinned in `.gitmodules`
-is checked out and `pip install -e`-installed inside the image.
+Total of ~340 MB of new layer content (replacement slime tree, int4_qat
+kernel rebuild, llm4cov_oss editable install, tree-sitter wheels). Bump
+`BASE_IMAGE_TAG` when rebasing to a newer slime release.
+
+### From scratch — `docker/Dockerfile`
+
+Used by the publishing pipeline to produce the `slimerl/slime` images the
+overlay sits on. Full ~31-layer rebuild including flash-attn, apex,
+TransformerEngine, sglang patches.
+
+```bash
+docker build -f docker/Dockerfile . \
+    --build-arg SLIME_REPO_URL=https://github.com/HejiaZ2023/slime.git \
+    --build-arg SLIME_COMMIT=$(git rev-parse HEAD) \
+    --build-arg HTTP_PROXY="$http_proxy" \
+    --build-arg HTTPS_PROXY="$https_proxy" \
+    --build-arg NO_PROXY="localhost,127.0.0.1" \
+    -t slime-llm4cov:full
+```
 
 The `transformers`, `pydantic`, `openai`, etc. floors used during the llm4cov
 install are kept low enough that pip does not bump `transformers` away from
 the 4.57.1 that `sglang==0.5.9` pins exactly.
 
-For NVIDIA DGX Spark (GB10/sm_121a, arm64) use `docker/Dockerfile.gb10`
-instead — it rebases on the NGC vLLM container and still copies the local
-slime tree (no `SLIME_REPO_URL`/`SLIME_COMMIT` build args).
+### NVIDIA DGX Spark (GB10/sm_121a, arm64)
+
+Use `docker/Dockerfile.gb10` — it rebases on the NGC vLLM container and
+copies the local slime tree (no `SLIME_REPO_URL`/`SLIME_COMMIT` build args).
 
 ## Run a container
 
