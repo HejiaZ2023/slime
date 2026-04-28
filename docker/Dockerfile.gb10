@@ -197,6 +197,23 @@ RUN cd /root/slime \
 RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat \
     && pip install --no-build-isolation --no-deps .
 
+# llm4cov_oss (optional): used by examples/agentic_cov. Install only when the
+# submodule is present in the build context (via `git submodule update --init`
+# before `docker build`). No-op for plain upstream slime checkouts.
+RUN if [ -f /root/slime/third_party/llm4cov_oss/pyproject.toml ]; then \
+      pip install --no-deps -e /root/slime/third_party/llm4cov_oss && \
+      pip install --no-deps \
+        'datasets>=4.4.1' \
+        'pydantic>=2.12.5' \
+        'transformers>=4.57.3' \
+        'tree-sitter>=0.25.2' \
+        'tree-sitter-systemverilog>=0.3.1' \
+        'jinja2>=3.1.6' \
+        'tqdm>=4.67.1' \
+        'hf-transfer>=0.1.9' && \
+      python -c 'from llm4cov.datasets.load import load_dataset_by_name; print("llm4cov import OK")'; \
+    fi
+
 WORKDIR /root/slime
 
 # Sanity: load the full arg parser on container build

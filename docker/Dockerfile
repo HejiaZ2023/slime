@@ -111,11 +111,34 @@ fi
 
 # ====================================== Install main package ============================================
 
+ARG SLIME_REPO_URL=https://github.com/THUDM/slime.git
 ARG SLIME_COMMIT=main
-RUN git clone https://github.com/THUDM/slime.git /root/slime && \
+RUN git clone --recurse-submodules ${SLIME_REPO_URL} /root/slime && \
     cd /root/slime && \
     git checkout ${SLIME_COMMIT} && \
+    git submodule update --init --recursive && \
     pip install -e . --no-deps
 
 RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat && \
     pip install . --no-build-isolation
+
+# ====================================== llm4cov_oss (optional) ============================================
+# Installed when the slime checkout includes the llm4cov_oss submodule under
+# third_party/ (i.e. building from a fork that vendors it, like the
+# examples/agentic_cov branch). On upstream THUDM/slime this is a no-op.
+#
+# `--no-deps` keeps Megatron / TransformerEngine pins intact; we then explicitly
+# install only the runtime deps that examples/agentic_cov actually imports.
+RUN if [ -f /root/slime/third_party/llm4cov_oss/pyproject.toml ]; then \
+      pip install --no-deps -e /root/slime/third_party/llm4cov_oss && \
+      pip install \
+        'datasets>=4.4.1' \
+        'pydantic>=2.12.5' \
+        'transformers>=4.57.3' \
+        'tree-sitter>=0.25.2' \
+        'tree-sitter-systemverilog>=0.3.1' \
+        'jinja2>=3.1.6' \
+        'tqdm>=4.67.1' \
+        'hf-transfer>=0.1.9' && \
+      python -c 'from llm4cov.datasets.load import load_dataset_by_name; print("llm4cov import OK")'; \
+    fi
