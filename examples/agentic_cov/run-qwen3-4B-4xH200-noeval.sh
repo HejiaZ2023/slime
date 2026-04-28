@@ -116,11 +116,11 @@ PERF_ARGS=(
 # -------------------- DAPO ----------------------
 # Asymmetric clipping + token-level (sequence-normalized) loss.
 # No dynamic sampling (--dynamic-sampling-filter-path is left unset).
-# No KL, no entropy bonus.
+# No KL (omit --use-kl-loss; the flag is store_true with default False),
+# no entropy bonus.
 GRPO_ARGS=(
    --advantage-estimator     grpo
    --calculate-per-token-loss
-   --use-kl-loss=false
    --kl-loss-coef            0.0
    --entropy-coef            0.0
    --eps-clip                0.2

@@ -16,8 +16,8 @@ Usage (in place of ``python train.py`` in slime's docs):
         --eda-repo-dir          /workspace/llm4cov_eda \
         --advantage-estimator grpo \
         --calculate-per-token-loss \
-        --use-kl-loss=false \
         ...  # + the usual slime/megatron/sglang flags
+        # (omit --use-kl-loss to disable KL; it is store_true, default False)
 """
 
 from __future__ import annotations
