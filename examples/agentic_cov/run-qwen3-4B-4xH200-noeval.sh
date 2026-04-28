@@ -78,6 +78,10 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len 32768
    --rollout-temperature    1.0
 
+   # llm4cov dataset is built from chat messages; apply_chat_template
+   # converts list[dict] -> str so sglang's tokenizer.encode accepts it.
+   --apply-chat-template
+
    --global-batch-size      16
    --balance-data
 )
