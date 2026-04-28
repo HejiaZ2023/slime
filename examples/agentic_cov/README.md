@@ -92,9 +92,64 @@ The `-v $HOME/.ssh:/root/.ssh:ro` mount lets the rollout's
 either pre-populate `known_hosts` in your mount or set
 `StrictHostKeyChecking=accept-new` in `~/.ssh/config`.
 
+## First-time setup: starting from a HuggingFace model
+
+`--hf-checkpoint` is fed straight into `AutoConfig.from_pretrained`, which
+accepts either a local dir or a HF model ID (auto-downloads to
+`~/.cache/huggingface/`). `--ref-load` is different — it points at a
+*Megatron `torch_dist`* checkpoint, which doesn't exist on HuggingFace and
+must be produced once via `tools/convert_hf_to_torch_dist.py`.
+
+Worked example: start from `hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0` (an SFT'd
+Qwen3-4B-Instruct-2507; rotary base 5,000,000 — different from the base
+Qwen3-4B's 1,000,000).
+
+```bash
+cd /root/slime
+export HF_TOKEN=...   # if the repo is gated, otherwise skip
+
+MODEL_ID=hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0
+LOCAL_DIR=/root/LLM4Cov-Qwen3-4B-SFT-Stage0
+
+# 1. Download HF weights (you can also skip this — passing the HF ID
+#    directly to step 2/3 would auto-cache to ~/.cache/huggingface, but an
+#    explicit local dir is faster on container restarts).
+huggingface-cli download "${MODEL_ID}" --local-dir "${LOCAL_DIR}"
+
+# 2. One-time conversion to Megatron torch_dist. Pass MODEL_ARGS so vocab,
+#    layer count, hidden size etc. line up with the slime/Megatron loader.
+#    --rotary-base 5000000 overrides the default in scripts/models/qwen3-4B.sh
+#    to match the Qwen3-4B-Instruct-2507 base this model was SFT'd from.
+source scripts/models/qwen3-4B.sh
+PYTHONPATH=/root/Megatron-LM torchrun --nproc_per_node 1 \
+    tools/convert_hf_to_torch_dist.py \
+    "${MODEL_ARGS[@]}" \
+    --hf-checkpoint "${LOCAL_DIR}" \
+    --rotary-base 5000000 \
+    --save "${LOCAL_DIR}_torch_dist"
+
+# 3. Launch training. MODEL_ARGS_ROTARY_BASE flows into the same
+#    --rotary-base flag the run script sources from qwen3-4B.sh.
+MODEL_ARGS_ROTARY_BASE=5000000 \
+HF_CKPT="${LOCAL_DIR}" \
+REF_LOAD="${LOCAL_DIR}_torch_dist" \
+SAVE_DIR="${LOCAL_DIR}_slime" \
+EDA_SERVER=paladin_centos \
+EDA_REPO_DIR=/workspace/llm4cov_eda \
+bash examples/agentic_cov/run-qwen3-4B-4xH200-noeval.sh
+```
+
+The conversion in step 2 takes ~5 min on a single H100/H200 and produces a
+~9 GB `*_torch_dist/` directory. Re-run only when you want to start from a
+different base checkpoint.
+
+For a base Qwen3-4B (no instruct tune) the conversion line drops the
+`--rotary-base` override and the launch command drops the
+`MODEL_ARGS_ROTARY_BASE` env var.
+
 ## Run the training script
 
-Inside the container:
+For subsequent runs with the same starting checkpoint, just:
 
 ```bash
 cd /root/slime
