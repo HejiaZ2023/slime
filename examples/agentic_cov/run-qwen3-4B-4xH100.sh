@@ -78,6 +78,9 @@ CKPT_ARGS=(
    --load          "${SAVE_DIR}"
    --save          "${SAVE_DIR}"
    --save-interval 50
+   # HF-format dump alongside the torch_dist save. {rollout_id} is filled
+   # in by slime via args.save_hf.format(rollout_id=...).
+   --save-hf       "${SAVE_DIR}_hf/step_{rollout_id}"
 )
 
 # -------------------- rollout / batching --------------------
