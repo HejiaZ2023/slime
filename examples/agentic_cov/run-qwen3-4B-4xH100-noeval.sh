@@ -177,9 +177,17 @@ WANDB_ARGS=(
 
 # -------------------- launch --------------------
 export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+
+# Keep Ray's session dir (logs + plasma spill) on the data disk; the default
+# /tmp is often small (~100 GB) and fills up under multi-round agentic
+# rollouts spilling 32k-token trajectories.
+RAY_TEMP_DIR=${RAY_TEMP_DIR:-${ROOT_DIR}/ray_tmp}
+mkdir -p "${RAY_TEMP_DIR}"
+
 ray start --head \
     --node-ip-address "${MASTER_ADDR}" \
     --num-gpus "${NUM_GPUS}" \
+    --temp-dir "${RAY_TEMP_DIR}" \
     --disable-usage-stats \
     --dashboard-host=0.0.0.0 \
     --dashboard-port=8265
