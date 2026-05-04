@@ -47,7 +47,7 @@ fi
 : "${EDA_REPO_DIR:?Set EDA_REPO_DIR to the path of llm4cov_eda on that worker}"
 
 MODEL_NAME=${MODEL_NAME:-hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0}
-ROOT_DIR=${ROOT_DIR:-/root}
+ROOT_DIR=${ROOT_DIR:-$(pwd)}
 LLM4COV_DATASET=${LLM4COV_DATASET:-hez2024/CodeV-R1-dataset-RL-test}
 LLM4COV_SPLIT=${LLM4COV_SPLIT:-train}
 LLM4COV_EVAL_DATASET=${LLM4COV_EVAL_DATASET:-hez2024/cvdp_ecov_eval}

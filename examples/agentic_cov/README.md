@@ -168,7 +168,7 @@ Env vars consumed by the run scripts:
 | variable | default | purpose |
 |---|---|---|
 | `MODEL_NAME` | `hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0` | HF model id; `<basename>` becomes the local dir under `ROOT_DIR` |
-| `ROOT_DIR` | `/root` | parent dir on the data disk for `HF_CKPT` / `REF_LOAD` / `SAVE_DIR` |
+| `ROOT_DIR` | `$(pwd)` (the slime repo root) | parent dir on the data disk for `HF_CKPT` / `REF_LOAD` / `SAVE_DIR` |
 | `ROTARY_BASE` | `5000000` | `--rotary-base` for HF→torch_dist conversion |
 | `MODEL_ARGS_ROTARY_BASE` | `5000000` | `--rotary-base` injected into `MODEL_ARGS` at training time |
 | `SAVE_DIR_ON_EXIST` | _prompt_ | `overwrite` / `resume` / `stop` to skip the interactive prompt |
