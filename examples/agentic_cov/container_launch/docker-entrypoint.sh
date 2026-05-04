@@ -42,7 +42,9 @@ if [ ! -f "$SSH_DST/config" ]; then
     exit 1
 fi
 
-if [ -n "${DOCKER_GID:-}" ] && ! getent group docker >/dev/null; then
+if [ -n "${DOCKER_GID:-}" ] \
+        && ! getent group docker >/dev/null \
+        && ! getent group "$DOCKER_GID" >/dev/null; then
     groupadd -g "$DOCKER_GID" docker
 fi
 
