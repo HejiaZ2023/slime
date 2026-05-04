@@ -1,5 +1,5 @@
 #!/bin/bash
-# Multi-round agentic GRPO training for Qwen3-4B on 4x H200 (141 GB HBM).
+# Multi-round agentic GRPO training for Qwen3-4B on 4x H100 (80 GB HBM).
 # - DAPO-style: asymmetric clipping (low=0.2, high=0.28) + sequence-normalized
 #   loss (--calculate-per-token-loss). NO dynamic sampling.
 # - Collocated rollout + training (--colocate).
@@ -8,7 +8,7 @@
 # - 40k total context: rollout response 32k, max packed train tokens 24k/GPU.
 #
 # Run from the slime repo root (e.g. /root/slime in the docker image):
-#   bash examples/agentic_cov/run-qwen3-4B-4xH200-noeval.sh
+#   bash examples/agentic_cov/run-qwen3-4B-4xH100-noeval.sh
 #
 # Required env:
 #   EDA_SERVER     SSH alias of the llm4cov_eda worker
@@ -109,7 +109,8 @@ AGENTIC_ARGS=(
 # -------------------- parallelism / memory --------------------
 # 4 GPUs split as TP=2 x CP=2 x PP=1. With CP=2 a 40k sequence is sharded
 # to ~20k tokens per CP rank; --max-tokens-per-gpu 24576 leaves headroom for
-# packing a few short sequences alongside one long one.
+# packing a few short sequences alongside one long one. Same setting as
+# H200 — H200 is not full at 24k, so 80 GB H100 should still fit.
 PERF_ARGS=(
    --tensor-model-parallel-size  2
    --sequence-parallel
@@ -168,7 +169,7 @@ MISC_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-llm4cov
-   --wandb-group qwen3-4B-4xH200-noeval
+   --wandb-group qwen3-4B-4xH100-noeval
 )
 
 # -------------------- launch --------------------

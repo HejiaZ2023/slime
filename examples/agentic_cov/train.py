@@ -8,7 +8,7 @@ Usage (in place of ``python train.py`` in slime's docs):
         --data-source-path      examples.agentic_cov.data_source.LlmCovDataSource \
         --num-agentic-rounds 2 \
         --eval-num-agentic-rounds 1 \
-        --llm4cov-dataset-name       zhuyaoyu/CodeV-R1-dataset \
+        --llm4cov-dataset-name       hez2024/CodeV-R1-dataset-RL-test \
         --llm4cov-dataset-split      train \
         --llm4cov-eval-dataset-name  hez2024/cvdp_ecov_eval \
         --llm4cov-eval-dataset-split eval \
@@ -43,7 +43,7 @@ def add_agentic_args(parser):
     parser.add_argument(
         "--llm4cov-dataset-name",
         type=str,
-        default="zhuyaoyu/CodeV-R1-dataset",
+        default="hez2024/CodeV-R1-dataset-RL-test",
         help="HF dataset name for training prompts (llm4cov.datasets.load.load_dataset_by_name).",
     )
     parser.add_argument(

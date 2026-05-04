@@ -68,23 +68,27 @@ copies the local slime tree (no `SLIME_REPO_URL`/`SLIME_COMMIT` build args).
 ## Run a container
 
 The training process needs:
-- HF checkpoint of the policy model
-- Megatron-format `torch_dist` checkpoint (produced by
-  `tools/convert_hf_to_torch_dist.py`)
+- A data-disk dir (`ROOT_DIR`) where the run script materializes the HF
+  checkpoint, the Megatron `torch_dist` conversion, and the slime
+  load/save dir — all derived from `MODEL_NAME` (see "Run the training
+  script" below).
 - Reachable EDA worker host (SSH alias) and the `llm4cov_eda` checkout on it
 - Optionally: HuggingFace cache for the llm4cov dataset and any wandb creds
 
 ```bash
 docker run --gpus all --shm-size=32g --network=host --ipc=host --rm -it \
-    -v /path/to/Qwen3-4B:/root/Qwen3-4B \
-    -v /path/to/Qwen3-4B_torch_dist:/root/Qwen3-4B_torch_dist \
-    -v /path/to/slime_save:/root/Qwen3-4B_slime \
+    -v /path/to/data_disk:/root \
     -v $HOME/.ssh:/run/host-ssh:ro \
     -v $HOME/.cache/huggingface:/root/.cache/huggingface \
     -e HF_TOKEN=... \
     -e WANDB_API_KEY=... \
     slime-llm4cov:<tag> bash
 ```
+
+Mount whatever data-disk path you want as the container's `ROOT_DIR`
+(default `/root`). The run script populates `${ROOT_DIR}/<model>`,
+`${ROOT_DIR}/<model>_torch_dist`, and `${ROOT_DIR}/<model>_slime` on
+first launch.
 
 The image's `ENTRYPOINT` copies `/run/host-ssh` into `/root/.ssh` on
 start (fixing modes to what OpenSSH expects), so the rollout's
@@ -105,86 +109,73 @@ running the container — git-ignored, deployed to each server via
 `scp -r container_launch`. The only tracked launcher files are the
 entrypoint and a local README.
 
-## First-time setup: starting from a HuggingFace model
-
-`--hf-checkpoint` is fed straight into `AutoConfig.from_pretrained`, which
-accepts either a local dir or a HF model ID (auto-downloads to
-`~/.cache/huggingface/`). `--ref-load` is different — it points at a
-*Megatron `torch_dist`* checkpoint, which doesn't exist on HuggingFace and
-must be produced once via `tools/convert_hf_to_torch_dist.py`.
-
-Worked example: start from `hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0` (an SFT'd
-Qwen3-4B-Instruct-2507; rotary base 5,000,000 — different from the base
-Qwen3-4B's 1,000,000).
-
-```bash
-cd /root/slime
-export HF_TOKEN=...   # if the repo is gated, otherwise skip
-
-MODEL_ID=hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0
-LOCAL_DIR=/root/LLM4Cov-Qwen3-4B-SFT-Stage0
-
-# 1. Download HF weights (you can also skip this — passing the HF ID
-#    directly to step 2/3 would auto-cache to ~/.cache/huggingface, but an
-#    explicit local dir is faster on container restarts).
-huggingface-cli download "${MODEL_ID}" --local-dir "${LOCAL_DIR}"
-
-# 2. One-time conversion to Megatron torch_dist. Pass MODEL_ARGS so vocab,
-#    layer count, hidden size etc. line up with the slime/Megatron loader.
-#    --rotary-base 5000000 overrides the default in scripts/models/qwen3-4B.sh
-#    to match the Qwen3-4B-Instruct-2507 base this model was SFT'd from.
-source scripts/models/qwen3-4B.sh
-PYTHONPATH=/root/Megatron-LM torchrun --nproc_per_node 1 \
-    tools/convert_hf_to_torch_dist.py \
-    "${MODEL_ARGS[@]}" \
-    --hf-checkpoint "${LOCAL_DIR}" \
-    --rotary-base 5000000 \
-    --save "${LOCAL_DIR}_torch_dist"
-
-# 3. Launch training. MODEL_ARGS_ROTARY_BASE flows into the same
-#    --rotary-base flag the run script sources from qwen3-4B.sh.
-MODEL_ARGS_ROTARY_BASE=5000000 \
-HF_CKPT="${LOCAL_DIR}" \
-REF_LOAD="${LOCAL_DIR}_torch_dist" \
-SAVE_DIR="${LOCAL_DIR}_slime" \
-EDA_SERVER=paladin_centos \
-EDA_REPO_DIR=/workspace/llm4cov_eda \
-bash examples/agentic_cov/run-qwen3-4B-4xH200-noeval.sh
-```
-
-The conversion in step 2 takes ~5 min on a single H100/H200 and produces a
-~9 GB `*_torch_dist/` directory. Re-run only when you want to start from a
-different base checkpoint.
-
-For a base Qwen3-4B (no instruct tune) the conversion line drops the
-`--rotary-base` override and the launch command drops the
-`MODEL_ARGS_ROTARY_BASE` env var.
-
 ## Run the training script
 
-For subsequent runs with the same starting checkpoint, just:
+Each `run-*.sh` sources `_setup_checkpoints.sh`, which derives the three
+checkpoint paths from `MODEL_NAME` + `ROOT_DIR` and runs first-time setup
+on demand:
+
+- `HF_CKPT  = ${ROOT_DIR}/<basename(MODEL_NAME)>` — downloaded via
+  `huggingface-cli` if missing/empty.
+- `REF_LOAD = ${HF_CKPT}_torch_dist` — produced once by
+  `tools/convert_hf_to_torch_dist.py` (~5 min on a single H100/H200,
+  ~9 GB) if missing/empty. `--hf-checkpoint` accepts a local dir or a HF
+  ID; we materialize a local dir to keep container restarts fast.
+- `SAVE_DIR = ${HF_CKPT}_slime` — slime's load/save dir. If non-empty,
+  the helper prompts `[o]verwrite / [r]esume / [s]top`. Set
+  `SAVE_DIR_ON_EXIST=overwrite|resume|stop` to skip the prompt in
+  non-interactive runs.
+
+Default launch starts from `hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0` (an SFT'd
+Qwen3-4B-Instruct-2507; rotary base 5,000,000) trained on
+`hez2024/CodeV-R1-dataset-RL-test`, with everything materialized under
+`/root`:
 
 ```bash
 cd /root/slime
+export HF_TOKEN=...   # if the SFT model is gated, otherwise skip
+
 EDA_SERVER=paladin_centos \
 EDA_REPO_DIR=/workspace/llm4cov_eda \
 bash examples/agentic_cov/run-qwen3-4B-4xH200-noeval.sh
 ```
 
-Override paths via env vars at the top of the script:
+Other shapes:
+
+- `run-qwen3-4B-4xH100-noeval.sh` — same as above, sized for 80 GB H100.
+- `run-qwen3-4B-4xH100.sh` — 4xH100 with periodic eval on
+  `hez2024/cvdp_ecov_eval` (`--eval-interval 20`, dispatches to
+  `examples.agentic_cov.rollout.eval_rollout`).
+
+`ROTARY_BASE` flows into the conversion's `--rotary-base` flag and
+`MODEL_ARGS_ROTARY_BASE` overrides the same flag at training time
+(sourced from `scripts/models/qwen3-4B.sh`); both default to `5000000` to
+match the default model. To start from the base Qwen3-4B (rotary base
+1,000,000) on a different data-disk root:
+
+```bash
+MODEL_NAME=Qwen/Qwen3-4B \
+ROOT_DIR=/data \
+ROTARY_BASE=1000000 \
+MODEL_ARGS_ROTARY_BASE=1000000 \
+EDA_SERVER=paladin_centos \
+EDA_REPO_DIR=/workspace/llm4cov_eda \
+bash examples/agentic_cov/run-qwen3-4B-4xH200-noeval.sh
+```
+
+Env vars consumed by the run scripts:
 
 | variable | default | purpose |
 |---|---|---|
-| `HF_CKPT` | `/root/Qwen3-4B` | HF policy checkpoint |
-| `REF_LOAD` | `/root/Qwen3-4B_torch_dist` | torch_dist conversion of policy |
-| `SAVE_DIR` | `/root/Qwen3-4B_slime` | slime save/load dir |
+| `MODEL_NAME` | `hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0` | HF model id; `<basename>` becomes the local dir under `ROOT_DIR` |
+| `ROOT_DIR` | `/root` | parent dir on the data disk for `HF_CKPT` / `REF_LOAD` / `SAVE_DIR` |
+| `ROTARY_BASE` | `5000000` | `--rotary-base` for HF→torch_dist conversion |
+| `MODEL_ARGS_ROTARY_BASE` | `5000000` | `--rotary-base` injected into `MODEL_ARGS` at training time |
+| `SAVE_DIR_ON_EXIST` | _prompt_ | `overwrite` / `resume` / `stop` to skip the interactive prompt |
 | `EDA_SERVER` | _required_ | SSH alias for the EDA worker |
 | `EDA_REPO_DIR` | _required_ | path to `llm4cov_eda` checkout on the EDA host |
-| `LLM4COV_DATASET` | `zhuyaoyu/CodeV-R1-dataset` | HF dataset for training prompts |
+| `LLM4COV_DATASET` | `hez2024/CodeV-R1-dataset-RL-test` | HF dataset for training prompts |
 | `LLM4COV_SPLIT` | `train` | split name |
+| `LLM4COV_EVAL_DATASET` | `hez2024/cvdp_ecov_eval` | HF dataset for eval prompts (`run-qwen3-4B-4xH100.sh`) |
+| `LLM4COV_EVAL_SPLIT` | `eval` | eval split name (`run-qwen3-4B-4xH100.sh`) |
 | `NUM_GPUS` | autodetected | override if you want fewer than all visible |
-
-The script does not configure eval (`--eval-interval` is unset). To add
-eval back, copy this script and add `--eval-interval`,
-`--eval-function-path examples.agentic_cov.rollout.eval_rollout`, and
-`--llm4cov-eval-dataset-name` / `--llm4cov-eval-dataset-split`.

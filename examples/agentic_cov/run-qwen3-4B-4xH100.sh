@@ -1,14 +1,18 @@
 #!/bin/bash
-# Multi-round agentic GRPO training for Qwen3-4B on 4x H200 (141 GB HBM).
+# Multi-round agentic GRPO training for Qwen3-4B on 4x H100 (80 GB HBM),
+# WITH periodic eval on hez2024/cvdp_ecov_eval.
 # - DAPO-style: asymmetric clipping (low=0.2, high=0.28) + sequence-normalized
 #   loss (--calculate-per-token-loss). NO dynamic sampling.
 # - Collocated rollout + training (--colocate).
-# - No eval (no --eval-interval / --eval-function-path).
+# - Eval every --eval-interval rollouts via examples.agentic_cov.rollout.eval_rollout.
+#   Eval prompts come from --llm4cov-eval-dataset-{name,split}; the
+#   --eval-prompt-data pair below only exists to satisfy slime's
+#   eval_datasets validation — the path is unused by eval_rollout.
 # - No KL, no weight decay.
 # - 40k total context: rollout response 32k, max packed train tokens 24k/GPU.
 #
 # Run from the slime repo root (e.g. /root/slime in the docker image):
-#   bash examples/agentic_cov/run-qwen3-4B-4xH200-noeval.sh
+#   bash examples/agentic_cov/run-qwen3-4B-4xH100.sh
 #
 # Required env:
 #   EDA_SERVER     SSH alias of the llm4cov_eda worker
@@ -46,6 +50,8 @@ MODEL_NAME=${MODEL_NAME:-hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0}
 ROOT_DIR=${ROOT_DIR:-/root}
 LLM4COV_DATASET=${LLM4COV_DATASET:-hez2024/CodeV-R1-dataset-RL-test}
 LLM4COV_SPLIT=${LLM4COV_SPLIT:-train}
+LLM4COV_EVAL_DATASET=${LLM4COV_EVAL_DATASET:-hez2024/cvdp_ecov_eval}
+LLM4COV_EVAL_SPLIT=${LLM4COV_EVAL_SPLIT:-eval}
 
 # Default model is SFT'd from Qwen3-4B-Instruct-2507 (rotary base 5,000,000).
 # Override both vars when MODEL_NAME points at a model with a different
@@ -99,17 +105,36 @@ ROLLOUT_ARGS=(
 AGENTIC_ARGS=(
    --rollout-function-path examples.agentic_cov.rollout.generate_rollout
    --data-source-path      examples.agentic_cov.data_source.LlmCovDataSource
-   --num-agentic-rounds    2
-   --llm4cov-dataset-name  "${LLM4COV_DATASET}"
-   --llm4cov-dataset-split "${LLM4COV_SPLIT}"
+   --num-agentic-rounds       2
+   --eval-num-agentic-rounds  1
+   --llm4cov-dataset-name        "${LLM4COV_DATASET}"
+   --llm4cov-dataset-split       "${LLM4COV_SPLIT}"
+   --llm4cov-eval-dataset-name   "${LLM4COV_EVAL_DATASET}"
+   --llm4cov-eval-dataset-split  "${LLM4COV_EVAL_SPLIT}"
    --eda-server            "${EDA_SERVER}"
    --eda-repo-dir          "${EDA_REPO_DIR}"
+)
+
+# -------------------- eval --------------------
+# eval_rollout pulls prompts directly from --llm4cov-eval-dataset-{name,split};
+# slime still requires --eval-prompt-data (or --eval-config) to populate
+# args.eval_datasets. Use the HF dataset id as both name and (unused) path so
+# the result key from rollout.py:369 (`args.llm4cov_eval_dataset_name`) lines
+# up with the eval_datasets entry.
+EVAL_ARGS=(
+   --eval-interval              20
+   --eval-function-path         examples.agentic_cov.rollout.eval_rollout
+   --eval-prompt-data           "${LLM4COV_EVAL_DATASET}" "${LLM4COV_EVAL_DATASET}"
+   --n-samples-per-eval-prompt  1
+   --eval-max-response-len      32768
+   --eval-temperature           0.0
 )
 
 # -------------------- parallelism / memory --------------------
 # 4 GPUs split as TP=2 x CP=2 x PP=1. With CP=2 a 40k sequence is sharded
 # to ~20k tokens per CP rank; --max-tokens-per-gpu 24576 leaves headroom for
-# packing a few short sequences alongside one long one.
+# packing a few short sequences alongside one long one. Same setting as
+# H200 — H200 is not full at 24k, so 80 GB H100 should still fit.
 PERF_ARGS=(
    --tensor-model-parallel-size  2
    --sequence-parallel
@@ -168,7 +193,7 @@ MISC_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-llm4cov
-   --wandb-group qwen3-4B-4xH200-noeval
+   --wandb-group qwen3-4B-4xH100
 )
 
 # -------------------- launch --------------------
@@ -198,6 +223,7 @@ ray job submit --address="http://127.0.0.1:8265" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \
     "${AGENTIC_ARGS[@]}" \
+    "${EVAL_ARGS[@]}" \
     "${OPTIMIZER_ARGS[@]}" \
     "${GRPO_ARGS[@]}" \
     "${PERF_ARGS[@]}" \
