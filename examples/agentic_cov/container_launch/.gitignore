@@ -1,0 +1,7 @@
+# Everything in this dir is per-host / per-user — SSH keys, git identity,
+# API tokens, and absolute volume paths. Keep it all local. Track only the
+# entrypoint (no secrets, baked into the image) and the docs.
+*
+!.gitignore
+!README.md
+!docker-entrypoint.sh

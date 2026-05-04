@@ -79,18 +79,31 @@ docker run --gpus all --shm-size=32g --network=host --ipc=host --rm -it \
     -v /path/to/Qwen3-4B:/root/Qwen3-4B \
     -v /path/to/Qwen3-4B_torch_dist:/root/Qwen3-4B_torch_dist \
     -v /path/to/slime_save:/root/Qwen3-4B_slime \
-    -v $HOME/.ssh:/root/.ssh:ro \
+    -v $HOME/.ssh:/run/host-ssh:ro \
     -v $HOME/.cache/huggingface:/root/.cache/huggingface \
     -e HF_TOKEN=... \
     -e WANDB_API_KEY=... \
     slime-llm4cov:<tag> bash
 ```
 
-The `-v $HOME/.ssh:/root/.ssh:ro` mount lets the rollout's
-`llm4cov.eda_client.remote_*` reach the EDA host via your SSH config alias
-(e.g. `paladin_centos`). Container-side OpenSSH must trust the host key —
-either pre-populate `known_hosts` in your mount or set
-`StrictHostKeyChecking=accept-new` in `~/.ssh/config`.
+The image's `ENTRYPOINT` copies `/run/host-ssh` into `/root/.ssh` on
+start (fixing modes to what OpenSSH expects), so the rollout's
+`llm4cov.eda_client.remote_*` can reach the EDA host via your SSH config
+alias (e.g. `paladin_centos`). Container-side OpenSSH must trust the host
+key — either pre-populate `known_hosts` in your mount or set
+`StrictHostKeyChecking=accept-new` in your SSH `config`. The mount is
+required; the entrypoint exits with an error if `/run/host-ssh` is
+missing. To run the image without SSH (rare — smoke tests only), pass
+`--entrypoint=''` to bypass the bootstrap.
+
+### Per-host launcher: `container_launch/`
+
+For a repeatable `make build|run|attach` flow with SSH keys + git identity
+wired in automatically, see `examples/agentic_cov/container_launch/`. It
+holds the matching `Makefile`, `.gitconfig`, and `.ssh/` for the host
+running the container — git-ignored, deployed to each server via
+`scp -r container_launch`. The only tracked launcher files are the
+entrypoint and a local README.
 
 ## First-time setup: starting from a HuggingFace model
 
