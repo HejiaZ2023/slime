@@ -77,10 +77,16 @@ def add_agentic_args(parser):
         help="Remote path to the llm4cov_eda checkout on the EDA server.",
     )
     parser.add_argument(
-        "--eda-job-timeout",
+        "--eda-stage-timeout",
         type=int,
-        default=600,
-        help="Per-sample coverage-job timeout in seconds.",
+        default=30,
+        help=(
+            "Per-stage coverage-job timeout in seconds, passed to "
+            "run_remote_cov_job_pipeline's `timeout` (which it uses "
+            "per-stage; the SSH wall-clock budget is timeout*3). Mirrors "
+            "DEFAULT_EDA_SINGLE_STAGE_TIMEOUT_S=30 in llm4cov_oss's "
+            "scripts/batch_query_eval.py."
+        ),
     )
     return parser
 

@@ -62,7 +62,7 @@ def _compute_reward_sync(args: Any, context_dict: dict[str, Any], response: str)
             context=context,
             tb_file=tb_file,
             skip_detail=True,
-            timeout=getattr(args, "eda_job_timeout", 600),
+            timeout=getattr(args, "eda_stage_timeout", 30),
         )
     except Exception as exc:
         logger.warning("Remote EDA job failed for %s: %s", context.id, exc)
