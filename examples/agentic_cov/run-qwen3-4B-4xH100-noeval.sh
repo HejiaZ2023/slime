@@ -46,6 +46,7 @@ MODEL_NAME=${MODEL_NAME:-hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0}
 ROOT_DIR=${ROOT_DIR:-$(pwd)}
 LLM4COV_DATASET=${LLM4COV_DATASET:-hez2024/CodeV-R1-dataset-RL-test}
 LLM4COV_SPLIT=${LLM4COV_SPLIT:-train}
+NUM_ROLLOUT=${NUM_ROLLOUT:-300}
 
 # Default model is SFT'd from Qwen3-4B-Instruct-2507 (rotary base 5,000,000).
 # Override both vars when MODEL_NAME points at a model with a different
@@ -86,10 +87,11 @@ CKPT_ARGS=(
 # -------------------- rollout / batching --------------------
 # group_size = n_samples_per_prompt = 4
 # global_batch_size = 16  ->  rollout_batch_size = 16 / 4 = 4
-# 300 steps total -> --num-rollout 300 (default num_steps_per_rollout=1)
+# Default 300 steps total -> --num-rollout 300 (default num_steps_per_rollout=1).
+# Override with NUM_ROLLOUT=... to run shorter/longer.
 ROLLOUT_ARGS=(
    --rollout-shuffle
-   --num-rollout            300
+   --num-rollout            "${NUM_ROLLOUT}"
    --rollout-batch-size     4
    --n-samples-per-prompt   4
    --rollout-max-response-len 16384

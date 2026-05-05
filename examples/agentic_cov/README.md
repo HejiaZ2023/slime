@@ -178,4 +178,5 @@ Env vars consumed by the run scripts:
 | `LLM4COV_SPLIT` | `train` | split name |
 | `LLM4COV_EVAL_DATASET` | `hez2024/cvdp_ecov_eval` | HF dataset for eval prompts (`run-qwen3-4B-4xH100.sh`) |
 | `LLM4COV_EVAL_SPLIT` | `eval` | eval split name (`run-qwen3-4B-4xH100.sh`) |
+| `NUM_ROLLOUT` | `300` | total rollout steps (`--num-rollout`); each step pulls `rollout_batch_size` prompts |
 | `NUM_GPUS` | autodetected | override if you want fewer than all visible |
