@@ -67,6 +67,12 @@ if [ "$(pwd)" != "${SLIME_ROOT}" ]; then
 fi
 source "${SLIME_ROOT}/scripts/models/qwen3-4B.sh"
 
+# Disable Megatron's vocab padding. With TP=2 and the default 128, vocab
+# is rounded 151936 -> 152064; the HF save then trips vllm's
+# `loaded_weight.shape[0] == config.vocab_size` assert. 1 keeps padding
+# at TP=2 only (151936 is already even), so HF dumps load in vllm as-is.
+MODEL_ARGS+=(--make-vocab-size-divisible-by 1)
+
 # Derives HF_CKPT / REF_LOAD / SAVE_DIR from MODEL_NAME + ROOT_DIR, and runs
 # first-time HF download / torch_dist conversion if those dirs are missing.
 source "${SCRIPT_DIR}/_setup_checkpoints.sh"
@@ -87,13 +93,12 @@ CKPT_ARGS=(
 # group_size = n_samples_per_prompt = 4
 # global_batch_size = 16  ->  rollout_batch_size = 16 / 4 = 4
 # 300 steps total -> --num-rollout 300 (default num_steps_per_rollout=1)
-# response 32k + prompt budget ~8k = 40k total context
 ROLLOUT_ARGS=(
    --rollout-shuffle
    --num-rollout            300
    --rollout-batch-size     4
    --n-samples-per-prompt   4
-   --rollout-max-response-len 32768
+   --rollout-max-response-len 16384
    --rollout-temperature    1.0
 
    # llm4cov dataset is built from chat messages; apply_chat_template
