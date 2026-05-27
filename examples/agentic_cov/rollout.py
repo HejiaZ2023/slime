@@ -314,7 +314,7 @@ async def _rollout_one_prompt(
 
         rewards = [float(s.reward or 0.0) for s in current_group]
         logger.info(
-            "rollout rollout_id=%d ctx=%s round=%d/%d rewards=%s mean=%.4f",
+            "rollout rollout_id=%d dataset_id=%s round=%d/%d rewards=%s mean=%.4f",
             rollout_id,
             context_id,
             round_idx + 1,
@@ -328,7 +328,7 @@ async def _rollout_one_prompt(
             for _s in current_group:
                 # ── complete LLM generation log ──────────────────────────
                 logger.info(
-                    "EVAL_GEN ctx=%s round=%d/%d idx=%s status=%s len=%d\n%s",
+                    "EVAL_GEN dataset_id=%s round=%d/%d idx=%s status=%s len=%d\n%s",
                     context_id, round_idx + 1, num_rounds,
                     _s.index, _s.status, len(_s.response or ""),
                     _s.response or "",
@@ -337,7 +337,7 @@ async def _rollout_one_prompt(
                 _el = _s.metadata.get("_eda_log", {})
                 if _el.get("status") == "success":
                     logger.info(
-                        "EVAL_EDA ctx=%s round=%d/%d idx=%s status=success "
+                        "EVAL_EDA dataset_id=%s round=%d/%d idx=%s status=success "
                         "reward=%.4f coverage=%.4f is_pass_xrun=%s is_pass_targets=%s "
                         "filename=%s",
                         context_id, round_idx + 1, num_rounds, _s.index,
@@ -348,7 +348,7 @@ async def _rollout_one_prompt(
                     )
                 else:
                     logger.info(
-                        "EVAL_EDA ctx=%s round=%d/%d idx=%s status=%s "
+                        "EVAL_EDA dataset_id=%s round=%d/%d idx=%s status=%s "
                         "reward=%.4f filename=%s\n%s",
                         context_id, round_idx + 1, num_rounds, _s.index,
                         _el.get("status", "?"),
@@ -360,7 +360,7 @@ async def _rollout_one_prompt(
                 _eval_eda_fb = _s.metadata.get("eda_feedback")
                 if _eval_eda_fb:
                     logger.info(
-                        "EVAL_EDA_FEEDBACK ctx=%s round=%d/%d idx=%s\n%s",
+                        "EVAL_EDA_FEEDBACK dataset_id=%s round=%d/%d idx=%s\n%s",
                         context_id, round_idx + 1, num_rounds, _s.index,
                         _eval_eda_fb,
                     )
@@ -376,7 +376,7 @@ async def _rollout_one_prompt(
                         ))
                     _n_resp = len(_tok.encode(_s.response or ""))
                     logger.info(
-                        "EVAL_TOKENS[first_task] ctx=%s round=%d/%d idx=%s "
+                        "EVAL_TOKENS[first_task] dataset_id=%s round=%d/%d idx=%s "
                         "prompt_tokens=%d response_tokens=%d total=%d",
                         context_id, round_idx + 1, num_rounds, _s.index,
                         _n_prompt, _n_resp, _n_prompt + _n_resp,
@@ -391,12 +391,11 @@ async def _rollout_one_prompt(
         eda_feedback: str | None = pivot.metadata.get("eda_feedback")
         eda_status_str: str = (pivot.metadata.get("_eda_log") or {}).get("status", "")
         logger.info(
-            "rollout rollout_id=%d ctx=%s round=%d pivot reward=%.4f dataset_id=%s (mode=%s) eda_feedback_len=%d",
+            "rollout rollout_id=%d dataset_id=%s round=%d pivot reward=%.4f (mode=%s) eda_feedback_len=%d",
             rollout_id,
             context_id,
             round_idx + 1,
             pivot_reward,
-            pivot_dataset_id,
             "best" if evaluation else "worst",
             len(eda_feedback) if eda_feedback else 0,
         )
@@ -404,7 +403,7 @@ async def _rollout_one_prompt(
         # Early stop: perfect coverage (overall_coverage=1.0 → reward=2.0).
         if evaluation and pivot_reward >= 2.0:
             logger.info(
-                "rollout rollout_id=%d ctx=%s round=%d early stop (perfect coverage)",
+                "rollout rollout_id=%d dataset_id=%s round=%d early stop (perfect coverage)",
                 rollout_id, context_id, round_idx + 1,
             )
             break
