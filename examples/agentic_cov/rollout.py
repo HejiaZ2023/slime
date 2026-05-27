@@ -314,7 +314,7 @@ async def _rollout_one_prompt(
 
         rewards = [float(s.reward or 0.0) for s in current_group]
         logger.info(
-            "rollout rollout_id=%d dataset_id=%s round=%d/%d rewards=%s mean=%.4f",
+            "rollout step=%d dataset_id=%s round=%d/%d rewards=%s mean=%.4f",
             rollout_id,
             context_id,
             round_idx + 1,
@@ -391,7 +391,7 @@ async def _rollout_one_prompt(
         eda_feedback: str | None = pivot.metadata.get("eda_feedback")
         eda_status_str: str = (pivot.metadata.get("_eda_log") or {}).get("status", "")
         logger.info(
-            "rollout rollout_id=%d dataset_id=%s round=%d pivot reward=%.4f (mode=%s) eda_feedback_len=%d",
+            "rollout step=%d dataset_id=%s round=%d pivot reward=%.4f (mode=%s) eda_feedback_len=%d",
             rollout_id,
             context_id,
             round_idx + 1,
@@ -403,7 +403,7 @@ async def _rollout_one_prompt(
         # Early stop: perfect coverage (overall_coverage=1.0 → reward=2.0).
         if evaluation and pivot_reward >= 2.0:
             logger.info(
-                "rollout rollout_id=%d dataset_id=%s round=%d early stop (perfect coverage)",
+                "rollout step=%d dataset_id=%s round=%d early stop (perfect coverage)",
                 rollout_id, context_id, round_idx + 1,
             )
             break
@@ -579,7 +579,7 @@ async def _eval_rollout_async(args: Namespace, rollout_id: int) -> RolloutFnEval
         raise ValueError(f"--eval-num-agentic-rounds must be >= 0, got {_eval_react_rounds}")
     num_rounds = 1 + _eval_react_rounds
     logger.info(
-        "eval rollout_id=%d: react_rounds=%d  total_rounds=%d  "
+        "eval step=%d: react_rounds=%d  total_rounds=%d  "
         "(markov-react + early-stop + max_retries=3)",
         rollout_id, _eval_react_rounds, num_rounds,
     )
@@ -590,7 +590,7 @@ async def _eval_rollout_async(args: Namespace, rollout_id: int) -> RolloutFnEval
         int(getattr(args, "n_samples_per_eval_prompt", 0) or args.n_samples_per_prompt or 1),
     )
     logger.info(
-        "eval rollout_id=%d: dataset=%s  n_prompts=%d  n_per_prompt=%d  total_tasks=%d",
+        "eval step=%d: dataset=%s  n_prompts=%d  n_per_prompt=%d  total_tasks=%d",
         rollout_id, args.llm4cov_eval_dataset_name,
         len(eval_prompts), n_per_prompt, len(eval_prompts) * n_per_prompt,
     )
@@ -642,7 +642,7 @@ async def _eval_rollout_async(args: Namespace, rollout_id: int) -> RolloutFnEval
 
     import time as _time
     _t_eval_start = _time.time()
-    logger.info("eval rollout_id=%d: asyncio.gather starting (%d tasks)...",
+    logger.info("eval step=%d: asyncio.gather starting (%d tasks)...",
                 rollout_id, len(initial_groups))
     all_rounds = await asyncio.gather(*[_one(g) for g in initial_groups])
     _t_eval_elapsed = _time.time() - _t_eval_start
@@ -697,7 +697,7 @@ async def _eval_rollout_async(args: Namespace, rollout_id: int) -> RolloutFnEval
         _total_resp_tok += len(_tok.encode(_s.response or ""))
 
     # ── Eval Summary (mirrors batch_query_eval.py === Eval Summary ===) ──────────
-    logger.info("=== Eval Summary (rollout_id=%d, elapsed=%.1fs) ===",
+    logger.info("=== Eval Summary (step=%d, elapsed=%.1fs) ===",
                 rollout_id, _t_eval_elapsed)
     logger.info("  is_pass_xrun:             Pass@1= %.1f%%  (%d/%d)",
                 100.0 * _pass_count / _n if _n else 0.0, _pass_count, _n)
@@ -835,7 +835,7 @@ def log_train_samples(
                     f"  idx={_gs2.index:<4} reward={_r2:+.4f} adv={_adv2:+.4f}"
                 )
             logger.info(
-                "TRAIN_GROUP  rollout=%d group=%s dataset_id=%s round=%d "
+                "TRAIN_GROUP  step=%d group=%s dataset_id=%s round=%d "
                 "n=%d mean=%.4f std=%.4f\n%s",
                 rollout_id, s.group_index, _gds,
                 s.metadata.get("round_number", 0),
@@ -854,7 +854,7 @@ def log_train_samples(
             if s.rollout_log_probs else None
         )
         logger.info(
-            "TRAIN_SAMPLE rollout=%d group=%s idx=%s dataset_id=%s "
+            "TRAIN_SAMPLE step=%d group=%s idx=%s dataset_id=%s "
             "round=%d resp_len=%d truncated=%s "
             "reward=%.4f advantage=%.4f group_mean=%.4f group_std=%.4f "
             "lp_mean=%s "
@@ -872,7 +872,7 @@ def log_train_samples(
         # ── EDA feedback (only when --eda-log-feedback-train) ────────────
         _eda_fb = s.metadata.get("eda_feedback")
         if _eda_fb:
-            logger.info("TRAIN_EDA_FEEDBACK rollout=%d idx=%s\n%s",
+            logger.info("TRAIN_EDA_FEEDBACK step=%d idx=%s\n%s",
                         rollout_id, s.index, _eda_fb)
 
         # ── input (prompt) ─────────────────────────────────────────────────
@@ -888,16 +888,16 @@ def log_train_samples(
                 prompt_repr = _json.dumps(s.prompt, ensure_ascii=False)
             _prompt_log = (prompt_repr if len(prompt_repr) <= _MAX_LOG_CHARS
                            else prompt_repr[:_MAX_LOG_CHARS] + f"\n[TRUNCATED {len(prompt_repr)} chars]")
-            logger.info("TRAIN_INPUT  rollout=%d idx=%s dataset_id=%s round=%d len=%d\n%s",
+            logger.info("TRAIN_INPUT  step=%d idx=%s dataset_id=%s round=%d len=%d\n%s",
                         rollout_id, s.index, dataset_id, round_num, len(prompt_repr), _prompt_log)
         else:
-            logger.info("TRAIN_INPUT  rollout=%d idx=%s dataset_id=%s round=%d (full every %d steps)",
+            logger.info("TRAIN_INPUT  step=%d idx=%s dataset_id=%s round=%d (full every %d steps)",
                         rollout_id, s.index, dataset_id, round_num, _MASK_LOG_INTERVAL)
 
         # ── output (response) ─────────────────────────────────────────────
         _resp = s.response or ""
         _resp_log = _resp if len(_resp) <= _MAX_OUTPUT_LOG_CHARS else _resp[:_MAX_OUTPUT_LOG_CHARS] + f"\n[TRUNCATED {len(_resp)} chars]"
-        logger.info("TRAIN_OUTPUT rollout=%d idx=%s\n%s",
+        logger.info("TRAIN_OUTPUT step=%d idx=%s\n%s",
                     rollout_id, s.index, _resp_log)
 
         # ── loss mask (every _MASK_LOG_INTERVAL steps) ────────────────────
@@ -908,7 +908,7 @@ def log_train_samples(
             # summarise run-length: log first/last 8 values + counts
             preview  = (mask[:8] if len(mask) >= 8 else mask)
             logger.info(
-                "TRAIN_MASK   rollout=%d idx=%s len=%d active=%d zero=%d preview=%s",
+                "TRAIN_MASK   step=%d idx=%s len=%d active=%d zero=%d preview=%s",
                 rollout_id, s.index, len(mask), n_active, n_zero, preview,
             )
 
@@ -923,7 +923,7 @@ def log_train_samples(
             for gid in sorted(_zero_std_gids)
         ]
         logger.info(
-            "TRAIN_ZERO_STD rollout=%d zero_std=%d/%d (no gradient signal):\n  %s",
+            "TRAIN_ZERO_STD step=%d zero_std=%d/%d (no gradient signal):\n  %s",
             rollout_id, len(_zero_std_gids), len(_group_raw),
             "\n  ".join(_zs_info),
         )
