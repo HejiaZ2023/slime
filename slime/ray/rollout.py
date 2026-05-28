@@ -377,7 +377,20 @@ class RolloutManager:
             self.servers: dict[str, RolloutServer] = {}
         else:
             init_http_client(args)
+            logger.info(
+                "starting rollout servers: model=%s  mem_fraction_static=%s  rollout_num_gpus=%s",
+                args.hf_checkpoint,
+                getattr(args, "sglang_mem_fraction_static", "?"),
+                getattr(args, "rollout_num_gpus", "?"),
+            )
+            t_srv = time.time()
             self.servers = start_rollout_servers(args, pg)
+            _total_engines = sum(len(srv.all_engines) for srv in self.servers.values())
+            logger.info("rollout servers ready: %d engine(s) across %d server(s) in %.1fs",
+                        _total_engines, len(self.servers), time.time() - t_srv)
+            for _name, _srv in self.servers.items():
+                logger.info("  server '%s': router=%s:%s  engines=%d",
+                            _name, _srv.router_ip, _srv.router_port, len(_srv.all_engines))
 
         init_tracking(args, primary=False)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
@@ -1108,7 +1121,11 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 server_groups.append(group)
 
             if all_init_handles:
+                logger.info("waiting for %d sglang engine(s) to reach 'Application startup complete'...",
+                            len(all_init_handles))
+                t_engines = time.time()
                 ray.get(all_init_handles)
+                logger.info("all sglang engines ready (%.1fs)", time.time() - t_engines)
 
         servers[model_cfg.name] = RolloutServer(
             server_groups=server_groups,

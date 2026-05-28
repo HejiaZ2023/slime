@@ -94,6 +94,12 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
         start_rollout_id = loaded_rollout_id + 1
+        logger.info(
+            "checkpoint loaded: loaded_rollout_id=%d  start_rollout_id=%d  "
+            "load=%s  ref_load=%s  hf_checkpoint=%s",
+            loaded_rollout_id, start_rollout_id,
+            args.load, getattr(args, "ref_load", None), args.hf_checkpoint,
+        )
 
         if role == "critic":
             if self.args.offload_train:
