@@ -8,11 +8,12 @@
 #   ROTARY_BASE   Optional override for --rotary-base during HF→torch_dist
 #                 conversion (e.g. 5000000 for Qwen3-4B-Instruct-2507).
 #   SAVE_DIR_ON_EXIST  Optional: overwrite | resume | stop (skips the prompt).
+#   SAVE_DIR_SUFFIX   Optional: suffix appended after "_slime" in SAVE_DIR (e.g. _elfe).
 #
 # Outputs (exported for the caller):
 #   HF_CKPT       ${ROOT_DIR}/<basename(MODEL_NAME)>
 #   REF_LOAD      ${HF_CKPT}_torch_dist
-#   SAVE_DIR      ${HF_CKPT}_slime
+#   SAVE_DIR      ${HF_CKPT}_slime${SAVE_DIR_SUFFIX:-}
 #
 # Side effects:
 #   - Downloads HF weights into HF_CKPT if missing/empty.
@@ -33,7 +34,7 @@ fi
 _MODEL_BASENAME="$(basename "${MODEL_NAME}")"
 HF_CKPT="${ROOT_DIR}/${_MODEL_BASENAME}"
 REF_LOAD="${HF_CKPT}_torch_dist"
-SAVE_DIR="${HF_CKPT}_slime"
+SAVE_DIR="${HF_CKPT}_slime${SAVE_DIR_SUFFIX:-}"
 
 _dir_has_content() {
     [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]
