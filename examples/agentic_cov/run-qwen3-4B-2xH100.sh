@@ -230,7 +230,6 @@ EVAL_ARGS=(
    --n-samples-per-eval-prompt  1
    --eval-max-response-len      32768
    --eval-temperature           0.0
-   --skip-eval-before-train
 )
 
 # -------------------- parallelism / memory --------------------
