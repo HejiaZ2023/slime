@@ -228,8 +228,9 @@ EVAL_ARGS=(
    --eval-function-path         examples.agentic_cov.rollout.eval_rollout
    --eval-prompt-data           "${LLM4COV_EVAL_DATASET}" "${LLM4COV_EVAL_DATASET}"
    --n-samples-per-eval-prompt  1
-   --eval-max-response-len      32768
-   --eval-temperature           0.0
+   --eval-max-response-len      16384
+   --eval-temperature           0.7
+   --eval-top-p                 0.8
 )
 
 # -------------------- parallelism / memory --------------------
