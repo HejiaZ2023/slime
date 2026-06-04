@@ -120,8 +120,19 @@ CKPT_INTERVAL=${CKPT_INTERVAL:-50}   # shared interval for --save-interval and -
 # never overwrite each other.  Set REMOTE_SYNC_SSH_KEY to an SSH identity
 # file when the host requires an explicit key (e.g. when running on brev,
 # use /home/nvidia/.ssh/id_paladin).  Leave empty to rely on the SSH agent.
+# Sync target: "hf" (upload to a private HF repo, default) or "paladin" (rsync).
+REMOTE_SYNC_TARGET=${REMOTE_SYNC_TARGET:-hf}
+# HF mode: repo = ${HF_SYNC_REPO_PREFIX}${RUN_SUBDIR} (private). The upload uses a
+# dedicated WRITE token from env HF_SYNC_TOKEN (kept separate from HF_TOKEN, which
+# the Makefile sets for model download). Pass -e HF_SYNC_TOKEN=<write> at launch.
+HF_SYNC_REPO_PREFIX=${HF_SYNC_REPO_PREFIX:-"Senlimulin/2026UCSDIntern_"}
+# paladin (rsync) fallback config:
 REMOTE_SYNC_BASE=${REMOTE_SYNC_BASE:-"slu375@paladin.ucsd.edu:/mnt/raid0_ssd/sheng/brev_result/rl"}
 REMOTE_SYNC_SSH_KEY=${REMOTE_SYNC_SSH_KEY:-""}
+if [ "${REMOTE_SYNC_TARGET}" = "hf" ] && [ -z "${HF_SYNC_TOKEN:-}" ]; then
+    echo "ERROR: REMOTE_SYNC_TARGET=hf requires a write token in HF_SYNC_TOKEN (pass -e HF_SYNC_TOKEN=...)" >&2
+    exit 1
+fi
 
 # Default model is SFT'd from Qwen3-4B-Instruct-2507 (rotary base 5,000,000).
 # Override both vars when MODEL_NAME points at a model with a different
@@ -153,6 +164,7 @@ _TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RUN_DIR="${ROOT_DIR}/${_MODEL_BASENAME}_${_TIMESTAMP}"
 mkdir -p "${RUN_DIR}"
 RUN_SUBDIR=${RUN_SUBDIR:-"${_MODEL_BASENAME}_${_TIMESTAMP}"}
+HF_SYNC_REPO="${HF_SYNC_REPO_PREFIX}${RUN_SUBDIR}"
 LOCAL_LOG="${RUN_DIR}/main.log"
 echo "[run] $(date '+%Y-%m-%d %H:%M:%S') starting run" | tee -a "${LOCAL_LOG}"
 
@@ -163,8 +175,12 @@ echo "[run] REF_LOAD     = ${REF_LOAD}"                              | tee -a "$
 echo "[run] SAVE_DIR     = ${SAVE_DIR}"                              | tee -a "${LOCAL_LOG}"
 echo "[run] RUN_DIR      = ${RUN_DIR}  (logs + step_N checkpoints)"  | tee -a "${LOCAL_LOG}"
 echo "[run] LOCAL_LOG    = ${LOCAL_LOG}"                             | tee -a "${LOCAL_LOG}"
-echo "[run] REMOTE_SYNC  = ${REMOTE_SYNC_BASE}/${RUN_SUBDIR}/"      | tee -a "${LOCAL_LOG}"
+if [ "${REMOTE_SYNC_TARGET}" = "hf" ]; then
+echo "[run] SYNC TARGET  = HF private: ${HF_SYNC_REPO}"             | tee -a "${LOCAL_LOG}"
+else
+echo "[run] SYNC TARGET  = paladin: ${REMOTE_SYNC_BASE}/${RUN_SUBDIR}/" | tee -a "${LOCAL_LOG}"
 echo "[run] SSH_KEY      = ${REMOTE_SYNC_SSH_KEY:-'(ssh-agent)'}"   | tee -a "${LOCAL_LOG}"
+fi
 echo "[run] EDA_SERVER   = ${EDA_SERVER}"                            | tee -a "${LOCAL_LOG}"
 echo "[run] EDA_REPO_DIR = ${EDA_REPO_DIR}"                          | tee -a "${LOCAL_LOG}"
 echo "[run] RUN_SUBDIR   = ${RUN_SUBDIR}"                            | tee -a "${LOCAL_LOG}"
@@ -344,10 +360,30 @@ _rsync_to_remote() {
     fi
 }
 
+# Upload RUN_DIR to a private HF repo. Resumable & incremental: upload_large_folder
+# re-scans each call and only uploads files not already committed. Uses the write
+# token from env HF_SYNC_TOKEN (separate from HF_TOKEN used for model download).
+_hf_upload_once() {
+    HF_SYNC_TOKEN="${HF_SYNC_TOKEN}" python - "$HF_SYNC_REPO" "$RUN_DIR" <<'PYEOF'
+import os, sys
+from huggingface_hub import HfApi
+repo, folder = sys.argv[1], sys.argv[2]
+api = HfApi(token=os.environ["HF_SYNC_TOKEN"])
+api.create_repo(repo_id=repo, repo_type="model", private=True, exist_ok=True)
+api.upload_large_folder(repo_id=repo, folder_path=folder, repo_type="model",
+                        num_workers=8, print_report=False)
+PYEOF
+}
+
 _sync_once() {
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    if [ -d "${RUN_DIR}" ]; then
+    [ -d "${RUN_DIR}" ] || return 0
+    if [ "${REMOTE_SYNC_TARGET}" = "hf" ]; then
+        echo "[sync] ${ts} uploading run dir → HF ${HF_SYNC_REPO} (private)" \
+            | tee -a "${LOCAL_LOG}"
+        _hf_upload_once 2>&1 | tee -a "${LOCAL_LOG}" || true
+    else
         echo "[sync] ${ts} syncing run dir → ${REMOTE_SYNC_BASE}/${RUN_SUBDIR}/" \
             | tee -a "${LOCAL_LOG}"
         _rsync_to_remote \
