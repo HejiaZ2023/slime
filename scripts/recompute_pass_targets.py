@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-recompute_pass_targets.py — 按指定 valid 集的 target 重算一次 eval 的 is_pass_targets pass rate。
+recompute_pass_targets.py — 按指定 valid 集的 target 重算"训练时 eval"的 is_pass_targets pass rate。
 
-输入一个 eval（batch_query_eval --debug 跑出的）：可以给 eval log（其中含一行
-"Debug output written to .../eval_debug.json"），也可以直接给该 eval_debug.json。
-脚本对两个 valid 集分别用其 targets 重新判定 is_pass_targets，输出 Pass@1 / Pass@5。
+背景：训练时 eval（rollout.py）记录在 log 里的 is_pass_targets 在部分 run（尤其 step49→499）是
+**有 bug 的**——即使 coverage 明显低于 target，也会记成 True。本脚本从 log 取每个样本的真实
+coverage，按 valid 集的 target_percentage 重新、正确地判定 is_pass_targets。
 
-判定逻辑复刻 llm4cov/datasets/eval.py：
-  is_pass_targets = has_coverage 且 对每个 target  actual_cov*100 >= target_percentage
-  （target.metric == "Overall Average" 时 actual_cov 取 sample 的 overall_coverage，
-    其他 metric 从 eval_result.misc 取）
-覆盖率(overall_coverage)取自 debug json 中每个 sample 的真实结果，与 target 无关 —— 换 valid
-集只改变判定阈值、不改变覆盖率。
+输入训练时 eval 的 log（run-path 下的 eval_step_49.log / eval_step_499.log 等），其中每个样本一轮
+记录为一行：
+    rollout.py:339 - EVAL_EDA dataset_id=5276 round=1/4 idx=0 status=success reward=1.68 \
+        coverage=0.6817 is_pass_xrun=True is_pass_targets=True filename=...
+该 eval 为 markov-react：每 task 跑多轮、best(最高覆盖率)那轮驱动后续，最终该 task 的覆盖率取其
+所有轮中的最高 coverage（即 Best@1，与 log 末尾 summary 的 overall_coverage Best@1 一致）。
+
+判定复刻 llm4cov/datasets/eval.py：is_pass_targets = 每个 target 满足 coverage*100 >= target_percentage
+（target.metric 为 "Overall Average" 时直接用该 task 的 overall_coverage）。覆盖率取自 log 真实值、
+与 target 无关——换 valid 集只改判定阈值。log 中缺失的 task（xrun 全失败/未生成）记为不通过。
 
 用法:
-  python recompute_pass_targets.py <eval_log 或 eval_debug.json> \
+  python recompute_pass_targets.py <eval_step_*.log> \
       [--valid1 val_codev_rl_test_with_targets.parquet] \
       [--valid2 val_codev_rl_test_r1cov.parquet]
 
-路径自适应容器挂载：给定路径不存在时自动尝试 /mnt/raid0_ssd <-> /data 前缀互换，
-因此 host 和 llm4cov_verl 容器内都能直接跑。
+路径自适应容器挂载：给定路径不存在时自动尝试 /mnt/raid0_ssd <-> /data 前缀互换。
 """
 import argparse
-import json
 import re
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 try:
@@ -40,9 +41,13 @@ DEFAULT_V2 = "/mnt/raid0_ssd/sheng/valid_dataset/val_codev_rl_test_r1cov.parquet
 # host /mnt/raid0_ssd  <->  container /data
 _SWAPS = [("/mnt/raid0_ssd", "/data"), ("/data", "/mnt/raid0_ssd")]
 
+EVAL_RE = re.compile(
+    r"EVAL_EDA dataset_id=(\d+) round=\d+/\d+ idx=\d+ status=(\w+) "
+    r"reward=[\d.]+ coverage=([\d.]+) is_pass_xrun=\w+ is_pass_targets=(\w+)"
+)
+
 
 def resolve(p):
-    """返回实际存在的路径，自动尝试容器挂载前缀互换。"""
     p = Path(p)
     if p.exists():
         return p
@@ -53,19 +58,6 @@ def resolve(p):
             if cand.exists():
                 return cand
     return p
-
-
-def find_debug_json(path):
-    p = resolve(path)
-    if not p.exists():
-        sys.exit(f"找不到输入文件: {path}")
-    if p.suffix == ".json":
-        return p
-    text = p.read_text(errors="ignore")
-    m = re.findall(r"Debug output written to (\S+)", text)
-    if not m:
-        sys.exit(f"未在 {p} 中找到 'Debug output written to ...' —— 该 eval 需用 --debug 跑")
-    return resolve(m[-1])
 
 
 def load_targets(parquet_path):
@@ -79,71 +71,76 @@ def load_targets(parquet_path):
     return out
 
 
-def sample_pass(eval_result, targets_for_pid):
-    """复刻 eval.py 的判定。"""
-    if not eval_result.get("has_coverage", False):
-        return False
-    cov = eval_result.get("overall_coverage", 0.0)
-    misc = eval_result.get("misc", {}) or {}
-    for metric, tgt in targets_for_pid:
-        actual = cov if metric == "Overall Average" else misc.get(metric)
-        if not isinstance(actual, float) or actual * 100 < tgt:
-            return False
-    return True
-
-
-def compute(samples, targets):
-    """返回 (Pass@1, Pass@k, n_task, missing_pids)。
-    Pass@1 = 每 task 内样本平均通过率，再对 task 求平均；
-    Pass@k = 每 task 任一样本通过即算过，再对 task 求平均（k = 每 task 样本数）。"""
-    per_task = defaultdict(list)
-    missing = set()
-    for s in samples:
-        pid = str(s["context_id"])
-        if pid not in targets:
-            missing.add(pid)
+def parse_eval_log(path):
+    """返回 {dataset_id(str): (best_coverage, log_is_pass_targets_str)}，取最高 coverage 那一轮。"""
+    p = resolve(path)
+    if not p.exists():
+        sys.exit(f"找不到 eval log: {path}")
+    best = {}
+    n_rows = 0
+    for line in p.read_text(errors="ignore").splitlines():
+        m = EVAL_RE.search(line)
+        if not m:
             continue
-        per_task[pid].append(sample_pass(s["eval_result"], targets[pid]))
-    n = len(per_task)
-    if n == 0:
-        return 0.0, 0.0, 0, missing
-    p1 = sum(sum(v) / len(v) for v in per_task.values()) / n
-    pk = sum(1.0 if any(v) else 0.0 for v in per_task.values()) / n
-    return p1, pk, n, missing
+        did, status, cov, log_ptg = m.group(1), m.group(2), float(m.group(3)), m.group(4)
+        n_rows += 1
+        if status != "success":
+            continue
+        if did not in best or cov > best[did][0]:
+            best[did] = (cov, log_ptg)
+    if n_rows == 0:
+        sys.exit(f"{p} 中没有 EVAL_EDA 行 —— 不是训练时 eval 的 log？")
+    return best, n_rows
+
+
+def recompute(best, targets):
+    """按 targets 重算。返回 (recomputed_Pass@1, mean_overall_coverage, n_task, n_missing)。"""
+    passes, covs, missing = [], [], 0
+    for pid, tgs in targets.items():
+        rec = best.get(pid)
+        if rec is None:
+            missing += 1
+            passes.append(False)
+            covs.append(0.0)
+            continue
+        cov = rec[0]
+        passes.append(all(cov * 100 >= tgt for (_m, tgt) in tgs))
+        covs.append(cov)
+    n = len(passes) or 1
+    return sum(passes) / n, sum(covs) / n, len(passes), missing
+
+
+def log_original_pass(best, task_ids):
+    """log 里记录的原始 is_pass_targets pass rate（best 轮），缺失记不过。供对比（可能有误）。"""
+    vals = [(best[t][1] == "True") if t in best else False for t in task_ids]
+    return (sum(vals) / len(vals)) if vals else 0.0
 
 
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("eval_log", help="eval log（含 'Debug output written to ...'）或直接给 eval_debug.json")
+    ap.add_argument("eval_log", help="训练时 eval 的 log（含 EVAL_EDA 行），如 eval_step_49.log")
     ap.add_argument("--valid1", default=DEFAULT_V1, help=f"第一个 valid 集 (默认 {DEFAULT_V1})")
     ap.add_argument("--valid2", default=DEFAULT_V2, help=f"第二个 valid 集 (默认 {DEFAULT_V2})")
     args = ap.parse_args()
 
-    dj = find_debug_json(args.eval_log)
-    data = json.load(open(dj))
-    samples = data.get("samples")
-    if not samples:
-        sys.exit(f"{dj} 中没有 'samples' 字段（不是 batch_query_eval --debug 的输出？）")
-    print(f"debug json : {dj}")
-    print(f"samples    : {len(samples)}")
+    best, n_rows = parse_eval_log(args.eval_log)
+    print(f"eval log     : {resolve(args.eval_log)}")
+    print(f"EVAL_EDA 行  : {n_rows}   涉及 task(dataset_id): {len(best)}")
 
-    # sanity: debug json 自带的原始 is_pass_targets（用第一个 valid 集即 with_targets 算的），
-    # 用 --valid1 重算应与之吻合
-    orig = (data.get("per_task") or {}).get("is_pass_targets")
-    if orig:
-        o1 = sum(v["@1"] for v in orig.values()) / len(orig)
-        ok = sum(v.get("@5", v["@1"]) for v in orig.values()) / len(orig)
-        print(f"debug json 原 is_pass_targets : Pass@1={o1 * 100:.1f}%  Pass@5={ok * 100:.1f}%  (应≈valid1)")
+    tg1 = load_targets(args.valid1)
+    orig = log_original_pass(best, list(tg1.keys()))
+    print(f"log 原始 is_pass_targets : Pass@1 = {orig * 100:.1f} %  (训练时记录值，部分 run/step49-499 有误，仅供对比)")
 
     for tag, vp in [("valid1", args.valid1), ("valid2", args.valid2)]:
         tg = load_targets(vp)
-        p1, pk, n, missing = compute(samples, tg)
+        p1, mcov, n, missing = recompute(best, tg)
+        warn = f"   ⚠ {missing} 个 task 在 log 中无成功覆盖率（记为不过）" if missing else ""
         print(f"\n[{tag}] {resolve(vp)}")
-        warn = f"   ⚠ {len(missing)} 个 problem_id 不在该集（已跳过）" if missing else ""
-        print(f"  matched tasks   : {n}{warn}")
-        print(f"  is_pass_targets : Pass@1 = {p1 * 100:.1f} %   Pass@5 = {pk * 100:.1f} %")
+        print(f"  valid tasks      : {n}{warn}")
+        print(f"  overall_coverage : Best@1 = {mcov:.4f}  ({mcov * 100:.1f} %)")
+        print(f"  is_pass_targets  : Pass@1 = {p1 * 100:.1f} %   (按该 valid 集 target 重算)")
 
 
 if __name__ == "__main__":
