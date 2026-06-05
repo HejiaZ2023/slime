@@ -42,7 +42,7 @@ DEFAULT_V2 = "/mnt/raid0_ssd/sheng/valid_dataset/val_codev_rl_test_r1cov.parquet
 _SWAPS = [("/mnt/raid0_ssd", "/data"), ("/data", "/mnt/raid0_ssd")]
 
 EVAL_RE = re.compile(
-    r"EVAL_EDA dataset_id=(\d+) round=\d+/\d+ idx=\d+ status=(\w+) "
+    r"EVAL_EDA (?:dataset_id|ctx)=(\d+) round=\d+/\d+ idx=\d+ status=(\w+) "
     r"reward=[\d.]+ coverage=([\d.]+) is_pass_xrun=\w+ is_pass_targets=(\w+)"
 )
 
