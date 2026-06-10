@@ -29,7 +29,7 @@ set -ex
 
 # -------------------- script-level flags --------------------
 # Usage: bash run-qwen3-4B-4xH100.sh [--offload] [--eda-log-feedback-train] [--eda-log-feedback-eval]
-#                                     [--interval N] [--steps N]
+#                                     [--use-uncovered-log] [--interval N] [--steps N]
 #                                     [--train-dataset NAME] [--eval-dataset NAME]
 #   --offload                Enable --offload-rollout: SGLang offloads model weights to
 #                            CPU during training phase, freeing ~4 GB/GPU for Megatron.
@@ -40,6 +40,11 @@ set -ex
 #   --eda-log-feedback-eval|--elfe
 #                            Fetch full block/expression/FSM uncovered detail from xrun
 #                            during eval rollouts.  Off by default.
+#   --use-uncovered-log|--uul
+#                            When EDA log feedback is on, format the tool-feedback from the
+#                            structured cov_info["uncovered"] (compact per-bin) instead of the
+#                            raw truncated IMC detail text.  No effect without --elft/--elfe.
+#                            Off by default.
 #   --interval N             Checkpoint save + eval interval in rollout steps (default: 50).
 #                            Overrides the CKPT_INTERVAL env var.
 #   --steps N                Total number of rollout steps to train (default: 300).
@@ -53,11 +58,13 @@ set -ex
 OFFLOAD=0
 EDA_LOG_FEEDBACK_TRAIN=0
 EDA_LOG_FEEDBACK_EVAL=0
+USE_UNCOVERED_LOG=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --offload)                OFFLOAD=1 ;;
         --eda-log-feedback-train|--elft) EDA_LOG_FEEDBACK_TRAIN=1 ;;
         --eda-log-feedback-eval|--elfe)  EDA_LOG_FEEDBACK_EVAL=1 ;;
+        --use-uncovered-log|--uul)       USE_UNCOVERED_LOG=1 ;;
         --interval)               CKPT_INTERVAL="${2:?--interval requires a value}"; shift ;;
         --interval=*)             CKPT_INTERVAL="${1#--interval=}" ;;
         --steps)                  NUM_ROLLOUT="${2:?--steps requires a value}"; shift ;;
@@ -320,6 +327,10 @@ if [ "${EDA_LOG_FEEDBACK_EVAL}" = "1" ]; then
     EDA_LOG_FEEDBACK_ARGS+=(--eda-log-feedback-eval)
     echo "[run] EDA log feedback (eval) enabled: full xrun detail in eval tool-feedback" | tee -a "${LOCAL_LOG}"
 fi
+if [ "${USE_UNCOVERED_LOG}" = "1" ]; then
+    EDA_LOG_FEEDBACK_ARGS+=(--use-uncovered-log)
+    echo "[run] use-uncovered-log enabled: tool-feedback from structured cov_info[uncovered]" | tee -a "${LOCAL_LOG}"
+fi
 
 # custom rollout log function (split log dir auto-derived from --save in train.py)
 ROLLOUT_LOG_ARGS=(
@@ -419,7 +430,7 @@ echo "[run] ─── TRAINING CONFIG ──────────────
 echo "[run] NUM_ROLLOUT=${NUM_ROLLOUT}  ckpt_interval=${CKPT_INTERVAL}  eval_interval=${CKPT_INTERVAL}" | tee -a "${LOCAL_LOG}"
 echo "[run] rollout_batch_size=4  n_samples_per_prompt=4  global_batch_size=16" | tee -a "${LOCAL_LOG}"
 echo "[run] num_agentic_rounds=2  eval_num_agentic_rounds=3" | tee -a "${LOCAL_LOG}"
-echo "[run] offload=${OFFLOAD}  eda_log_feedback_train=${EDA_LOG_FEEDBACK_TRAIN}  eda_log_feedback_eval=${EDA_LOG_FEEDBACK_EVAL}" | tee -a "${LOCAL_LOG}"
+echo "[run] offload=${OFFLOAD}  eda_log_feedback_train=${EDA_LOG_FEEDBACK_TRAIN}  eda_log_feedback_eval=${EDA_LOG_FEEDBACK_EVAL}  use_uncovered_log=${USE_UNCOVERED_LOG}" | tee -a "${LOCAL_LOG}"
 echo "[run] train_dataset=${LLM4COV_DATASET}  eval_dataset=${LLM4COV_EVAL_DATASET}" | tee -a "${LOCAL_LOG}"
 echo "[run] ROTARY_BASE=${ROTARY_BASE}" | tee -a "${LOCAL_LOG}"
 echo "[run] ─────────────────────────────────────────────────────────" | tee -a "${LOCAL_LOG}"

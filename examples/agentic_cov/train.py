@@ -114,6 +114,17 @@ def add_agentic_args(parser):
         ),
     )
     parser.add_argument(
+        "--use-uncovered-log",
+        action="store_true",
+        default=False,
+        help=(
+            "When EDA log feedback is on (--eda-log-feedback-train/-eval), build the "
+            "tool-feedback from the structured cov_info['uncovered'] (compact per-bin "
+            "uncovered list) instead of the raw truncated IMC detail text. No effect "
+            "without --eda-log-feedback-*. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--rollout-log-dir",
         type=str,
         default=None,

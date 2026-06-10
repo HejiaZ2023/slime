@@ -183,6 +183,93 @@ def _format_eda_feedback(result: dict[str, Any], context_id: str) -> str:
     return f"- status: {status}\n- stage: success\n- coverage: {detail}"
 
 
+# ── New structured tool-feedback from cov_info["uncovered"] (used iff --use-uncovered-log).
+# Prompt rendering only; the underlying bin_ids stay per-bit for reward. Robust by design:
+# never raises — non-success / missing-uncovered fall back to a minimal line or raw formatter.
+def _agg_toggle_signals(signals: list[str]) -> list[str]:
+    """Aggregate bit signals (sig[15], sig[14], ...) into ranges (sig[15:0])."""
+    import re
+    from collections import defaultdict
+    bits: dict[str, list[int]] = defaultdict(list)
+    order: list[str] = []
+    plain: list[str] = []
+    for s in signals:
+        m = re.match(r"^(.*)\[(\d+)\]$", s)
+        if m:
+            base = m.group(1)
+            if base not in bits:
+                order.append(base)
+            bits[base].append(int(m.group(2)))
+        else:
+            plain.append(s)
+    out: list[str] = []
+    for base in order:
+        bl = sorted(set(bits[base]), reverse=True)
+        parts, i = [], 0
+        while i < len(bl):
+            j = i
+            while j + 1 < len(bl) and bl[j + 1] == bl[j] - 1:
+                j += 1
+            parts.append(f"[{bl[i]}]" if i == j else f"[{bl[i]}:{bl[j]}]")
+            i = j + 1
+        out.append(base + "".join(parts))
+    out.extend(plain)
+    return out
+
+
+def _render_uncov_type(typ: str, items: list[dict]) -> list[str]:
+    if typ == "block":
+        return [f"L{it.get('line')} `{it.get('source', '')}`" for it in items]
+    if typ == "expression":
+        return [f"L{it.get('line')} (expr {it.get('index')})" for it in items]
+    if typ == "fsm":
+        states = [it.get("state") for it in items if it.get("kind") == "state"]
+        trans = [f"{it.get('from')}->{it.get('to')}" for it in items if it.get("kind") == "transition"]
+        out = []
+        if states:
+            out.append("states: " + ", ".join(states))
+        if trans:
+            out.append("transitions: " + ", ".join(trans))
+        return out
+    if typ == "toggle":
+        return _agg_toggle_signals([it.get("signal", "") for it in items])
+    return [str(it.get("id", it)) for it in items]  # assertion/covergroup/unknown fallback
+
+
+def _format_eda_feedback_uncovered(result: dict[str, Any], context_id: str) -> str:
+    status = str(result.get("status", "unknown"))
+    if status != "success":
+        return _format_eda_feedback(result, context_id)  # reuse raw status lines
+    cov_info = result.get("cov_info", {})
+    cov_info = cov_info if isinstance(cov_info, dict) else {}
+    summ = cov_info.get("summary") or []
+    overall = None
+    if summ and isinstance(summ[0], dict):
+        ov = summ[0].get("Overall Average")
+        if isinstance(ov, (int, float)):
+            overall = f"{ov * 100:.1f}%"
+    unc = cov_info.get("uncovered")
+    head = ["- status: success"]
+    if overall is not None:
+        head.append(f"- overall coverage: {overall}")
+    if not isinstance(unc, dict) or not unc.get("by_type"):
+        head.append("- uncovered: none")
+        return "\n".join(head)
+    by_type = unc["by_type"]
+    counts = unc.get("counts", {}) if isinstance(unc.get("counts"), dict) else {}
+    total = unc.get("total_uncovered", sum(len(v) for v in by_type.values()))
+    bits = ", ".join(f"{t} {counts.get(t, len(items))}" for t, items in by_type.items())
+    lines = head + [f"- uncovered ({total}): {bits}"]
+    for typ, items in by_type.items():
+        try:
+            rendered = _render_uncov_type(typ, items)
+        except Exception:
+            rendered = [str(it.get("id", it)) for it in items]
+        lines.append(f"  {typ}:")
+        lines.extend(f"    {r}" for r in rendered)
+    return "\n".join(lines)
+
+
 def _parse_testbench(response: str) -> tuple[str | None, str | None]:
     """Return (filename, verilog_body) parsed from an LLM completion."""
     from llm4cov.llm_query.parse import extract_filename_from_text, extract_verilog_content
@@ -253,7 +340,13 @@ def _compute_reward_sync(
         _eda_log = {"status": "exception", "exc": str(exc), "filename": filename}
         return 0.0, exc_fb if want_detail else None, _eda_log
 
-    eda_feedback = _format_eda_feedback(result, context.id) if want_detail else None
+    if want_detail:
+        if getattr(args, "use_uncovered_log", False):
+            eda_feedback = _format_eda_feedback_uncovered(result, context.id)
+        else:
+            eda_feedback = _format_eda_feedback(result, context.id)
+    else:
+        eda_feedback = None
 
     cov_result = eval_cov_result_against_expectations(context, result)
     _eda_log = {
