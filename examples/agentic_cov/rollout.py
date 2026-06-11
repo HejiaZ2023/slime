@@ -240,6 +240,7 @@ def _apply_diversity_reward(group: list[Sample], args: Namespace) -> None:
         return
     for s, cov in zip(group, covered, strict=False):
         div = sum(1.0 / (n * cnt[b]) for b in cov)
+        s.metadata["diversity"] = div   # logged in TRAIN_SAMPLE/TRAIN_GROUP; absent -> "n/a"
         s.reward = float(s.reward if s.reward is not None else 0.0) + lam * div
 
 
@@ -872,8 +873,10 @@ def log_train_samples(
             for _gs2 in _g:
                 _r2 = float(_gs2.reward or 0.0)
                 _adv2 = (_r2 - _gm) / (_gs + 1e-6) if _use_std else (_r2 - _gm)
+                _d2 = _gs2.metadata.get("diversity")
+                _ds2 = f"{_d2:.4f}" if _d2 is not None else "n/a"
                 _g_lines.append(
-                    f"  idx={_gs2.index:<4} reward={_r2:+.4f} adv={_adv2:+.4f}"
+                    f"  idx={_gs2.index:<4} reward={_r2:+.4f} adv={_adv2:+.4f} div={_ds2}"
                 )
             logger.info(
                 "TRAIN_GROUP  step=%d group=%s dataset_id=%s round=%d "
@@ -894,12 +897,13 @@ def log_train_samples(
             sum(s.rollout_log_probs) / len(s.rollout_log_probs)
             if s.rollout_log_probs else None
         )
+        _div = s.metadata.get("diversity")  # set only under --uur; else None -> "n/a"
         logger.info(
             "TRAIN_SAMPLE step=%d group=%s idx=%s dataset_id=%s "
             "round=%d resp_len=%d truncated=%s "
             "reward=%.4f advantage=%.4f group_mean=%.4f group_std=%.4f "
             "lp_mean=%s "
-            "eda_status=%s coverage=%.4f is_pass_xrun=%s is_pass_targets=%s",
+            "eda_status=%s coverage=%.4f diversity=%s is_pass_xrun=%s is_pass_targets=%s",
             rollout_id, s.group_index, s.index, dataset_id,
             round_num, resp_len,
             s.status.name if s.status else "?",
@@ -907,6 +911,7 @@ def log_train_samples(
             f"{_lp_mean:.4f}" if _lp_mean is not None else "N/A",
             _el.get("status", "?"),
             float(_el.get("overall_coverage", 0.0)),
+            f"{_div:.4f}" if _div is not None else "n/a",
             _el.get("is_pass_xrun"),
             _el.get("is_pass_targets"),
         )
