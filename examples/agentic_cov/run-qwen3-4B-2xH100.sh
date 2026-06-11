@@ -67,6 +67,7 @@ EDA_LOG_FEEDBACK_EVAL=0
 USE_UNCOVERED_LOG=0
 USE_UNCOVERED_REWARD=0
 DIV_LAM=""
+SKIP_EVAL_BEFORE_TRAIN=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --offload)                OFFLOAD=1 ;;
@@ -76,6 +77,7 @@ while [ $# -gt 0 ]; do
         --use-uncovered-reward|--uur)    USE_UNCOVERED_REWARD=1 ;;
         --div-lam)                DIV_LAM="${2:?--div-lam requires a value}"; shift ;;
         --div-lam=*)              DIV_LAM="${1#--div-lam=}" ;;
+        --skip-eval-before-train|--skip-eval) SKIP_EVAL_BEFORE_TRAIN=1 ;;
         --interval)               CKPT_INTERVAL="${2:?--interval requires a value}"; shift ;;
         --interval=*)             CKPT_INTERVAL="${1#--interval=}" ;;
         --steps)                  NUM_ROLLOUT="${2:?--steps requires a value}"; shift ;;
@@ -266,6 +268,10 @@ EVAL_ARGS=(
    --eval-temperature           0.7
    --eval-top-p                 0.8
 )
+if [ "${SKIP_EVAL_BEFORE_TRAIN}" = "1" ]; then
+    EVAL_ARGS+=(--skip-eval-before-train)
+    echo "[run] skip-eval-before-train enabled: no step-0 initial eval" | tee -a "${LOCAL_LOG}"
+fi
 
 # -------------------- parallelism / memory --------------------
 # 4 GPUs split as TP=2 x CP=2 x PP=1. With CP=2 a 40k sequence is sharded
