@@ -357,10 +357,21 @@ def _compute_reward_sync(
         "is_pass_targets": bool(cov_result.is_pass_targets),
         "has_coverage": bool(cov_result.has_coverage),
         "err_msg": (result.get("err_msg") or "") if result.get("status") != "success" else "",
+        # uncovered bin_ids (unaggregated) for group-level diversity reward; only stored
+        # under --use-uncovered-reward (else [] to avoid bloating metadata).
+        "uncovered_bin_ids": (
+            ((result.get("cov_info") or {}).get("uncovered") or {}).get("bin_ids", [])
+            if getattr(args, "use_uncovered_reward", False) else []
+        ),
     }
     if not cov_result.has_coverage:
         return 0.0, eda_feedback, _eda_log
-    return 1.0 + float(cov_result.overall_coverage), eda_feedback, _eda_log
+    cov_score = float(cov_result.overall_coverage)
+    # coverage score rescaled to [0.5,1] ONLY under --use-uncovered-reward (so it
+    # composes with the diversity bonus); otherwise unchanged 1+cov (legacy behaviour).
+    if getattr(args, "use_uncovered_reward", False):
+        return (1.0 + cov_score) / 2.0, eda_feedback, _eda_log
+    return 1.0 + cov_score, eda_feedback, _eda_log
 
 
 async def compute_reward(args: Any, sample: Any, *, want_detail: bool | None = None) -> float:

@@ -205,6 +205,44 @@ def _clone_prompt_into_group(
     return group
 
 
+def _apply_diversity_reward(group: list[Sample], args: Namespace) -> None:
+    """In-place: reward_i = coverage_score_i + div_lam * diversity_i.
+
+    diversity_i = rarity-weighted novel-coverage share over the group's uncovered
+    bin_ids: Uall = union of per-rollout uncovered; covered_i = Uall \\ U_i; over
+    the total covered set C (size n) with per-bin hit count cnt(b), weight(b) =
+    1/(n*cnt(b)); diversity_i = sum of weights of i's covered bins. By construction
+    sum_i diversity_i == 1. Fail rollouts (no coverage) cover nothing -> diversity 0
+    (NOT treated as empty-uncovered, which would mean "covered everything"). No-op
+    (reward stays = coverage score) when no uncovered data is present (e.g. without
+    --eda-log-feedback-train, or an all-fail / single-success group).
+    """
+    from collections import Counter
+
+    lam = float(getattr(args, "div_lam", 0.0) or 0.0)
+    Us: list[set | None] = []
+    for s in group:
+        el = (s.metadata or {}).get("_eda_log") or {}
+        Us.append(set(el.get("uncovered_bin_ids") or []) if el.get("has_coverage") else None)
+    success = [u for u in Us if u is not None]
+    Uall: set = set().union(*success) if success else set()
+    if not Uall:
+        return
+    cnt: Counter = Counter()
+    covered: list[set] = []
+    for u in Us:
+        cov = (Uall - u) if u is not None else set()
+        covered.append(cov)
+        for b in cov:
+            cnt[b] += 1
+    n = len(cnt)  # |C| = size of the total covered set
+    if n == 0:
+        return
+    for s, cov in zip(group, covered, strict=False):
+        div = sum(1.0 / (n * cnt[b]) for b in cov)
+        s.reward = float(s.reward if s.reward is not None else 0.0) + lam * div
+
+
 async def _generate_and_score_group(
     args: Namespace,
     state: GenerateState,
@@ -244,7 +282,10 @@ async def _generate_and_score_group(
                 break
         return sample
 
-    return await asyncio.gather(*[_one(s) for s in group])
+    scored = await asyncio.gather(*[_one(s) for s in group])
+    if getattr(args, "use_uncovered_reward", False):
+        _apply_diversity_reward(scored, args)
+    return scored
 
 
 def _select_pivot_sample(group: list[Sample], evaluation: bool) -> Sample:

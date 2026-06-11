@@ -125,6 +125,27 @@ def add_agentic_args(parser):
         ),
     )
     parser.add_argument(
+        "--use-uncovered-reward",
+        action="store_true",
+        default=False,
+        help=(
+            "Add a group-level diversity bonus to the reward: reward = coverage_score "
+            "+ div_lam * diversity, where diversity is the rarity-weighted novel-coverage "
+            "share over the group's uncovered bin_ids (sum over group == 1). Requires "
+            "--eda-log-feedback-train (uncovered data); no-op without it. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--div-lam",
+        dest="div_lam",
+        type=float,
+        default=None,
+        help=(
+            "Diversity reward weight lambda (reward = coverage_score + div_lam*diversity). "
+            "Required when --use-uncovered-reward is on."
+        ),
+    )
+    parser.add_argument(
         "--rollout-log-dir",
         type=str,
         default=None,

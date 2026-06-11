@@ -29,7 +29,8 @@ set -ex
 
 # -------------------- script-level flags --------------------
 # Usage: bash run-qwen3-4B-4xH100.sh [--offload] [--eda-log-feedback-train] [--eda-log-feedback-eval]
-#                                     [--use-uncovered-log] [--interval N] [--steps N]
+#                                     [--use-uncovered-log] [--use-uncovered-reward --div-lam V]
+#                                     [--interval N] [--steps N]
 #                                     [--train-dataset NAME] [--eval-dataset NAME]
 #   --offload                Enable --offload-rollout: SGLang offloads model weights to
 #                            CPU during training phase, freeing ~4 GB/GPU for Megatron.
@@ -45,6 +46,11 @@ set -ex
 #                            structured cov_info["uncovered"] (compact per-bin) instead of the
 #                            raw truncated IMC detail text.  No effect without --elft/--elfe.
 #                            Off by default.
+#   --use-uncovered-reward|--uur
+#                            Add a group-level diversity bonus to the reward:
+#                            reward = coverage_score + div_lam*diversity. Requires --elft
+#                            (uncovered data) AND --div-lam. No-op without --elft.
+#   --div-lam V              Diversity reward weight lambda. Required with --elft + --uur.
 #   --interval N             Checkpoint save + eval interval in rollout steps (default: 50).
 #                            Overrides the CKPT_INTERVAL env var.
 #   --steps N                Total number of rollout steps to train (default: 300).
@@ -59,12 +65,17 @@ OFFLOAD=0
 EDA_LOG_FEEDBACK_TRAIN=0
 EDA_LOG_FEEDBACK_EVAL=0
 USE_UNCOVERED_LOG=0
+USE_UNCOVERED_REWARD=0
+DIV_LAM=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --offload)                OFFLOAD=1 ;;
         --eda-log-feedback-train|--elft) EDA_LOG_FEEDBACK_TRAIN=1 ;;
         --eda-log-feedback-eval|--elfe)  EDA_LOG_FEEDBACK_EVAL=1 ;;
         --use-uncovered-log|--uul)       USE_UNCOVERED_LOG=1 ;;
+        --use-uncovered-reward|--uur)    USE_UNCOVERED_REWARD=1 ;;
+        --div-lam)                DIV_LAM="${2:?--div-lam requires a value}"; shift ;;
+        --div-lam=*)              DIV_LAM="${1#--div-lam=}" ;;
         --interval)               CKPT_INTERVAL="${2:?--interval requires a value}"; shift ;;
         --interval=*)             CKPT_INTERVAL="${1#--interval=}" ;;
         --steps)                  NUM_ROLLOUT="${2:?--steps requires a value}"; shift ;;
@@ -331,6 +342,15 @@ if [ "${USE_UNCOVERED_LOG}" = "1" ]; then
     EDA_LOG_FEEDBACK_ARGS+=(--use-uncovered-log)
     echo "[run] use-uncovered-log enabled: tool-feedback from structured cov_info[uncovered]" | tee -a "${LOCAL_LOG}"
 fi
+if [ "${USE_UNCOVERED_REWARD}" = "1" ]; then
+    if [ "${EDA_LOG_FEEDBACK_TRAIN}" = "1" ] && [ -z "${DIV_LAM}" ]; then
+        echo "[run] ERROR: --use-uncovered-reward with --eda-log-feedback-train requires --div-lam <value>" >&2
+        exit 1
+    fi
+    EDA_LOG_FEEDBACK_ARGS+=(--use-uncovered-reward)
+    [ -n "${DIV_LAM}" ] && EDA_LOG_FEEDBACK_ARGS+=(--div-lam "${DIV_LAM}")
+    echo "[run] use-uncovered-reward enabled: reward += div_lam*diversity (div_lam=${DIV_LAM:-unset})" | tee -a "${LOCAL_LOG}"
+fi
 
 # custom rollout log function (split log dir auto-derived from --save in train.py)
 ROLLOUT_LOG_ARGS=(
@@ -430,7 +450,7 @@ echo "[run] ─── TRAINING CONFIG ──────────────
 echo "[run] NUM_ROLLOUT=${NUM_ROLLOUT}  ckpt_interval=${CKPT_INTERVAL}  eval_interval=${CKPT_INTERVAL}" | tee -a "${LOCAL_LOG}"
 echo "[run] rollout_batch_size=4  n_samples_per_prompt=4  global_batch_size=16" | tee -a "${LOCAL_LOG}"
 echo "[run] num_agentic_rounds=2  eval_num_agentic_rounds=3" | tee -a "${LOCAL_LOG}"
-echo "[run] offload=${OFFLOAD}  eda_log_feedback_train=${EDA_LOG_FEEDBACK_TRAIN}  eda_log_feedback_eval=${EDA_LOG_FEEDBACK_EVAL}  use_uncovered_log=${USE_UNCOVERED_LOG}" | tee -a "${LOCAL_LOG}"
+echo "[run] offload=${OFFLOAD}  eda_log_feedback_train=${EDA_LOG_FEEDBACK_TRAIN}  eda_log_feedback_eval=${EDA_LOG_FEEDBACK_EVAL}  use_uncovered_log=${USE_UNCOVERED_LOG}  use_uncovered_reward=${USE_UNCOVERED_REWARD}  div_lam=${DIV_LAM:-unset}" | tee -a "${LOCAL_LOG}"
 echo "[run] train_dataset=${LLM4COV_DATASET}  eval_dataset=${LLM4COV_EVAL_DATASET}" | tee -a "${LOCAL_LOG}"
 echo "[run] ROTARY_BASE=${ROTARY_BASE}" | tee -a "${LOCAL_LOG}"
 echo "[run] ─────────────────────────────────────────────────────────" | tee -a "${LOCAL_LOG}"
