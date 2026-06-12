@@ -357,10 +357,12 @@ def _compute_reward_sync(
         "is_pass_targets": bool(cov_result.is_pass_targets),
         "has_coverage": bool(cov_result.has_coverage),
         "err_msg": (result.get("err_msg") or "") if result.get("status") != "success" else "",
-        # uncovered bin_ids (unaggregated) for group-level diversity reward; only stored
-        # under --use-uncovered-reward (else [] to avoid bloating metadata).
-        "uncovered_bin_ids": (
-            ((result.get("cov_info") or {}).get("uncovered") or {}).get("bin_ids", [])
+        # covered bin_ids (full, incl. all-covered) for group-level diversity reward;
+        # only stored under --use-uncovered-reward (else [] to avoid bloating metadata).
+        # NOTE: tool-feedback (prompt + TRAIN/EVAL_EDA_FEEDBACK) still uses the uncovered
+        # set via _format_eda_feedback_uncovered(cov_info["uncovered"]) — unchanged.
+        "covered_bin_ids": (
+            ((result.get("cov_info") or {}).get("covered") or {}).get("bin_ids", [])
             if getattr(args, "use_uncovered_reward", False) else []
         ),
     }
