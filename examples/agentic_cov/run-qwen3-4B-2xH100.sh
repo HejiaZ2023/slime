@@ -397,18 +397,26 @@ _rsync_to_remote() {
     fi
 }
 
-# Upload RUN_DIR to a private HF repo. Resumable & incremental: upload_large_folder
-# re-scans each call and only uploads files not already committed. Uses the write
-# token from env HF_SYNC_TOKEN (separate from HF_TOKEN used for model download).
+# Upload RUN_DIR to a private HF repo via upload_folder: ONE commit per call, no
+# concurrency, incremental (only changed files are re-uploaded). Single attempt —
+# on any failure we log and GIVE UP (no retry); the next daemon cycle (3600 s later)
+# just tries again. This replaces upload_large_folder, whose 8 workers + unbounded
+# resumable retry spiked the 256-commits/hour limit and self-inflicted a 429 storm
+# (27426 retries). Token from env HF_SYNC_TOKEN (separate from HF_TOKEN for download).
 _hf_upload_once() {
     HF_SYNC_TOKEN="${HF_SYNC_TOKEN}" python - "$HF_SYNC_REPO" "$RUN_DIR" <<'PYEOF'
 import os, sys
 from huggingface_hub import HfApi
 repo, folder = sys.argv[1], sys.argv[2]
 api = HfApi(token=os.environ["HF_SYNC_TOKEN"])
-api.create_repo(repo_id=repo, repo_type="model", private=True, exist_ok=True)
-api.upload_large_folder(repo_id=repo, folder_path=folder, repo_type="model",
-                        num_workers=8, print_report=False)
+try:
+    api.create_repo(repo_id=repo, repo_type="model", private=True, exist_ok=True)
+    api.upload_folder(repo_id=repo, folder_path=folder, repo_type="model",
+                      commit_message="sync run dir")
+    print("[sync] upload_folder OK (single commit)")
+except Exception as e:
+    print(f"[sync] upload_folder FAILED — no retry, next cycle will retry: {repr(e)[:300]}")
+    sys.exit(1)
 PYEOF
 }
 
