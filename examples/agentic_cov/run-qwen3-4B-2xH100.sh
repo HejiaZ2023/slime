@@ -225,6 +225,11 @@ CKPT_ARGS=(
 # Override with NUM_ROLLOUT=... to run shorter/longer.
 ROLLOUT_ARGS=(
    --rollout-shuffle
+   # Pin the rollout RNG seed so every training run shuffles the prompt dataset
+   # identically -> step N consumes the same data points across different runs
+   # (given the same dataset + tokenizer + max prompt len). Default is already
+   # 42; pinned explicitly here so it can never silently drift.
+   --rollout-seed           42
    --num-rollout            "${NUM_ROLLOUT}"
    --rollout-batch-size     4
    --n-samples-per-prompt   4

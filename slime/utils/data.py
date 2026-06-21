@@ -269,9 +269,14 @@ class Dataset:
         if self.epoch_id == new_epoch_id:
             return
 
-        random.seed(self.seed + new_epoch_id)
+        # Use a dedicated RNG instance instead of the global `random` module so
+        # the prompt shuffle is fully reproducible across runs regardless of any
+        # other global random consumption, and so it does not perturb global
+        # state. random.Random(s).shuffle yields the same permutation as
+        # random.seed(s); random.shuffle, so the shuffle order is unchanged.
+        rng = random.Random(self.seed + new_epoch_id)
         permutation = list(range(len(self.samples)))
-        random.shuffle(permutation)
+        rng.shuffle(permutation)
         self.samples = [self.origin_samples[i] for i in permutation]
         self.epoch_id = new_epoch_id
 
