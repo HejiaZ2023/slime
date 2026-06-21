@@ -122,7 +122,7 @@ export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
 # If you want more or less GPUs, change this parameter
 NUM_GPUS=2
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 --temp-dir /root/shared/ray_temp 
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=127.0.0.1 --dashboard-port=8265 --temp-dir /root/shared/ray_temp 
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {

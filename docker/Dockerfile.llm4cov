@@ -34,7 +34,8 @@ RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat && \
 # llm4cov_oss editable install; --no-deps preserves the carefully pinned
 # Megatron / TE / transformers / etc. from the base image. tree-sitter is the
 # only runtime dep not already satisfied.
-RUN pip install --no-deps -e /root/slime/third_party/llm4cov_oss && \
+RUN pip install paramiko && \
+    pip install --no-deps -e /root/slime/third_party/llm4cov_oss && \
     pip install 'tree-sitter>=0.25.2' 'tree-sitter-systemverilog>=0.3.1' && \
     python -c 'from llm4cov.datasets.load import load_dataset_by_name; print("llm4cov import OK")'
 

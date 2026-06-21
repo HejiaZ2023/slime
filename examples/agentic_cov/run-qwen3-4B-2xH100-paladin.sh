@@ -171,7 +171,7 @@ ray start --head \
     --num-gpus "${NUM_GPUS}" \
     --temp-dir "${RAY_TEMP_DIR}" \
     --disable-usage-stats \
-    --dashboard-host=0.0.0.0 \
+    --dashboard-host=127.0.0.1 \
     --dashboard-port=8265
 
 RUNTIME_ENV_JSON="{

@@ -404,7 +404,8 @@ _rsync_to_remote() {
 # resumable retry spiked the 256-commits/hour limit and self-inflicted a 429 storm
 # (27426 retries). Token from env HF_SYNC_TOKEN (separate from HF_TOKEN for download).
 _hf_upload_once() {
-    HF_SYNC_TOKEN="${HF_SYNC_TOKEN}" python - "$HF_SYNC_REPO" "$RUN_DIR" <<'PYEOF'
+    set +x   # xtrace OFF: 防 HF_SYNC_TOKEN 被 set -ex 的 trace 打进日志 (2026-06 泄露事件)
+    python - "$HF_SYNC_REPO" "$RUN_DIR" <<'PYEOF'   # token 由 python 从环境继承, 不在命令行出现
 import os, sys
 from huggingface_hub import HfApi
 repo, folder = sys.argv[1], sys.argv[2]
@@ -418,6 +419,9 @@ except Exception as e:
     print(f"[sync] upload_folder FAILED — no retry, next cycle will retry: {repr(e)[:300]}")
     sys.exit(1)
 PYEOF
+    _rc=$?
+    set -x   # xtrace 恢复
+    return $_rc
 }
 
 _sync_once() {
@@ -469,13 +473,28 @@ echo "[run] train_dataset=${LLM4COV_DATASET}  eval_dataset=${LLM4COV_EVAL_DATASE
 echo "[run] ROTARY_BASE=${ROTARY_BASE}" | tee -a "${LOCAL_LOG}"
 echo "[run] ─────────────────────────────────────────────────────────" | tee -a "${LOCAL_LOG}"
 
+# Ensure the container hostname resolves locally. Otherwise Ray's dashboard
+# agent (prometheus/OpenTelemetry) hangs ~30s on DNS for the hostname via the
+# systemd-resolved stub, and the raylet times out in WaitForDashboardAgentPorts
+# (Check failed: metrics_export_port), killing "node startup".
+grep -q " $(hostname)\$" /etc/hosts || echo "127.0.0.1 $(hostname)" >> /etc/hosts 2>/dev/null || true
+
 ray start --head \
     --node-ip-address "${MASTER_ADDR}" \
     --num-gpus "${NUM_GPUS}" \
     --temp-dir "${RAY_TEMP_DIR}" \
     --disable-usage-stats \
-    --dashboard-host=0.0.0.0 \
-    --dashboard-port=8265
+    --dashboard-host=127.0.0.1 \
+    --dashboard-port=8265 \
+    --port=6379 \
+    --node-manager-port=6380 \
+    --object-manager-port=6381 \
+    --runtime-env-agent-port=6382 \
+    --dashboard-agent-grpc-port=6383 \
+    --dashboard-agent-listen-port=6384 \
+    --metrics-export-port=6385 \
+    --min-worker-port=16000 \
+    --max-worker-port=19000
 
 echo "[run] Ray dashboard: http://$(hostname -I | awk '{print $1}'):8265" | tee -a "${LOCAL_LOG}"
 

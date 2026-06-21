@@ -141,7 +141,7 @@ MISC_ARGS=(
 )
 
 export no_proxy="127.0.0.1,${MASTER_ADDR}"
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" --disable-usage-stats --dashboard-host=127.0.0.1 --dashboard-port=8265
 
 HOSTFILE=${HOSTFILE:-}
 if [ -n "${HOSTFILE}" ]; then
