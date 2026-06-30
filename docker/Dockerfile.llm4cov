@@ -16,14 +16,36 @@ FROM slimerl/slime:${BASE_IMAGE_TAG}
 ARG SLIME_REPO_URL=https://github.com/HejiaZ2023/slime.git
 ARG SLIME_COMMIT=main
 
-# Replace upstream THUDM/slime checkout with our fork. --recurse-submodules
-# pulls third_party/llm4cov_oss as recorded in .gitmodules.
-RUN rm -rf /root/slime && \
-    git clone --recurse-submodules ${SLIME_REPO_URL} /root/slime && \
-    cd /root/slime && \
-    git checkout ${SLIME_COMMIT} && \
-    git submodule update --init --recursive && \
-    pip install --no-deps --no-build-isolation -e .
+# Replace upstream THUDM/slime checkout with our fork.
+#
+# The code is already present in the build context: a fresh brev launch clones
+# brev_docker (which now vendors the complete ctr_slime/slime + full llm4cov_oss),
+# and `make build` uses that local dir as the build context. So we COPY it in
+# rather than re-fetching.
+#
+# The old git-clone path is DISABLED on purpose: it pulled the gutted
+# HejiaZ2023/llm4cov_oss (no xfer_client.py / sftp, no local-parquet loader) and
+# its pinned submodule commit (6ea9e0c) was deleted upstream, so
+# `git submodule update --init` failed and broke the build.
+# ARG SLIME_REPO_URL / SLIME_COMMIT above are now unused.
+# RUN rm -rf /root/slime && \
+#     git clone --recurse-submodules ${SLIME_REPO_URL} /root/slime && \
+#     cd /root/slime && \
+#     git checkout ${SLIME_COMMIT} && \
+#     git submodule update --init --recursive && \
+#     pip install --no-deps --no-build-isolation -e .
+RUN rm -rf /root/slime
+COPY . /root/slime
+
+# Integrity check: fail the build early if the vendored llm4cov_oss is the gutted
+# version (missing the sftp transport / local-parquet loader) instead of the
+# complete one — exactly the files the old submodule path used to drop.
+RUN test -f /root/slime/third_party/llm4cov_oss/src/llm4cov/eda_client/xfer_client.py \
+ && test -f /root/slime/third_party/llm4cov_oss/src/llm4cov/datasets/load.py \
+ && test -f /root/slime/examples/agentic_cov/reward.py \
+ || { echo "ERROR: vendored slime/llm4cov_oss is INCOMPLETE — re-vendor from brev_docker"; exit 1; }
+
+RUN cd /root/slime && pip install --no-deps --no-build-isolation -e .
 
 # int4_qat extension is built against the slime source tree, so rebuild
 # against our fork's copy (kernel sources are identical to upstream today,

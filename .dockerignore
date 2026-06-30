@@ -1,0 +1,11 @@
+# build env / caches — never bake into the image (runtime live-mounts /root/slime)
+**/.venv
+**/.git
+**/wandb
+**/__pycache__
+**/*.egg-info
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/*.bak_predeploy
