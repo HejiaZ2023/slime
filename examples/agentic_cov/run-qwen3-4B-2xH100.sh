@@ -68,6 +68,7 @@ USE_UNCOVERED_LOG=0
 USE_UNCOVERED_REWARD=0
 DIV_LAM=""
 SKIP_EVAL_BEFORE_TRAIN=0
+OPD_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --offload)                OFFLOAD=1 ;;
@@ -86,6 +87,12 @@ while [ $# -gt 0 ]; do
         --train-dataset=*)        LLM4COV_DATASET="${1#--train-dataset=}" ;;
         --eval-dataset)           LLM4COV_EVAL_DATASET="${2:?--eval-dataset requires a value}"; shift ;;
         --eval-dataset=*)         LLM4COV_EVAL_DATASET="${1#--eval-dataset=}" ;;
+        --use-opd-relay|--opd-score-student-rollouts)
+                                  OPD_ARGS+=("$1") ;;
+        --opd-teachers|--opd-lambda|--opd-gate-eps|--opd-timeout|--opd-poll|--opd-namespace|--opd-server|--opd-transport|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
+                                  OPD_ARGS+=("$1" "${2:?$1 requires a value}"); shift ;;
+        --opd-teachers=*|--opd-lambda=*|--opd-gate-eps=*|--opd-timeout=*|--opd-poll=*|--opd-namespace=*|--opd-server=*|--opd-transport=*|--opd-xfer-dir=*|--opd-sftp-host=*|--opd-sftp-port=*|--opd-sftp-user=*|--opd-sftp-key=*)
+                                  OPD_ARGS+=("$1") ;;
         *) echo "[run] Unknown argument: $1" >&2; exit 1 ;;
     esac
     shift
@@ -533,4 +540,5 @@ ray job submit --address="http://127.0.0.1:8265" \
     "${EDA_LOG_FEEDBACK_ARGS[@]}" \
     "${ROLLOUT_LOG_ARGS[@]}" \
     "${WANDB_ARGS[@]}" \
+    "${OPD_ARGS[@]}" \
     2>&1 | tee -a "${LOCAL_LOG}"
