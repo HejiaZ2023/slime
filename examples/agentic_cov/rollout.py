@@ -44,7 +44,14 @@ from slime.utils.async_utils import run
 from slime.utils.types import Sample
 
 from .dataset import build_samples_from_llm4cov
-from .reward import compute_reward
+from .opd_remote_client import (
+    OpdRelayClient,
+    build_job_id,
+    build_round_files,
+    load_result_tree,
+    parse_teacher_specs,
+)
+from .reward import _parse_testbench, compute_reward
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +244,395 @@ def _apply_diversity_reward(group: list[Sample], args: Namespace) -> None:
         s.reward = float(s.reward if s.reward is not None else 0.0) + lam * div
 
 
+
+def _set_train_loss_type(sample: Sample, loss_type: str, **extra: Any) -> None:
+    meta = dict(sample.train_metadata or {})
+    meta["loss_type"] = loss_type
+    meta.update(extra)
+    sample.train_metadata = meta
+
+
+def _prompt_to_text(
+    prompt: str | list[dict[str, str]],
+    tokenizer: Any,
+    apply_chat_template_kwargs: dict[str, Any],
+) -> str:
+    if isinstance(prompt, str):
+        return prompt
+    return tokenizer.apply_chat_template(
+        prompt,
+        tokenize=False,
+        add_generation_prompt=True,
+        **(apply_chat_template_kwargs or {}),
+    )
+
+
+def _sample_prompt_ids(sample: Sample, tokenizer: Any, prompt_text: str) -> list[int]:
+    if sample.tokens and sample.response_length >= 0:
+        prompt_len = max(0, len(sample.tokens) - int(sample.response_length or 0))
+        if prompt_len > 0:
+            return list(sample.tokens[:prompt_len])
+    return list(tokenizer.encode(prompt_text, add_special_tokens=False))
+
+
+def _sample_response_token_ids(sample: Sample) -> list[int]:
+    if not sample.tokens or not sample.response_length:
+        return []
+    return list(sample.tokens[-int(sample.response_length):])
+
+
+def _coerce_float_list(value: Any) -> list[float] | None:
+    if not isinstance(value, list):
+        return None
+    out: list[float] = []
+    for item in value:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def _coerce_int_list(value: Any) -> list[int] | None:
+    if not isinstance(value, list):
+        return None
+    out: list[int] = []
+    for item in value:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def _entry_reward(entry: dict[str, Any]) -> float:
+    for key in ("reward", "score", "coverage_reward"):
+        if key in entry:
+            try:
+                return float(entry[key])
+            except (TypeError, ValueError):
+                return 0.0
+    eda_log = entry.get("eda_log") or entry.get("eda") or {}
+    if isinstance(eda_log, dict) and eda_log.get("has_coverage"):
+        try:
+            return 1.0 + float(eda_log.get("overall_coverage", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def _entry_eda_log(entry: dict[str, Any]) -> dict[str, Any]:
+    eda_log = entry.get("eda_log") or entry.get("eda") or {}
+    return dict(eda_log) if isinstance(eda_log, dict) else {}
+
+
+def _entry_feedback(entry: dict[str, Any]) -> str | None:
+    feedback = entry.get("eda_feedback") or entry.get("feedback")
+    return str(feedback) if feedback is not None else None
+
+
+def _result_entries(result: dict[str, Any], *keys: str) -> list[dict[str, Any]]:
+    for key in keys:
+        value = result.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            return [v for v in value if isinstance(v, dict)]
+        if isinstance(value, dict):
+            rollouts = value.get("rollouts")
+            if isinstance(rollouts, list):
+                return [v for v in rollouts if isinstance(v, dict)]
+            return [v for v in value.values() if isinstance(v, dict)]
+    return []
+
+
+def _student_rollout_payload(sample: Sample, slot: int) -> dict[str, Any]:
+    sid = f"s{slot:03d}"
+    sample.metadata["_opd_student_id"] = sid
+    filename, testbench = _parse_testbench(sample.response or "")
+    payload: dict[str, Any] = {
+        "id": sid,
+        "sample_index": sample.index,
+        "assistant_response": sample.response or "",
+        "filename": filename,
+        "response_token_ids": _sample_response_token_ids(sample),
+        "rollout_log_probs": sample.rollout_log_probs or [],
+        "status": sample.status.value if sample.status else "unknown",
+    }
+    if testbench is not None:
+        payload["testbench"] = testbench
+    return payload
+
+
+def _apply_remote_student_scores(group: list[Sample], result: dict[str, Any]) -> None:
+    entries = _result_entries(result, "student_rollouts", "students", "student")
+    by_id = {str(e.get("id")): e for e in entries if e.get("id") is not None}
+    missing: list[str] = []
+    for sample in group:
+        sid = str(sample.metadata.get("_opd_student_id", ""))
+        entry = by_id.get(sid)
+        if entry is None:
+            missing.append(sid)
+            continue
+        sample.reward = _entry_reward(entry)
+        sample.metadata["_eda_log"] = _entry_eda_log(entry)
+        feedback = _entry_feedback(entry)
+        if feedback is not None:
+            sample.metadata["eda_feedback"] = feedback
+        _set_train_loss_type(sample, "rl")
+    if missing:
+        raise RuntimeError(f"OPD relay result missing student entries: {missing}")
+
+
+def _best_entry(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not entries:
+        return None
+    return max(entries, key=_entry_reward)
+
+
+def _make_teacher_sample(
+    *,
+    args: Namespace,
+    state: GenerateState,
+    reference_student: Sample,
+    teacher_entry: dict[str, Any],
+    prompt_text: str,
+    messages_history: list[dict[str, str]],
+    sample_index: int,
+    round_idx: int,
+    best_student_reward: float,
+    best_teacher_reward: float,
+) -> Sample:
+    response = str(
+        teacher_entry.get("assistant_response")
+        or teacher_entry.get("response")
+        or teacher_entry.get("text")
+        or ""
+    )
+    tokenizer = state.tokenizer
+    prompt_ids = _sample_prompt_ids(reference_student, tokenizer, prompt_text)
+    response_ids = list(tokenizer.encode(response, add_special_tokens=False))
+    returned_ids = _coerce_int_list(
+        teacher_entry.get("generated_token_ids")
+        or teacher_entry.get("token_ids")
+        or teacher_entry.get("output_token_ids")
+    )
+    token_logprobs = _coerce_float_list(
+        teacher_entry.get("generated_token_logprobs")
+        or teacher_entry.get("token_logprobs")
+        or teacher_entry.get("output_token_logprobs")
+    )
+    teacher_log_probs = None
+    if token_logprobs is not None and len(token_logprobs) == len(response_ids):
+        if returned_ids is None or returned_ids == response_ids:
+            teacher_log_probs = token_logprobs
+
+    metadata = {
+        **copy.deepcopy(reference_student.metadata),
+        "round_number": round_idx,
+        "chat_history": copy.deepcopy(messages_history),
+        "opd_teacher": teacher_entry.get("teacher") or teacher_entry.get("teacher_name"),
+        "opd_teacher_rollout_id": teacher_entry.get("id"),
+        "opd_best_student_reward": best_student_reward,
+        "opd_best_teacher_reward": best_teacher_reward,
+        "opd_gate_pass": True,
+        "_eda_log": _entry_eda_log(teacher_entry),
+    }
+    feedback = _entry_feedback(teacher_entry)
+    if feedback is not None:
+        metadata["eda_feedback"] = feedback
+
+    sample = Sample(
+        prompt=reference_student.prompt,
+        tokens=prompt_ids + response_ids,
+        response=response,
+        response_length=len(response_ids),
+        label=reference_student.label,
+        reward=best_teacher_reward,
+        loss_mask=[1] * len(response_ids),
+        group_index=reference_student.group_index,
+        index=sample_index,
+        session_id=str(uuid.uuid4()),
+        metadata=metadata,
+        teacher_log_probs=teacher_log_probs,
+        status=Sample.Status.COMPLETED,
+        train_metadata={
+            "loss_type": "opd",
+            "opd_weight": float(getattr(args, "opd_lambda", 1.0) or 0.0),
+            "best_student_reward": best_student_reward,
+            "best_teacher_reward": best_teacher_reward,
+            "teacher": metadata.get("opd_teacher"),
+        },
+    )
+    if teacher_log_probs is None and token_logprobs is not None:
+        sample.metadata["opd_teacher_logprob_alignment"] = "mismatch"
+    return sample
+
+
+async def _generate_group_only(
+    args: Namespace,
+    state: GenerateState,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+) -> list[Sample]:
+    async def _one(sample: Sample) -> Sample:
+        if sample.session_id is None:
+            sample.session_id = str(uuid.uuid4())
+        async with state.semaphore:
+            await generate(args, sample, sampling_params.copy())
+        return sample
+
+    return await asyncio.gather(*[_one(s) for s in group])
+
+
+async def _score_existing_group_locally(
+    args: Namespace,
+    group: list[Sample],
+    want_detail: bool,
+) -> list[Sample]:
+    async def _one(sample: Sample) -> Sample:
+        sample.reward = await compute_reward(args, sample, want_detail=want_detail)
+        _set_train_loss_type(sample, "rl")
+        return sample
+
+    scored = await asyncio.gather(*[_one(s) for s in group])
+    if getattr(args, "use_uncovered_reward", False):
+        _apply_diversity_reward(scored, args)
+    return scored
+
+
+def _run_opd_relay_round_sync(
+    *,
+    args: Namespace,
+    job_id: str,
+    dataset_id: str,
+    rollout_id: int,
+    round_idx: int,
+    prompt_text: str,
+    messages_history: list[dict[str, str]],
+    context: dict[str, Any],
+    student_rollouts: list[dict[str, Any]],
+    sampling_params: dict[str, Any],
+    want_detail: bool,
+) -> dict[str, Any]:
+    teachers = parse_teacher_specs(getattr(args, "opd_teachers", ""))
+    if not teachers:
+        raise ValueError("OPD relay enabled but no teachers configured")
+    files = build_round_files(
+        job_id=job_id,
+        dataset_id=dataset_id,
+        rollout_id=rollout_id,
+        round_idx=round_idx,
+        prompt=prompt_text,
+        state={
+            "round_idx": round_idx,
+            "messages_history": messages_history,
+            "prompt_is_chat_template_text": True,
+        },
+        context=context,
+        student_rollouts=student_rollouts,
+        teachers=teachers,
+        sampling_params=sampling_params,
+        want_detail=want_detail,
+        score_student_rollouts=bool(getattr(args, "opd_score_student_rollouts", False)),
+    )
+    client = OpdRelayClient(args)
+    try:
+        result_dir = client.submit_and_wait(
+            job_id,
+            files,
+            timeout_s=float(getattr(args, "opd_timeout", 1800.0) or 1800.0),
+            poll_s=float(getattr(args, "opd_poll", 2.0) or 2.0),
+        )
+        return load_result_tree(result_dir)
+    finally:
+        client.close()
+
+
+async def _score_group_with_opd_relay(
+    *,
+    args: Namespace,
+    state: GenerateState,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    rollout_id: int,
+    round_idx: int,
+    dataset_id: str,
+    want_detail: bool,
+    sample_index_allocator,
+) -> tuple[list[Sample], list[Sample]]:
+    reference = group[0]
+    apply_chat_template_kwargs = getattr(args, "apply_chat_template_kwargs", {}) or {}
+    prompt_text = _prompt_to_text(reference.prompt, state.tokenizer, apply_chat_template_kwargs)
+    messages_history = list(reference.metadata.get("chat_history") or reference.metadata.get("initial_messages") or [])
+    context = reference.metadata.get("llm4cov_context") or {}
+    if not isinstance(context, dict):
+        raise RuntimeError("OPD relay requires llm4cov_context metadata as a dict")
+
+    student_rollouts = [_student_rollout_payload(sample, i) for i, sample in enumerate(group)]
+    job_id = build_job_id(dataset_id, rollout_id, round_idx)
+    result = await asyncio.to_thread(
+        _run_opd_relay_round_sync,
+        args=args,
+        job_id=job_id,
+        dataset_id=dataset_id,
+        rollout_id=rollout_id,
+        round_idx=round_idx,
+        prompt_text=prompt_text,
+        messages_history=messages_history,
+        context=context,
+        student_rollouts=student_rollouts,
+        sampling_params=sampling_params,
+        want_detail=want_detail,
+    )
+
+    _apply_remote_student_scores(group, result)
+    teacher_entries = _result_entries(result, "teacher_rollouts", "teachers", "teacher")
+    best_teacher = _best_entry(teacher_entries)
+    best_student = max(group, key=lambda s: float(s.reward or 0.0))
+    best_student_reward = float(best_student.reward or 0.0)
+    best_teacher_reward = _entry_reward(best_teacher) if best_teacher is not None else -float("inf")
+    gate_eps = float(getattr(args, "opd_gate_eps", 0.0) or 0.0)
+    gate_pass = best_teacher is not None and best_teacher_reward > best_student_reward + gate_eps
+
+    for sample in group:
+        sample.metadata["opd_job_id"] = job_id
+        sample.metadata["opd_best_student_reward"] = best_student_reward
+        sample.metadata["opd_best_teacher_reward"] = best_teacher_reward
+        sample.metadata["opd_gate_pass"] = bool(gate_pass)
+
+    logger.info(
+        "OPD_GATE step=%d dataset_id=%s round=%d job=%s gate=%s "
+        "best_student=%.4f best_teacher=%.4f eps=%.4f n_teachers=%d",
+        rollout_id,
+        dataset_id,
+        round_idx + 1,
+        job_id,
+        gate_pass,
+        best_student_reward,
+        best_teacher_reward,
+        gate_eps,
+        len(teacher_entries),
+    )
+
+    if gate_pass and best_teacher is not None:
+        teacher_index = sample_index_allocator(1)
+        teacher_sample = _make_teacher_sample(
+            args=args,
+            state=state,
+            reference_student=reference,
+            teacher_entry=best_teacher,
+            prompt_text=prompt_text,
+            messages_history=messages_history,
+            sample_index=teacher_index,
+            round_idx=round_idx,
+            best_student_reward=best_student_reward,
+            best_teacher_reward=best_teacher_reward,
+        )
+        return [teacher_sample], group
+
+    return group, group
+
 async def _generate_and_score_group(
     args: Namespace,
     state: GenerateState,
@@ -279,6 +675,8 @@ async def _generate_and_score_group(
     scored = await asyncio.gather(*[_one(s) for s in group])
     if getattr(args, "use_uncovered_reward", False):
         _apply_diversity_reward(scored, args)
+    for sample in scored:
+        _set_train_loss_type(sample, "rl")
     return scored
 
 
@@ -341,11 +739,36 @@ async def _rollout_one_prompt(
         for s in current_group:
             s.metadata["round_number"] = round_idx
 
-        current_group = await _generate_and_score_group(
-            args, state, current_group, sampling_params,
-            max_retries=max_retries, want_detail=_want_detail,
-        )
-        rounds_output.append(current_group)
+        train_group: list[Sample]
+        if bool(getattr(args, "use_opd_relay", False)) and not evaluation:
+            current_group = await _generate_group_only(args, state, current_group, sampling_params)
+            try:
+                train_group, current_group = await _score_group_with_opd_relay(
+                    args=args,
+                    state=state,
+                    group=current_group,
+                    sampling_params=sampling_params,
+                    rollout_id=rollout_id,
+                    round_idx=round_idx,
+                    dataset_id=context_id,
+                    want_detail=_want_detail,
+                    sample_index_allocator=sample_index_allocator,
+                )
+            except Exception:
+                logger.exception(
+                    "OPD relay failed; falling back to local RL scoring "
+                    "step=%d dataset_id=%s round=%d",
+                    rollout_id, context_id, round_idx + 1,
+                )
+                current_group = await _score_existing_group_locally(args, current_group, _want_detail)
+                train_group = current_group
+        else:
+            current_group = await _generate_and_score_group(
+                args, state, current_group, sampling_params,
+                max_retries=max_retries, want_detail=_want_detail,
+            )
+            train_group = current_group
+        rounds_output.append(train_group)
 
         rewards = [float(s.reward or 0.0) for s in current_group]
         logger.info(
@@ -868,8 +1291,9 @@ def log_train_samples(
                 _adv2 = (_r2 - _gm) / (_gs + 1e-6) if _use_std else (_r2 - _gm)
                 _d2 = _gs2.metadata.get("diversity")
                 _ds2 = f"{_d2:.4f}" if _d2 is not None else "n/a"
+                _lt2 = (_gs2.train_metadata or {}).get("loss_type", "rl")
                 _g_lines.append(
-                    f"  idx={_gs2.index:<4} reward={_r2:+.4f} adv={_adv2:+.4f} div={_ds2}"
+                    f"  idx={_gs2.index:<4} loss={_lt2:<3} reward={_r2:+.4f} adv={_adv2:+.4f} div={_ds2}"
                 )
             logger.info(
                 "TRAIN_GROUP  step=%d group=%s dataset_id=%s round=%d "
@@ -891,14 +1315,15 @@ def log_train_samples(
             if s.rollout_log_probs else None
         )
         _div = s.metadata.get("diversity")  # set only under --uur; else None -> "n/a"
+        _loss_type = (s.train_metadata or {}).get("loss_type", "rl")
         logger.info(
             "TRAIN_SAMPLE step=%d group=%s idx=%s dataset_id=%s "
-            "round=%d resp_len=%d truncated=%s "
+            "round=%d loss_type=%s resp_len=%d truncated=%s "
             "reward=%.4f advantage=%.4f group_mean=%.4f group_std=%.4f "
             "lp_mean=%s "
             "eda_status=%s coverage=%.4f diversity=%s is_pass_xrun=%s is_pass_targets=%s",
             rollout_id, s.group_index, s.index, dataset_id,
-            round_num, resp_len,
+            round_num, _loss_type, resp_len,
             s.status.name if s.status else "?",
             raw_reward, _advantage, _g_mean, _g_std,
             f"{_lp_mean:.4f}" if _lp_mean is not None else "N/A",
@@ -954,7 +1379,8 @@ def log_train_samples(
     # ── zero-std group summary ────────────────────────────────────────────
     _zero_std_gids = [
         gid for gid, rs in _group_raw.items()
-        if max(rs) == min(rs)  # all samples in group share the same reward
+        if max(rs) == min(rs)
+        and all((_s.train_metadata or {}).get("loss_type", "rl") == "rl" for _s in _group_samples[gid])
     ]
     if _zero_std_gids:
         _zs_info = [

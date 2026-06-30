@@ -818,6 +818,38 @@ def policy_loss_function(
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
 
+    loss_types = batch.get("loss_types") or ["rl"] * len(response_lengths)
+    base_loss_masks = batch["loss_masks"]
+    has_opd_samples = any(loss_type == "opd" for loss_type in loss_types)
+    rl_loss_masks = [
+        loss_mask if loss_type == "rl" else torch.zeros_like(loss_mask)
+        for loss_mask, loss_type in zip(base_loss_masks, loss_types, strict=False)
+    ]
+    opd_loss_masks = [
+        loss_mask if loss_type == "opd" else torch.zeros_like(loss_mask)
+        for loss_mask, loss_type in zip(base_loss_masks, loss_types, strict=False)
+    ]
+    rl_sum_of_sample_mean = (
+        get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            rl_loss_masks,
+            args.calculate_per_token_loss,
+            args.qkv_format,
+            max_seq_lens,
+        )
+        if has_opd_samples
+        else sum_of_sample_mean
+    )
+    opd_sum_of_sample_mean = get_sum_of_sample_mean(
+        total_lengths,
+        response_lengths,
+        opd_loss_masks,
+        args.calculate_per_token_loss,
+        args.qkv_format,
+        max_seq_lens,
+    )
+
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
@@ -856,7 +888,7 @@ def policy_loss_function(
             full_log_probs=full_log_probs,
             full_old_log_probs=full_old_log_probs,
             advantages=batch["advantages"],
-            loss_masks=batch["loss_masks"],
+            loss_masks=rl_loss_masks if has_opd_samples else batch["loss_masks"],
         )
 
     # Compute KL divergence (GSPO uses sequence-level KL, others use per-token KL)
@@ -865,7 +897,7 @@ def policy_loss_function(
             full_log_probs=full_log_probs,
             full_old_log_probs=full_old_log_probs,
             local_log_probs=log_probs,
-            loss_masks=batch["loss_masks"],
+            loss_masks=rl_loss_masks if has_opd_samples else batch["loss_masks"],
         )
         old_log_probs = torch.cat(old_log_probs, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
@@ -889,7 +921,7 @@ def policy_loss_function(
         # *pre-RS* valid tokens. If we aggregate metrics with `modified_response_masks`, the rejected
         # tokens are excluded from the denominator and the metric can be artificially driven to 0.
         # Keep a copy of the original reducer (based on `batch["loss_masks"]`) for metric aggregation.
-        sum_of_sample_mean_for_mismatch_metrics = sum_of_sample_mean
+        sum_of_sample_mean_for_mismatch_metrics = rl_sum_of_sample_mean
 
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
@@ -899,7 +931,7 @@ def policy_loss_function(
             "pg_loss": pg_loss,
             "train_log_probs": batch["log_probs"],
             "rollout_log_probs": batch["rollout_log_probs"],
-            "loss_masks": batch["loss_masks"],
+            "loss_masks": rl_loss_masks if has_opd_samples else batch["loss_masks"],
             "total_lengths": total_lengths,
             "response_lengths": response_lengths,
         }
@@ -925,23 +957,55 @@ def policy_loss_function(
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
         # Determine which loss_masks to use for pg_loss reducer
-        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        pg_loss_masks = (
+            modified_response_masks
+            if (args.get_mismatch_metrics or args.use_tis)
+            else (rl_loss_masks if has_opd_samples else batch["loss_masks"])
+        )
         pg_loss_reducer = custom_pg_loss_reducer_func(
             total_lengths, response_lengths, pg_loss_masks, args.calculate_per_token_loss
         )
     else:
-        pg_loss_reducer = sum_of_sample_mean
+        pg_loss_reducer = rl_sum_of_sample_mean
 
     pg_loss = pg_loss_reducer(pg_loss)
-    pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
-    ppo_kl = sum_of_sample_mean(ppo_kl)
+    pg_clipfrac = rl_sum_of_sample_mean(pg_clipfrac)
+    ppo_kl = rl_sum_of_sample_mean(ppo_kl)
 
-    # entropy loss
+    # entropy loss applies to RL tokens only in mixed OPD/RL batches.
     entropy = log_probs_and_entropy["entropy"]
     entropy = torch.cat(entropy, dim=0)
-    entropy_loss = sum_of_sample_mean(entropy)
+    entropy_loss = rl_sum_of_sample_mean(entropy)
 
-    loss = pg_loss - args.entropy_coef * entropy_loss
+    opd_loss = log_probs.new_tensor(0.0)
+    opd_sampled_kl = None
+    opd_teacher_logprob_coverage = None
+    if has_opd_samples:
+        default_opd_weight = float(getattr(args, "opd_lambda", 1.0) or 0.0)
+        opd_weights = batch.get("opd_weights") or [default_opd_weight] * len(response_lengths)
+        weight_vec = torch.cat([
+            torch.full(
+                (response_length,),
+                float(weight),
+                dtype=log_probs.dtype,
+                device=log_probs.device,
+            )
+            for weight, response_length in zip(opd_weights, response_lengths, strict=False)
+        ], dim=0)
+        opd_loss = opd_sum_of_sample_mean(-log_probs * weight_vec)
+
+        if batch.get("teacher_log_probs") is not None:
+            teacher_log_probs = torch.cat(batch["teacher_log_probs"], dim=0).to(device=log_probs.device)
+            if batch.get("teacher_logprob_masks") is not None:
+                teacher_valid = torch.cat(batch["teacher_logprob_masks"], dim=0).to(
+                    device=log_probs.device, dtype=log_probs.dtype
+                )
+            else:
+                teacher_valid = torch.ones_like(log_probs)
+            opd_sampled_kl = opd_sum_of_sample_mean((teacher_log_probs - log_probs) * teacher_valid)
+            opd_teacher_logprob_coverage = opd_sum_of_sample_mean(teacher_valid)
+
+    loss = pg_loss + opd_loss - args.entropy_coef * entropy_loss
 
     if args.use_kl_loss:
         ref_log_probs = batch["ref_log_probs"]
@@ -955,7 +1019,7 @@ def policy_loss_function(
             kl_loss_type=args.kl_loss_type,
             importance_ratio=importance_ratio,
         )
-        kl_loss = sum_of_sample_mean(kl)
+        kl_loss = rl_sum_of_sample_mean(kl)
 
         loss = loss + args.kl_loss_coef * kl_loss
 
@@ -966,11 +1030,12 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        train_rollout_logprob_abs_diff = rl_sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
 
     reported_loss = {
         "loss": loss.clone().detach(),
         "pg_loss": pg_loss.clone().detach(),
+        "opd_loss": opd_loss.clone().detach(),
         "entropy_loss": entropy_loss.clone().detach(),
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
@@ -978,6 +1043,11 @@ def policy_loss_function(
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
+
+    if opd_sampled_kl is not None:
+        reported_loss["opd_sampled_kl"] = opd_sampled_kl.clone().detach()
+    if opd_teacher_logprob_coverage is not None:
+        reported_loss["opd_teacher_logprob_coverage"] = opd_teacher_logprob_coverage.clone().detach()
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()

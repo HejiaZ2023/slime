@@ -671,27 +671,37 @@ class RolloutManager:
             return self.custom_reward_post_process_func(self.args, samples)
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
+        loss_types = [
+            (sample.train_metadata or {}).get("loss_type", "rl")
+            for sample in samples
+        ]
         if (
             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
-            # group norm
-            rewards = torch.tensor(raw_rewards, dtype=torch.float)
-            if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
-                rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
-            else:
-                # when samples count are not equal in each group
-                rewards = rewards.view(-1, rewards.shape[-1])
-            mean = rewards.mean(dim=-1, keepdim=True)
-            rewards = rewards - mean
+            # OPD CE samples must not receive RL advantages.  Normalize only RL
+            # samples within each rollout group; variable group sizes are expected
+            # when OPD gate passes.
+            from collections import defaultdict
 
-            if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
-                std = rewards.std(dim=-1, keepdim=True)
-                rewards = rewards / (std + 1e-6)
+            rewards = [0.0] * len(samples)
+            groups = defaultdict(list)
+            for i, sample in enumerate(samples):
+                if loss_types[i] == "rl":
+                    groups[sample.group_index].append(i)
 
-            return raw_rewards, rewards.flatten().tolist()
+            for indices in groups.values():
+                group_rewards = torch.tensor([raw_rewards[i] for i in indices], dtype=torch.float)
+                group_rewards = group_rewards - group_rewards.mean()
+                if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
+                    group_rewards = group_rewards / (group_rewards.std(unbiased=False) + 1e-6)
+                for i, reward in zip(indices, group_rewards.tolist(), strict=False):
+                    rewards[i] = reward
 
-        return raw_rewards, raw_rewards
+            return raw_rewards, rewards
+
+        rewards = [raw if loss_type == "rl" else 0.0 for raw, loss_type in zip(raw_rewards, loss_types, strict=False)]
+        return raw_rewards, rewards
 
     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):
         """
@@ -705,6 +715,15 @@ class RolloutManager:
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)
 
+        loss_types = [
+            (sample.train_metadata or {}).get("loss_type", "rl")
+            for sample in samples
+        ]
+        opd_weights = [
+            float((sample.train_metadata or {}).get("opd_weight", 1.0))
+            for sample in samples
+        ]
+
         train_data = {
             "tokens": [sample.tokens for sample in samples],
             "response_lengths": [sample.response_length for sample in samples],
@@ -714,6 +733,9 @@ class RolloutManager:
             "raw_reward": raw_rewards,
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
             "sample_indices": [sample.index for sample in samples],
+            "loss_types": loss_types,
+            "opd_weights": opd_weights,
+            "opd_is_active": [1.0 if loss_type == "opd" else 0.0 for loss_type in loss_types],
         }
 
         # loss mask
@@ -744,21 +766,38 @@ class RolloutManager:
         if samples[0].metadata and "round_number" in samples[0].metadata:
             train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
 
-        # Add rollout log probabilities for off-policy correction
-        if samples[0].rollout_log_probs is not None:
-            train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
+        # Add rollout log probabilities for off-policy correction. Mixed OPD/RL
+        # batches may only have rollout-side logprobs on the student samples.
+        if self.args.use_rollout_logprobs or any(sample.rollout_log_probs is not None for sample in samples):
+            train_data["rollout_log_probs"] = [
+                sample.rollout_log_probs
+                if sample.rollout_log_probs is not None
+                else [0.0] * sample.response_length
+                for sample in samples
+            ]
 
         if samples[0].rollout_routed_experts is not None:
             train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
 
-        if samples[0].train_metadata is not None:
-            train_data["metadata"] = [sample.train_metadata for sample in samples]
+        if any(sample.train_metadata is not None for sample in samples):
+            train_data["metadata"] = [sample.train_metadata or {} for sample in samples]
 
         if any(sample.multimodal_train_inputs is not None for sample in samples):
             train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 
-        if samples[0].teacher_log_probs is not None:
-            train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+        if any(sample.teacher_log_probs is not None for sample in samples):
+            train_data["teacher_log_probs"] = [
+                sample.teacher_log_probs
+                if sample.teacher_log_probs is not None
+                else [0.0] * sample.response_length
+                for sample in samples
+            ]
+            train_data["teacher_logprob_masks"] = [
+                [1] * sample.response_length
+                if sample.teacher_log_probs is not None
+                else [0] * sample.response_length
+                for sample in samples
+            ]
 
         return train_data
 
@@ -799,6 +838,10 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_logprob_masks",
+                "loss_types",
+                "opd_weights",
+                "opd_is_active",
             ]:
                 if key not in data:
                     continue

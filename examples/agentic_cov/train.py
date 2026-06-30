@@ -146,6 +146,87 @@ def add_agentic_args(parser):
         ),
     )
     parser.add_argument(
+        "--use-opd-relay",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable OPD relay training. Student rollouts are generated locally, "
+            "student/teacher EDA is delegated to the paladin relay, and a gated "
+            "teacher CE sample is used instead of RL loss for that prompt-round "
+            "when the best teacher beats the best student."
+        ),
+    )
+    parser.add_argument(
+        "--opd-teachers",
+        type=str,
+        default="stage0:1,stage1:1",
+        help="Comma-separated teacher rollout spec, e.g. 'stage0:1,stage1:1'.",
+    )
+    parser.add_argument(
+        "--opd-lambda",
+        type=float,
+        default=1.0,
+        help="Weight for the OPD CE/NLL loss on gated teacher responses.",
+    )
+    parser.add_argument(
+        "--opd-gate-eps",
+        type=float,
+        default=0.0,
+        help="Require best_teacher_reward > best_student_reward + eps to use OPD.",
+    )
+    parser.add_argument(
+        "--opd-timeout",
+        type=float,
+        default=1800.0,
+        help="Wall-clock timeout in seconds for each OPD relay job.",
+    )
+    parser.add_argument(
+        "--opd-poll",
+        type=float,
+        default=2.0,
+        help="Polling interval in seconds while waiting for OPD relay results.",
+    )
+    parser.add_argument(
+        "--opd-namespace",
+        type=str,
+        default="opd",
+        help="Relay xfer namespace under incoming/ and results/.",
+    )
+    parser.add_argument(
+        "--opd-server",
+        type=str,
+        default="local",
+        help="OPD relay server hint. Use local on paladin, or a host for SFTP mode.",
+    )
+    parser.add_argument(
+        "--opd-transport",
+        type=str,
+        default="",
+        choices=["", "local", "sftp"],
+        help="OPD relay transport. Empty auto-selects local for paladin/local, else sftp.",
+    )
+    parser.add_argument(
+        "--opd-xfer-dir",
+        type=str,
+        default="/mnt/raid0_ssd/eda/xfer",
+        help="Local xfer root when --opd-transport local is used.",
+    )
+    parser.add_argument("--opd-sftp-host", type=str, default="", help="SFTP relay host.")
+    parser.add_argument("--opd-sftp-port", type=int, default=2222, help="SFTP relay port.")
+    parser.add_argument("--opd-sftp-user", type=str, default="gpujobs", help="SFTP relay user.")
+    parser.add_argument(
+        "--opd-sftp-key",
+        type=str,
+        default="~/.ssh/brev_eda_sftp",
+        help="Private key for SFTP relay transport.",
+    )
+    parser.add_argument(
+        "--opd-score-student-rollouts",
+        action="store_true",
+        default=False,
+        help="Reserved for future true reverse-KL: ask teachers to score student responses.",
+    )
+    parser.add_argument(
         "--rollout-log-dir",
         type=str,
         default=None,
@@ -173,6 +254,16 @@ if __name__ == "__main__":
     if not args.rollout_log_dir and args.save:
         args.rollout_log_dir = args.save.rstrip("/") + "_rollout_logs"
 
+    if getattr(args, "use_opd_relay", False):
+        if not getattr(args, "opd_teachers", ""):
+            raise ValueError("--use-opd-relay requires --opd-teachers")
+        if not getattr(args, "use_dynamic_global_batch_size", False):
+            logger.warning(
+                "OPD relay can return variable samples per prompt-round; enabling "
+                "--use-dynamic-global-batch-size for this run."
+            )
+            args.use_dynamic_global_batch_size = True
+
     logger.info("=== llm4cov slime RL training config ===")
 
     # ---------- checkpoint paths ----------
@@ -196,6 +287,17 @@ if __name__ == "__main__":
     logger.info("  EDA server=%s  repo=%s  stage_timeout=%ds",
                 args.eda_server, args.eda_repo_dir,
                 getattr(args, "eda_stage_timeout", 30))
+
+    logger.info("  OPD relay enabled=%s  teachers=%s  lambda=%s  gate_eps=%s",
+                getattr(args, "use_opd_relay", False),
+                getattr(args, "opd_teachers", ""),
+                getattr(args, "opd_lambda", None),
+                getattr(args, "opd_gate_eps", None))
+    logger.info("  OPD relay transport=%s  server=%s  namespace=%s  timeout=%ss",
+                getattr(args, "opd_transport", "") or "auto",
+                getattr(args, "opd_server", ""),
+                getattr(args, "opd_namespace", "opd"),
+                getattr(args, "opd_timeout", None))
 
     # ---------- training hyperparams ----------
     logger.info("  num_rollout=%d  save_interval=%d  eval_interval=%s",
