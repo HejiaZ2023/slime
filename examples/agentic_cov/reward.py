@@ -15,12 +15,16 @@ the model in the next round's tool-feedback turn.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 # import re   # only used by the old _format_eda_feedback implementation (see below)
+import threading
 import uuid
 from typing import Any
 
 logger = logging.getLogger(__name__)
+_MISSING_DUT_LOG_LOCK = threading.Lock()
 
 _DEFAULT_TB_FILENAME = "tb_generated.sv"
 
@@ -290,6 +294,47 @@ def _rehydrate_context(context_dict: dict[str, Any]):
     return LlmGenTbContext(**context_dict)
 
 
+def _record_missing_dut_item(
+    args: Any,
+    context: Any,
+    filename: str,
+    result: dict[str, Any],
+    exc: AssertionError,
+) -> None:
+    """Persist dataset-bad items whose EDA result has no expected DUT entry."""
+    log_dir = getattr(args, "rollout_log_dir", None) or getattr(args, "save", None)
+    if not log_dir:
+        return
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        cov_summary = ((result.get("cov_info") or {}).get("summary") or [])
+        seen_modules = []
+        for item in cov_summary[:100]:
+            if isinstance(item, dict):
+                seen_modules.append({"name": item.get("name"), "level": item.get("level")})
+        row = {
+            "status": "missing_dut",
+            "dataset_id": str(getattr(context, "id", "")),
+            "dut_top_module_name": getattr(context, "dut_top_module_name", ""),
+            "dut_top_instance_name": getattr(context, "dut_top_instance_name", ""),
+            "dataset_name": getattr(context, "dataset_name", ""),
+            "filename": filename,
+            "eda_status": result.get("status", ""),
+            "message": str(exc),
+            "reward_override": 1.0,
+            "seen_modules_head": seen_modules,
+        }
+        path = os.path.join(log_dir, "missing_dut_items.jsonl")
+        with _MISSING_DUT_LOG_LOCK:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        logger.exception(
+            "Failed to record missing-DUT dataset item %s",
+            getattr(context, "id", "?"),
+        )
+
+
 def _compute_reward_sync(
     args: Any, context_dict: dict[str, Any], response: str
 ) -> tuple[float, str | None, dict]:
@@ -348,7 +393,35 @@ def _compute_reward_sync(
     else:
         eda_feedback = None
 
-    cov_result = eval_cov_result_against_expectations(context, result)
+    try:
+        cov_result = eval_cov_result_against_expectations(context, result)
+    except AssertionError as exc:
+        message = str(exc)
+        if message.startswith("Missing DUT module "):
+            logger.warning(
+                "Skipping dataset item with missing DUT coverage: id=%s dut=%s filename=%s err=%s",
+                context.id,
+                getattr(context, "dut_top_module_name", ""),
+                filename,
+                message,
+            )
+            _record_missing_dut_item(args, context, filename, result, exc)
+            skip_feedback = (
+                f"- status: skipped (dataset issue: {message}; reward set to 1.0)"
+            )
+            _eda_log = {
+                "status": "missing_dut",
+                "filename": filename,
+                "overall_coverage": 0.0,
+                "is_pass_xrun": result.get("status") != "xrun_failed",
+                "is_pass_targets": False,
+                "has_coverage": False,
+                "err_msg": message,
+                "missing_dut": True,
+                "reward_override": 1.0,
+            }
+            return 1.0, skip_feedback if want_detail else None, _eda_log
+        raise
     _eda_log = {
         "status": result.get("status", "xrun_failed"),
         "filename": filename,
