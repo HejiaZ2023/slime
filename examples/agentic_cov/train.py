@@ -257,12 +257,6 @@ if __name__ == "__main__":
     if getattr(args, "use_opd_relay", False):
         if not getattr(args, "opd_teachers", ""):
             raise ValueError("--use-opd-relay requires --opd-teachers")
-        if not getattr(args, "use_dynamic_global_batch_size", False):
-            logger.warning(
-                "OPD relay can return variable samples per prompt-round; enabling "
-                "--use-dynamic-global-batch-size for this run."
-            )
-            args.use_dynamic_global_batch_size = True
 
     logger.info("=== llm4cov slime RL training config ===")
 

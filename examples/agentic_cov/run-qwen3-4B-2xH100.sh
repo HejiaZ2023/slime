@@ -61,6 +61,10 @@ set -ex
 #   --eval-dataset  NAME     HuggingFace dataset name for eval rollouts
 #                            (default: hez2024/cvdp_ecov_eval).
 #                            Overrides the LLM4COV_EVAL_DATASET env var.
+#   --batch-size N           Number of task prompts per rollout step. Smoke uses 1;
+#                            full runs can use 4. Internal slime rollout_batch_size
+#                            is N * num_agentic_rounds.
+#   --n-student N            Number of student rollouts per prompt. Smoke uses 2.
 OFFLOAD=0
 EDA_LOG_FEEDBACK_TRAIN=0
 EDA_LOG_FEEDBACK_EVAL=0
@@ -87,6 +91,14 @@ while [ $# -gt 0 ]; do
         --train-dataset=*)        LLM4COV_DATASET="${1#--train-dataset=}" ;;
         --eval-dataset)           LLM4COV_EVAL_DATASET="${2:?--eval-dataset requires a value}"; shift ;;
         --eval-dataset=*)         LLM4COV_EVAL_DATASET="${1#--eval-dataset=}" ;;
+        --batch-size|--prompt-batch-size|--task-batch-size)
+                                  PROMPT_BATCH_SIZE="${2:?$1 requires a value}"; shift ;;
+        --batch-size=*|--prompt-batch-size=*|--task-batch-size=*)
+                                  PROMPT_BATCH_SIZE="${1#*=}" ;;
+        --n-student|--n-samples-per-prompt)
+                                  N_STUDENT="${2:?$1 requires a value}"; shift ;;
+        --n-student=*|--n-samples-per-prompt=*)
+                                  N_STUDENT="${1#*=}" ;;
         --use-opd-relay|--opd-score-student-rollouts)
                                   OPD_ARGS+=("$1") ;;
         --opd-teachers|--opd-lambda|--opd-gate-eps|--opd-timeout|--opd-poll|--opd-namespace|--opd-server|--opd-transport|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
@@ -140,6 +152,11 @@ LLM4COV_EVAL_DATASET=${LLM4COV_EVAL_DATASET:-hez2024/cvdp_ecov_eval}
 LLM4COV_EVAL_SPLIT=${LLM4COV_EVAL_SPLIT:-eval}
 NUM_ROLLOUT=${NUM_ROLLOUT:-300}
 CKPT_INTERVAL=${CKPT_INTERVAL:-50}   # shared interval for --save-interval and --eval-interval
+NUM_AGENTIC_ROUNDS=${NUM_AGENTIC_ROUNDS:-2}
+PROMPT_BATCH_SIZE=${PROMPT_BATCH_SIZE:-4}
+N_STUDENT=${N_STUDENT:-4}
+ROLLOUT_BATCH_SIZE=$((PROMPT_BATCH_SIZE * NUM_AGENTIC_ROUNDS))
+GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_STUDENT))
 
 # -------------------- remote sync --------------------
 # HF checkpoints and training log are rsynced to REMOTE_SYNC_BASE under a
@@ -226,8 +243,9 @@ CKPT_ARGS=(
 )
 
 # -------------------- rollout / batching --------------------
-# group_size = n_samples_per_prompt = 4
-# global_batch_size = 16  ->  rollout_batch_size = 16 / 4 = 4
+# group_size = n_samples_per_prompt = N_STUDENT
+# rollout_batch_size = PROMPT_BATCH_SIZE * NUM_AGENTIC_ROUNDS
+# global_batch_size = rollout_batch_size * N_STUDENT
 # Default 300 steps total -> --num-rollout 300 (default num_steps_per_rollout=1).
 # Override with NUM_ROLLOUT=... to run shorter/longer.
 ROLLOUT_ARGS=(
@@ -238,8 +256,8 @@ ROLLOUT_ARGS=(
    # 42; pinned explicitly here so it can never silently drift.
    --rollout-seed           42
    --num-rollout            "${NUM_ROLLOUT}"
-   --rollout-batch-size     4
-   --n-samples-per-prompt   4
+   --rollout-batch-size     "${ROLLOUT_BATCH_SIZE}"
+   --n-samples-per-prompt   "${N_STUDENT}"
    --rollout-max-response-len 16384
    --rollout-temperature    1.0
 
@@ -247,7 +265,7 @@ ROLLOUT_ARGS=(
    # converts list[dict] -> str so sglang's tokenizer.encode accepts it.
    --apply-chat-template
 
-   --global-batch-size      16
+   --global-batch-size      "${GLOBAL_BATCH_SIZE}"
    --balance-data
 )
 
@@ -255,7 +273,7 @@ ROLLOUT_ARGS=(
 AGENTIC_ARGS=(
    --rollout-function-path examples.agentic_cov.rollout.generate_rollout
    --data-source-path      examples.agentic_cov.data_source.LlmCovDataSource
-   --num-agentic-rounds       2
+   --num-agentic-rounds       "${NUM_AGENTIC_ROUNDS}"
    --eval-num-agentic-rounds  3
    --llm4cov-dataset-name        "${LLM4COV_DATASET}"
    --llm4cov-dataset-split       "${LLM4COV_SPLIT}"
@@ -478,8 +496,8 @@ mkdir -p "${RAY_TEMP_DIR}"
 
 echo "[run] ─── TRAINING CONFIG ────────────────────────────────────" | tee -a "${LOCAL_LOG}"
 echo "[run] NUM_ROLLOUT=${NUM_ROLLOUT}  ckpt_interval=${CKPT_INTERVAL}  eval_interval=${CKPT_INTERVAL}" | tee -a "${LOCAL_LOG}"
-echo "[run] rollout_batch_size=4  n_samples_per_prompt=4  global_batch_size=16" | tee -a "${LOCAL_LOG}"
-echo "[run] num_agentic_rounds=2  eval_num_agentic_rounds=3" | tee -a "${LOCAL_LOG}"
+echo "[run] prompt_batch_size=${PROMPT_BATCH_SIZE}  num_agentic_rounds=${NUM_AGENTIC_ROUNDS}  rollout_batch_size=${ROLLOUT_BATCH_SIZE}  n_student=${N_STUDENT}  global_batch_size=${GLOBAL_BATCH_SIZE}" | tee -a "${LOCAL_LOG}"
+echo "[run] num_agentic_rounds=${NUM_AGENTIC_ROUNDS}  eval_num_agentic_rounds=3" | tee -a "${LOCAL_LOG}"
 echo "[run] offload=${OFFLOAD}  eda_log_feedback_train=${EDA_LOG_FEEDBACK_TRAIN}  eda_log_feedback_eval=${EDA_LOG_FEEDBACK_EVAL}  use_uncovered_log=${USE_UNCOVERED_LOG}  use_uncovered_reward=${USE_UNCOVERED_REWARD}  div_lam=${DIV_LAM:-unset}" | tee -a "${LOCAL_LOG}"
 echo "[run] train_dataset=${LLM4COV_DATASET}  eval_dataset=${LLM4COV_EVAL_DATASET}" | tee -a "${LOCAL_LOG}"
 echo "[run] ROTARY_BASE=${ROTARY_BASE}" | tee -a "${LOCAL_LOG}"

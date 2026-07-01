@@ -533,19 +533,11 @@ def apply_opd_kl_to_advantages(
     advantages: list[torch.Tensor],
     student_log_probs: list[torch.Tensor] | None,
 ) -> None:
-    """Apply on-policy distillation KL penalty to advantages.
+    """Apply reverse-KL OPD as a token-level policy-gradient signal.
 
-    Computes reverse KL (student_logp - teacher_logp) and adds weighted penalty
-    to advantages in-place. This is orthogonal to the base advantage estimator.
-
-    Args:
-        args: Configuration containing `use_opd` and `opd_kl_coef`.
-        rollout_data: Dict containing "teacher_log_probs".
-        advantages: List of advantage tensors to modify in-place.
-        student_log_probs: List of student log-probability tensors.
-
-    References:
-        https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/tinker_cookbook/distillation/train_on_policy.py
+    Teacher log-probs are computed on the *student sampled tokens*.  For OPD
+    relay samples the task reward is zeroed upstream, so this penalty is the only
+    advantage signal when the gate passes.
     """
 
     if student_log_probs is None:
@@ -553,18 +545,26 @@ def apply_opd_kl_to_advantages(
 
     teacher_log_probs = rollout_data.get("teacher_log_probs")
     if teacher_log_probs is None:
-        raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
+        raise ValueError("OPD requires teacher_log_probs, but they are missing.")
 
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
+    teacher_masks = rollout_data.get("teacher_logprob_masks")
+    if teacher_masks is None:
+        teacher_masks = [torch.ones_like(t, dtype=torch.float32, device=device) for t in teacher_log_probs]
+    else:
+        teacher_masks = [m.to(device=device, dtype=torch.float32) for m in teacher_masks]
+
+    default_coef = float(getattr(args, "opd_lambda", getattr(args, "opd_kl_coef", 0.0)) or 0.0)
+    opd_weights = rollout_data.get("opd_weights") or [default_coef] * len(student_log_probs)
 
     reverse_kls = []
     for i, adv in enumerate(advantages):
-        reverse_kl = student_log_probs[i] - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
+        coef = float(opd_weights[i]) if i < len(opd_weights) else default_coef
+        reverse_kl = (student_log_probs[i] - teacher_log_probs[i]) * teacher_masks[i]
+        advantages[i] = adv - coef * reverse_kl
         reverse_kls.append(reverse_kl)
 
-    # Store reverse KL for logging
     rollout_data["opd_reverse_kl"] = reverse_kls
 
 
@@ -662,8 +662,13 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     else:
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
 
-    # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
-    if args.use_opd:
+    # Apply OPD when explicitly enabled or when relay-provided teacher log-probs
+    # are present for gated student-token samples.
+    loss_types = rollout_data.get("loss_types") or []
+    has_relay_opd = rollout_data.get("teacher_log_probs") is not None and any(
+        loss_type == "opd" for loss_type in loss_types
+    )
+    if args.use_opd or has_relay_opd:
         apply_opd_kl_to_advantages(
             args=args,
             rollout_data=rollout_data,
@@ -953,6 +958,8 @@ def policy_loss_function(
             max_seq_lens,
         )
 
+    pg_loss_tokens = pg_loss
+
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
@@ -968,7 +975,7 @@ def policy_loss_function(
     else:
         pg_loss_reducer = rl_sum_of_sample_mean
 
-    pg_loss = pg_loss_reducer(pg_loss)
+    pg_loss = pg_loss_reducer(pg_loss_tokens)
     pg_clipfrac = rl_sum_of_sample_mean(pg_clipfrac)
     ppo_kl = rl_sum_of_sample_mean(ppo_kl)
 
@@ -981,18 +988,7 @@ def policy_loss_function(
     opd_sampled_kl = None
     opd_teacher_logprob_coverage = None
     if has_opd_samples:
-        default_opd_weight = float(getattr(args, "opd_lambda", 1.0) or 0.0)
-        opd_weights = batch.get("opd_weights") or [default_opd_weight] * len(response_lengths)
-        weight_vec = torch.cat([
-            torch.full(
-                (response_length,),
-                float(weight),
-                dtype=log_probs.dtype,
-                device=log_probs.device,
-            )
-            for weight, response_length in zip(opd_weights, response_lengths, strict=False)
-        ], dim=0)
-        opd_loss = opd_sum_of_sample_mean(-log_probs * weight_vec)
+        opd_loss = opd_sum_of_sample_mean(pg_loss_tokens)
 
         if batch.get("teacher_log_probs") is not None:
             teacher_log_probs = torch.cat(batch["teacher_log_probs"], dim=0).to(device=log_probs.device)
@@ -1002,7 +998,7 @@ def policy_loss_function(
                 )
             else:
                 teacher_valid = torch.ones_like(log_probs)
-            opd_sampled_kl = opd_sum_of_sample_mean((teacher_log_probs - log_probs) * teacher_valid)
+            opd_sampled_kl = opd_sum_of_sample_mean((log_probs - teacher_log_probs) * teacher_valid)
             opd_teacher_logprob_coverage = opd_sum_of_sample_mean(teacher_valid)
 
     loss = pg_loss + opd_loss - args.entropy_coef * entropy_loss

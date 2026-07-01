@@ -355,7 +355,9 @@ def _student_rollout_payload(sample: Sample, slot: int) -> dict[str, Any]:
         "sample_index": sample.index,
         "assistant_response": sample.response or "",
         "filename": filename,
+        "input_token_ids": list(sample.tokens or []),
         "response_token_ids": _sample_response_token_ids(sample),
+        "response_token_count": int(sample.response_length or 0),
         "rollout_log_probs": sample.rollout_log_probs or [],
         "status": sample.status.value if sample.status else "unknown",
     }
@@ -534,7 +536,7 @@ def _run_opd_relay_round_sync(
         teachers=teachers,
         sampling_params=sampling_params,
         want_detail=want_detail,
-        score_student_rollouts=bool(getattr(args, "opd_score_student_rollouts", False)),
+        score_student_rollouts=True,
     )
     client = OpdRelayClient(args)
     try:
@@ -616,20 +618,67 @@ async def _score_group_with_opd_relay(
     )
 
     if gate_pass and best_teacher is not None:
-        teacher_index = sample_index_allocator(1)
-        teacher_sample = _make_teacher_sample(
-            args=args,
-            state=state,
-            reference_student=reference,
-            teacher_entry=best_teacher,
-            prompt_text=prompt_text,
-            messages_history=messages_history,
-            sample_index=teacher_index,
-            round_idx=round_idx,
-            best_student_reward=best_student_reward,
-            best_teacher_reward=best_teacher_reward,
-        )
-        return [teacher_sample], group
+        student_entries_by_id = {
+            str(entry.get("id")): entry
+            for entry in _result_entries(result, "student_rollouts", "students", "student")
+            if entry.get("id") is not None
+        }
+        best_teacher_name = str(best_teacher.get("teacher") or best_teacher.get("teacher_name") or "")
+
+        def _student_teacher_log_probs(sample: Sample) -> list[float] | None:
+            sid = str(sample.metadata.get("_opd_student_id", ""))
+            entry = student_entries_by_id.get(sid)
+            if entry is None:
+                return None
+            direct = _coerce_float_list(entry.get("teacher_log_probs"))
+            if direct is not None and (not best_teacher_name or entry.get("teacher_logprob_teacher") == best_teacher_name):
+                return direct
+            for score in entry.get("teacher_scores") or []:
+                if not isinstance(score, dict):
+                    continue
+                if best_teacher_name and str(score.get("teacher") or "") != best_teacher_name:
+                    continue
+                if score.get("status") != "success":
+                    continue
+                scored = _coerce_float_list(score.get("teacher_log_probs"))
+                if scored is not None:
+                    return scored
+            return None
+
+        valid_opd = bool(best_teacher_name)
+        teacher_log_probs_by_index: dict[int, list[float]] = {}
+        for sample in group:
+            teacher_log_probs = _student_teacher_log_probs(sample)
+            expected = int(sample.response_length or 0)
+            if teacher_log_probs is None or len(teacher_log_probs) != expected:
+                valid_opd = False
+                sample.metadata["opd_gate_reason"] = (
+                    f"teacher_logprob_len={len(teacher_log_probs) if teacher_log_probs is not None else 'missing'} "
+                    f"expected={expected}"
+                )
+                break
+            teacher_log_probs_by_index[int(sample.index)] = teacher_log_probs
+
+        if valid_opd:
+            for sample in group:
+                teacher_log_probs = teacher_log_probs_by_index[int(sample.index)]
+                sample.teacher_log_probs = teacher_log_probs
+                sample.metadata["opd_teacher_logprob_teacher"] = best_teacher_name
+                sample.metadata["opd_teacher_logprob_tokens"] = len(teacher_log_probs)
+                _set_train_loss_type(
+                    sample,
+                    "opd",
+                    opd_weight=float(getattr(args, "opd_lambda", 1.0) or 0.0),
+                    best_student_reward=best_student_reward,
+                    best_teacher_reward=best_teacher_reward,
+                    teacher=best_teacher_name,
+                )
+            return group, group
+
+        for sample in group:
+            sample.metadata["opd_gate_pass"] = False
+            sample.metadata.setdefault("opd_gate_reason", "missing_teacher_log_probs")
+            _set_train_loss_type(sample, "rl")
 
     return group, group
 

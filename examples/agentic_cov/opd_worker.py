@@ -301,6 +301,66 @@ def generate_teacher_rollout(name: str, slot: int, prompt: str, sampling_params:
     }
 
 
+def extract_input_logprobs(meta: dict[str, Any], response_len: int) -> list[float]:
+    pairs = meta.get("input_token_logprobs") or []
+    logprobs: list[float] = []
+    if not isinstance(pairs, list) or response_len <= 0:
+        return logprobs
+    for item in pairs:
+        if isinstance(item, (list, tuple)) and item:
+            try:
+                logprobs.append(float(item[0]))
+            except (TypeError, ValueError):
+                continue
+    return logprobs[-response_len:]
+
+
+def score_teacher_on_student(name: str, entry: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    sid = str(entry.get("id"))
+    input_ids = entry.get("input_token_ids")
+    response_len = int(entry.get("response_token_count") or 0)
+    if not isinstance(input_ids, list) or response_len <= 0:
+        return {
+            "student_id": sid,
+            "teacher": name,
+            "status": "missing_student_tokens",
+            "teacher_log_probs": [],
+        }
+    payload = {
+        "input_ids": [int(x) for x in input_ids],
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 0,
+            "skip_special_tokens": False,
+        },
+        "return_logprob": True,
+        "logprob_start_len": 0,
+    }
+    try:
+        output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
+    except Exception as exc:
+        return {
+            "student_id": sid,
+            "teacher": name,
+            "status": "teacher_score_error",
+            "error": str(exc),
+            "teacher_log_probs": [],
+            "response_token_count": response_len,
+            "num_teacher_log_probs": 0,
+        }
+    meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
+    teacher_log_probs = extract_input_logprobs(meta, response_len)
+    status = "success" if len(teacher_log_probs) == response_len else "length_mismatch"
+    return {
+        "student_id": sid,
+        "teacher": name,
+        "status": status,
+        "teacher_log_probs": teacher_log_probs,
+        "response_token_count": response_len,
+        "num_teacher_log_probs": len(teacher_log_probs),
+    }
+
+
 def score_student(job: Path, entry: dict[str, Any], context: SimpleNamespace, want_detail: bool) -> dict[str, Any]:
     sid = str(entry.get("id"))
     base = job / str(entry.get("path", f"student/{sid}"))
@@ -316,6 +376,11 @@ def score_student(job: Path, entry: dict[str, Any], context: SimpleNamespace, wa
         "id": sid,
         "sample_index": meta.get("sample_index"),
         "assistant_response_file": f"{base.relative_to(job).as_posix()}/assistant_response.txt",
+        "input_token_ids": meta.get("input_token_ids") or meta.get("tokens") or [],
+        "response_token_ids": meta.get("response_token_ids") or [],
+        "response_token_count": int(meta.get("response_token_count") or len(meta.get("response_token_ids") or [])),
+        "rollout_log_probs": meta.get("rollout_log_probs") or [],
+        "teacher_scores": [],
         **scored,
     }
 
@@ -390,6 +455,20 @@ def process(job: Path) -> None:
                 with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(generated)))) as pool:
                     teacher_entries = list(pool.map(lambda e: score_teacher(e, context, want_detail), generated))
 
+            sel = selection(student_entries, teacher_entries)
+            best_teacher_entry = max(teacher_entries, key=lambda e: float(e.get("reward", 0.0)), default=None)
+            teacher_request = manifest.get("teacher_request") if isinstance(manifest.get("teacher_request"), dict) else {}
+            if teacher_request.get("score_student_rollouts") and best_teacher_entry is not None:
+                best_teacher_name = str(best_teacher_entry.get("teacher") or "")
+                if best_teacher_name:
+                    with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(student_entries) or 1))) as pool:
+                        scores = list(pool.map(lambda e: score_teacher_on_student(best_teacher_name, e, teacher_cfg), student_entries))
+                    for entry, score in zip(student_entries, scores, strict=False):
+                        entry.setdefault("teacher_scores", []).append(score)
+                        if score.get("status") == "success":
+                            entry["teacher_log_probs"] = score.get("teacher_log_probs") or []
+                            entry["teacher_logprob_teacher"] = best_teacher_name
+
             result = {
                 "version": SCHEMA_VERSION,
                 "status": "success",
@@ -399,7 +478,7 @@ def process(job: Path) -> None:
                 "round_idx": manifest.get("round_idx"),
                 "student_rollouts": student_entries,
                 "teacher_rollouts": teacher_entries,
-                "selection": selection(student_entries, teacher_entries),
+                "selection": sel,
                 "elapsed_s": time.time() - started,
             }
             publish(job_id, result)
