@@ -101,9 +101,9 @@ while [ $# -gt 0 ]; do
                                   N_STUDENT="${1#*=}" ;;
         --use-opd-relay|--opd-score-student-rollouts)
                                   OPD_ARGS+=("$1") ;;
-        --opd-teachers|--opd-lambda|--opd-gate-eps|--opd-timeout|--opd-poll|--opd-namespace|--opd-server|--opd-transport|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
+        --opd-teachers|--opd-lambda|--opd-topk|--opd-gate-eps|--opd-timeout|--opd-poll|--opd-namespace|--opd-server|--opd-transport|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
                                   OPD_ARGS+=("$1" "${2:?$1 requires a value}"); shift ;;
-        --opd-teachers=*|--opd-lambda=*|--opd-gate-eps=*|--opd-timeout=*|--opd-poll=*|--opd-namespace=*|--opd-server=*|--opd-transport=*|--opd-xfer-dir=*|--opd-sftp-host=*|--opd-sftp-port=*|--opd-sftp-user=*|--opd-sftp-key=*)
+        --opd-teachers=*|--opd-lambda=*|--opd-topk=*|--opd-gate-eps=*|--opd-timeout=*|--opd-poll=*|--opd-namespace=*|--opd-server=*|--opd-transport=*|--opd-xfer-dir=*|--opd-sftp-host=*|--opd-sftp-port=*|--opd-sftp-user=*|--opd-sftp-key=*)
                                   OPD_ARGS+=("$1") ;;
         *) echo "[run] Unknown argument: $1" >&2; exit 1 ;;
     esac

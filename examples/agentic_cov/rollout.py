@@ -305,6 +305,34 @@ def _coerce_int_list(value: Any) -> list[int] | None:
     return out
 
 
+def _coerce_float_matrix(value: Any) -> list[list[float]] | None:
+    if not isinstance(value, list):
+        return None
+    out: list[list[float]] = []
+    for row in value:
+        coerced = _coerce_float_list(row)
+        if coerced is None:
+            return None
+        out.append(coerced)
+    return out
+
+
+def _coerce_int_matrix(value: Any) -> list[list[int]] | None:
+    if not isinstance(value, list):
+        return None
+    out: list[list[int]] = []
+    for row in value:
+        coerced = _coerce_int_list(row)
+        if coerced is None:
+            return None
+        out.append(coerced)
+    return out
+
+
+def _matrix_has_shape(value: list[list[Any]] | None, rows: int, cols: int) -> bool:
+    return value is not None and len(value) == rows and all(len(row) == cols for row in value)
+
+
 def _entry_reward(entry: dict[str, Any]) -> float:
     for key in ("reward", "score", "coverage_reward"):
         if key in entry:
@@ -359,6 +387,8 @@ def _student_rollout_payload(sample: Sample, slot: int) -> dict[str, Any]:
         "response_token_ids": _sample_response_token_ids(sample),
         "response_token_count": int(sample.response_length or 0),
         "rollout_log_probs": sample.rollout_log_probs or [],
+        "topk_token_ids": copy.deepcopy(sample.rollout_topk_token_ids or []),
+        "topk_student_log_probs": copy.deepcopy(sample.rollout_topk_log_probs or []),
         "status": sample.status.value if sample.status else "unknown",
     }
     if testbench is not None:
@@ -537,6 +567,7 @@ def _run_opd_relay_round_sync(
         sampling_params=sampling_params,
         want_detail=want_detail,
         score_student_rollouts=True,
+        topk_k=int(getattr(args, "opd_topk", 0) or 0),
     )
     client = OpdRelayClient(args)
     try:
@@ -624,10 +655,15 @@ async def _score_group_with_opd_relay(
             if entry.get("id") is not None
         }
         best_teacher_name = str(best_teacher.get("teacher") or best_teacher.get("teacher_name") or "")
+        requested_topk = int(getattr(args, "opd_topk", 0) or 0)
+        require_topk = requested_topk > 1
+
+        def _entry_for_sample(sample: Sample) -> dict[str, Any] | None:
+            sid = str(sample.metadata.get("_opd_student_id", ""))
+            return student_entries_by_id.get(sid)
 
         def _student_teacher_log_probs(sample: Sample) -> list[float] | None:
-            sid = str(sample.metadata.get("_opd_student_id", ""))
-            entry = student_entries_by_id.get(sid)
+            entry = _entry_for_sample(sample)
             if entry is None:
                 return None
             direct = _coerce_float_list(entry.get("teacher_log_probs"))
@@ -638,33 +674,82 @@ async def _score_group_with_opd_relay(
                     continue
                 if best_teacher_name and str(score.get("teacher") or "") != best_teacher_name:
                     continue
-                if score.get("status") != "success":
+                if score.get("status") not in {"success", "topk_success", "partial_topk"}:
                     continue
                 scored = _coerce_float_list(score.get("teacher_log_probs"))
                 if scored is not None:
                     return scored
             return None
 
-        valid_opd = bool(best_teacher_name)
-        teacher_log_probs_by_index: dict[int, list[float]] = {}
-        for sample in group:
-            teacher_log_probs = _student_teacher_log_probs(sample)
-            expected = int(sample.response_length or 0)
-            if teacher_log_probs is None or len(teacher_log_probs) != expected:
-                valid_opd = False
-                sample.metadata["opd_gate_reason"] = (
-                    f"teacher_logprob_len={len(teacher_log_probs) if teacher_log_probs is not None else 'missing'} "
-                    f"expected={expected}"
-                )
-                break
-            teacher_log_probs_by_index[int(sample.index)] = teacher_log_probs
+        def _student_teacher_topk(sample: Sample):
+            entry = _entry_for_sample(sample)
+            if entry is None:
+                return None
+            topk_ids = _coerce_int_matrix(entry.get("topk_token_ids")) or copy.deepcopy(sample.rollout_topk_token_ids)
+            student_topk = _coerce_float_matrix(entry.get("topk_student_log_probs")) or copy.deepcopy(sample.rollout_topk_log_probs)
+            teacher_topk = _coerce_float_matrix(entry.get("teacher_topk_log_probs"))
+            teacher_masks = _coerce_float_matrix(entry.get("teacher_topk_logprob_masks"))
+            if teacher_topk is not None:
+                return topk_ids, student_topk, teacher_topk, teacher_masks
+            for score in entry.get("teacher_scores") or []:
+                if not isinstance(score, dict):
+                    continue
+                if best_teacher_name and str(score.get("teacher") or "") != best_teacher_name:
+                    continue
+                teacher_topk = _coerce_float_matrix(score.get("teacher_topk_log_probs"))
+                teacher_masks = _coerce_float_matrix(score.get("teacher_topk_logprob_masks"))
+                if teacher_topk is not None:
+                    return topk_ids, student_topk, teacher_topk, teacher_masks
+            return None
 
-        if valid_opd:
+        topk_by_index = {}
+        topk_valid = bool(best_teacher_name) and require_topk
+        if require_topk:
             for sample in group:
-                teacher_log_probs = teacher_log_probs_by_index[int(sample.index)]
-                sample.teacher_log_probs = teacher_log_probs
+                expected = int(sample.response_length or 0)
+                width = requested_topk
+                packed = _student_teacher_topk(sample)
+                if packed is None:
+                    topk_valid = False
+                    sample.metadata["opd_gate_reason"] = "missing_teacher_topk_log_probs"
+                    break
+                topk_ids, student_topk, teacher_topk, teacher_masks = packed
+                if teacher_masks is None and _matrix_has_shape(teacher_topk, expected, width):
+                    teacher_masks = [[1.0] * width for _ in range(expected)]
+                if not (
+                    _matrix_has_shape(topk_ids, expected, width)
+                    and _matrix_has_shape(teacher_topk, expected, width)
+                    and _matrix_has_shape(teacher_masks, expected, width)
+                ):
+                    topk_valid = False
+                    sample.metadata["opd_gate_reason"] = (
+                        f"topk_shape_invalid expected=({expected},{width})"
+                    )
+                    break
+                mask_total = expected * width
+                mask_hit = sum(sum(float(x) for x in row) for row in teacher_masks)
+                if mask_hit < mask_total:
+                    topk_valid = False
+                    sample.metadata["opd_gate_reason"] = (
+                        f"teacher_topk_incomplete hit={mask_hit:.0f}/{mask_total}"
+                    )
+                    break
+                if student_topk is not None and not _matrix_has_shape(student_topk, expected, width):
+                    student_topk = None
+                topk_by_index[int(sample.index)] = (topk_ids, student_topk, teacher_topk, teacher_masks)
+
+        if topk_valid:
+            for sample in group:
+                topk_ids, student_topk, teacher_topk, teacher_masks = topk_by_index[int(sample.index)]
+                sample.rollout_topk_token_ids = topk_ids
+                sample.rollout_topk_log_probs = student_topk
+                sample.teacher_topk_log_probs = teacher_topk
+                sample.teacher_topk_logprob_masks = teacher_masks
                 sample.metadata["opd_teacher_logprob_teacher"] = best_teacher_name
-                sample.metadata["opd_teacher_logprob_tokens"] = len(teacher_log_probs)
+                sample.metadata["opd_topk"] = requested_topk
+                sample.metadata["opd_topk_teacher_coverage"] = (
+                    sum(sum(float(x) for x in row) for row in teacher_masks) / max(1, requested_topk * int(sample.response_length or 0))
+                )
                 _set_train_loss_type(
                     sample,
                     "opd",
@@ -672,12 +757,47 @@ async def _score_group_with_opd_relay(
                     best_student_reward=best_student_reward,
                     best_teacher_reward=best_teacher_reward,
                     teacher=best_teacher_name,
+                    opd_topk=requested_topk,
                 )
             return group, group
 
+        if not require_topk:
+            valid_opd = bool(best_teacher_name)
+            teacher_log_probs_by_index: dict[int, list[float]] = {}
+            for sample in group:
+                teacher_log_probs = _student_teacher_log_probs(sample)
+                expected = int(sample.response_length or 0)
+                if teacher_log_probs is None or len(teacher_log_probs) != expected:
+                    valid_opd = False
+                    sample.metadata["opd_gate_reason"] = (
+                        f"teacher_logprob_len={len(teacher_log_probs) if teacher_log_probs is not None else 'missing'} "
+                        f"expected={expected}"
+                    )
+                    break
+                teacher_log_probs_by_index[int(sample.index)] = teacher_log_probs
+
+            if valid_opd:
+                for sample in group:
+                    teacher_log_probs = teacher_log_probs_by_index[int(sample.index)]
+                    sample.teacher_log_probs = teacher_log_probs
+                    sample.metadata["opd_teacher_logprob_teacher"] = best_teacher_name
+                    sample.metadata["opd_teacher_logprob_tokens"] = len(teacher_log_probs)
+                    _set_train_loss_type(
+                        sample,
+                        "opd",
+                        opd_weight=float(getattr(args, "opd_lambda", 1.0) or 0.0),
+                        best_student_reward=best_student_reward,
+                        best_teacher_reward=best_teacher_reward,
+                        teacher=best_teacher_name,
+                    )
+                return group, group
+
         for sample in group:
             sample.metadata["opd_gate_pass"] = False
-            sample.metadata.setdefault("opd_gate_reason", "missing_teacher_log_probs")
+            sample.metadata.setdefault(
+                "opd_gate_reason",
+                "missing_teacher_topk_log_probs" if require_topk else "missing_teacher_log_probs",
+            )
             _set_train_loss_type(sample, "rl")
 
     return group, group

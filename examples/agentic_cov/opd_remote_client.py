@@ -280,6 +280,7 @@ def build_round_files(
     sampling_params: dict[str, Any],
     want_detail: bool,
     score_student_rollouts: bool = False,
+    topk_k: int = 0,
 ) -> dict[str, bytes]:
     files: dict[str, bytes] = {
         "prompt.txt": _encode_text(prompt),
@@ -316,9 +317,8 @@ def build_round_files(
             "return_teacher_assistant_response": True,
             "return_teacher_token_ids": True,
             "return_teacher_logprobs": True,
-            # Reserved for future true reverse-KL training.  When enabled later,
-            # the relay should ask each teacher to score student responses and
-            # return teacher_scores_on_student entries in result.json.
+            "return_teacher_topk_logprobs": int(topk_k or 0) > 1,
+            "student_topk_k": int(topk_k or 0),
             "score_student_rollouts": bool(score_student_rollouts),
         },
         "files": make_file_manifest(files),

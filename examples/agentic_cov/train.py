@@ -152,7 +152,7 @@ def add_agentic_args(parser):
         help=(
             "Enable OPD relay training. Student rollouts are generated locally, "
             "student/teacher EDA is delegated to the paladin relay, and a gated "
-            "teacher CE sample is used instead of RL loss for that prompt-round "
+            "student top-k KL is used instead of RL loss for that prompt-round "
             "when the best teacher beats the best student."
         ),
     )
@@ -166,7 +166,13 @@ def add_agentic_args(parser):
         "--opd-lambda",
         type=float,
         default=1.0,
-        help="Weight for the OPD CE/NLL loss on gated teacher responses.",
+        help="Weight for the OPD KL loss on gated student-token distributions.",
+    )
+    parser.add_argument(
+        "--opd-topk",
+        type=int,
+        default=16,
+        help="Student top-k tokens per generated position used for OPD KL; <=1 uses sampled-token fallback.",
     )
     parser.add_argument(
         "--opd-gate-eps",
@@ -224,7 +230,7 @@ def add_agentic_args(parser):
         "--opd-score-student-rollouts",
         action="store_true",
         default=False,
-        help="Reserved for future true reverse-KL: ask teachers to score student responses.",
+        help="Ask teachers to score student responses; enabled automatically by the OPD relay path.",
     )
     parser.add_argument(
         "--rollout-log-dir",

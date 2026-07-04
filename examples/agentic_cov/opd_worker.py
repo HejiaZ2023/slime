@@ -315,10 +315,164 @@ def extract_input_logprobs(meta: dict[str, Any], response_len: int) -> list[floa
     return logprobs[-response_len:]
 
 
-def score_teacher_on_student(name: str, entry: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+def _coerce_int_matrix(value: Any) -> list[list[int]] | None:
+    if not isinstance(value, list):
+        return None
+    out: list[list[int]] = []
+    for row in value:
+        if not isinstance(row, list):
+            return None
+        try:
+            out.append([int(x) for x in row])
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def _coerce_float_matrix(value: Any) -> list[list[float]] | None:
+    if not isinstance(value, list):
+        return None
+    out: list[list[float]] = []
+    for row in value:
+        if not isinstance(row, list):
+            return None
+        try:
+            out.append([float(x) for x in row])
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def _matrix_shape(value: list[list[Any]] | None, rows: int, cols: int) -> bool:
+    return value is not None and len(value) == rows and all(len(row) == cols for row in value)
+
+
+def _candidate_logprob_row(row: Any) -> dict[int, float]:
+    out: dict[int, float] = {}
+    if isinstance(row, dict):
+        for key, value in row.items():
+            try:
+                out[int(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return out
+    if not isinstance(row, list):
+        return out
+    for item in row:
+        token_id = None
+        log_prob = None
+        if isinstance(item, dict):
+            raw_token = item.get("token_id", item.get("id", item.get("token")))
+            raw_logprob = item.get("logprob", item.get("log_prob", item.get("log_probs")))
+            try:
+                token_id = int(raw_token)
+                log_prob = float(raw_logprob)
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            first, second = item[0], item[1]
+            try:
+                first_f = float(first)
+                second_i = int(second)
+                if first_f <= 0.0:
+                    log_prob = first_f
+                    token_id = second_i
+            except (TypeError, ValueError):
+                pass
+            if token_id is None or log_prob is None:
+                try:
+                    token_id = int(first)
+                    log_prob = float(second)
+                except (TypeError, ValueError):
+                    continue
+        if token_id is not None and log_prob is not None:
+            out[token_id] = log_prob
+    return out
+
+
+def _extract_requested_topk_logprobs(
+    output: dict[str, Any],
+    response_len: int,
+    requested_topk: list[list[int]] | None,
+) -> tuple[list[list[float]] | None, list[list[float]] | None]:
+    if not requested_topk or response_len <= 0:
+        return None, None
+    width = len(requested_topk[0]) if requested_topk else 0
+    if width <= 0 or not _matrix_shape(requested_topk, response_len, width):
+        return None, None
+
+    meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
+    direct = (
+        output.get("teacher_topk_log_probs")
+        or output.get("topk_log_probs")
+        or meta.get("teacher_topk_log_probs")
+        or meta.get("topk_log_probs")
+        or meta.get("input_requested_token_logprobs")
+    )
+    direct_matrix = _coerce_float_matrix(direct)
+    if _matrix_shape(direct_matrix, response_len, width):
+        masks = (
+            output.get("teacher_topk_logprob_masks")
+            or output.get("topk_logprob_masks")
+            or meta.get("teacher_topk_logprob_masks")
+            or meta.get("topk_logprob_masks")
+        )
+        mask_matrix = _coerce_float_matrix(masks)
+        if not _matrix_shape(mask_matrix, response_len, width):
+            mask_matrix = [[1.0] * width for _ in range(response_len)]
+        return direct_matrix, mask_matrix
+
+    idx_rows = meta.get("input_top_logprobs_idx") or meta.get("input_top_logprobs_token_ids")
+    val_rows = meta.get("input_top_logprobs_val") or meta.get("input_top_logprobs_logprobs")
+    candidate_maps: list[dict[int, float]] = []
+    if isinstance(idx_rows, list) and isinstance(val_rows, list):
+        for ids, vals in zip(idx_rows[-response_len:], val_rows[-response_len:], strict=False):
+            row: dict[int, float] = {}
+            if isinstance(ids, list) and isinstance(vals, list):
+                for token_id, log_prob in zip(ids, vals, strict=False):
+                    try:
+                        row[int(token_id)] = float(log_prob)
+                    except (TypeError, ValueError):
+                        continue
+            candidate_maps.append(row)
+    else:
+        rows = (
+            meta.get("input_top_logprobs")
+            or meta.get("input_token_top_logprobs")
+            or meta.get("top_logprobs")
+            or []
+        )
+        if isinstance(rows, list):
+            candidate_maps = [_candidate_logprob_row(row) for row in rows[-response_len:]]
+
+    if len(candidate_maps) != response_len:
+        return None, None
+    log_probs: list[list[float]] = []
+    masks: list[list[float]] = []
+    for want_row, have_row in zip(requested_topk, candidate_maps, strict=False):
+        lp_row: list[float] = []
+        mask_row: list[float] = []
+        for token_id in want_row:
+            if token_id in have_row:
+                lp_row.append(float(have_row[token_id]))
+                mask_row.append(1.0)
+            else:
+                lp_row.append(0.0)
+                mask_row.append(0.0)
+        log_probs.append(lp_row)
+        masks.append(mask_row)
+    return log_probs, masks
+
+
+def score_teacher_on_student(
+    name: str, entry: dict[str, Any], cfg: dict[str, Any], topk_k: int = 0
+) -> dict[str, Any]:
     sid = str(entry.get("id"))
     input_ids = entry.get("input_token_ids")
     response_len = int(entry.get("response_token_count") or 0)
+    requested_topk = _coerce_int_matrix(entry.get("topk_token_ids")) if topk_k > 1 else None
+    if requested_topk is not None:
+        requested_topk = [row[:topk_k] for row in requested_topk]
     if not isinstance(input_ids, list) or response_len <= 0:
         return {
             "student_id": sid,
@@ -336,6 +490,11 @@ def score_teacher_on_student(name: str, entry: dict[str, Any], cfg: dict[str, An
         "return_logprob": True,
         "logprob_start_len": 0,
     }
+    if requested_topk:
+        payload["topk_token_ids"] = requested_topk
+        payload["return_topk_logprobs"] = True
+        payload["top_logprobs_num"] = topk_k
+        payload["sampling_params"]["top_logprobs_num"] = topk_k
     try:
         output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
     except Exception as exc:
@@ -351,7 +510,15 @@ def score_teacher_on_student(name: str, entry: dict[str, Any], cfg: dict[str, An
     meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
     teacher_log_probs = extract_input_logprobs(meta, response_len)
     status = "success" if len(teacher_log_probs) == response_len else "length_mismatch"
-    return {
+    teacher_topk, teacher_topk_masks = _extract_requested_topk_logprobs(output, response_len, requested_topk)
+    if requested_topk is not None:
+        if teacher_topk is not None and teacher_topk_masks is not None:
+            topk_total = sum(len(row) for row in teacher_topk_masks)
+            topk_valid = sum(sum(float(x) for x in row) for row in teacher_topk_masks)
+            status = "topk_success" if topk_valid == topk_total else "partial_topk"
+        else:
+            status = "missing_teacher_topk"
+    result = {
         "student_id": sid,
         "teacher": name,
         "status": status,
@@ -359,6 +526,12 @@ def score_teacher_on_student(name: str, entry: dict[str, Any], cfg: dict[str, An
         "response_token_count": response_len,
         "num_teacher_log_probs": len(teacher_log_probs),
     }
+    if requested_topk is not None:
+        result["topk_token_ids"] = requested_topk
+        result["topk_student_log_probs"] = entry.get("topk_student_log_probs") or []
+        result["teacher_topk_log_probs"] = teacher_topk or []
+        result["teacher_topk_logprob_masks"] = teacher_topk_masks or []
+    return result
 
 
 def score_student(job: Path, entry: dict[str, Any], context: SimpleNamespace, want_detail: bool) -> dict[str, Any]:
@@ -380,6 +553,8 @@ def score_student(job: Path, entry: dict[str, Any], context: SimpleNamespace, wa
         "response_token_ids": meta.get("response_token_ids") or [],
         "response_token_count": int(meta.get("response_token_count") or len(meta.get("response_token_ids") or [])),
         "rollout_log_probs": meta.get("rollout_log_probs") or [],
+        "topk_token_ids": meta.get("topk_token_ids") or [],
+        "topk_student_log_probs": meta.get("topk_student_log_probs") or [],
         "teacher_scores": [],
         **scored,
     }
@@ -462,12 +637,16 @@ def process(job: Path) -> None:
                 best_teacher_name = str(best_teacher_entry.get("teacher") or "")
                 if best_teacher_name:
                     with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(student_entries) or 1))) as pool:
-                        scores = list(pool.map(lambda e: score_teacher_on_student(best_teacher_name, e, teacher_cfg), student_entries))
+                        topk_k = int(teacher_request.get("student_topk_k") or 0)
+                        scores = list(pool.map(lambda e: score_teacher_on_student(best_teacher_name, e, teacher_cfg, topk_k), student_entries))
                     for entry, score in zip(student_entries, scores, strict=False):
                         entry.setdefault("teacher_scores", []).append(score)
-                        if score.get("status") == "success":
+                        if score.get("status") in {"success", "topk_success", "partial_topk"}:
                             entry["teacher_log_probs"] = score.get("teacher_log_probs") or []
                             entry["teacher_logprob_teacher"] = best_teacher_name
+                        if score.get("teacher_topk_log_probs"):
+                            entry["teacher_topk_log_probs"] = score.get("teacher_topk_log_probs") or []
+                            entry["teacher_topk_logprob_masks"] = score.get("teacher_topk_logprob_masks") or []
 
             result = {
                 "version": SCHEMA_VERSION,

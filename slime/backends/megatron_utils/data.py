@@ -418,6 +418,8 @@ def log_rollout_data(
                 "dynamic_global_batch_size",
                 "loss_types",
                 "teacher_logprob_masks",
+                "opd_topk_token_ids",
+                "opd_topk_masks",
             ]:
                 continue
             # Upload per sample mean for each rollout value

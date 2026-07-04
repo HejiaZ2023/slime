@@ -13,6 +13,7 @@ from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
+    compute_log_probs,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
@@ -527,6 +528,47 @@ def get_values(
     return torch.empty((0,), device=logits.device), res
 
 
+def get_topk_log_probs(
+    logits: torch.Tensor,
+    *,
+    args: Namespace,
+    unconcat_tokens: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    topk_token_ids: list[torch.Tensor],
+    max_seq_lens: list[int] | None = None,
+) -> list[torch.Tensor]:
+    """Gather current student log-probs for rollout-provided top-k token ids."""
+    if getattr(args, "allgather_cp", False):
+        raise NotImplementedError("OPD top-k KL does not support allgather_cp yet")
+
+    tp_group = mpu.get_tensor_model_parallel_group()
+    out: list[torch.Tensor] = []
+    for (logits_chunk, _), ids in zip(
+        get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            max_seq_lens=max_seq_lens,
+        ),
+        topk_token_ids,
+        strict=False,
+    ):
+        ids = ids.to(device=logits_chunk.device, dtype=torch.long)
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(-1)
+        if logits_chunk.size(0) == 0 or ids.numel() == 0:
+            out.append(logits_chunk.new_zeros((logits_chunk.size(0), ids.size(-1) if ids.dim() == 2 else 0)))
+            continue
+        cols = []
+        for col in range(ids.size(1)):
+            cols.append(compute_log_probs(logits_chunk, ids[:, col], tp_group).squeeze(-1))
+        out.append(torch.stack(cols, dim=-1))
+    return out
+
+
 def apply_opd_kl_to_advantages(
     args: Namespace,
     rollout_data: RolloutBatch,
@@ -668,7 +710,10 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     has_relay_opd = rollout_data.get("teacher_log_probs") is not None and any(
         loss_type == "opd" for loss_type in loss_types
     )
-    if args.use_opd or has_relay_opd:
+    has_topk_opd = rollout_data.get("opd_topk_token_ids") is not None and any(
+        loss_type == "opd" for loss_type in loss_types
+    )
+    if (args.use_opd or has_relay_opd) and not has_topk_opd:
         apply_opd_kl_to_advantages(
             args=args,
             rollout_data=rollout_data,
@@ -826,6 +871,11 @@ def policy_loss_function(
     loss_types = batch.get("loss_types") or ["rl"] * len(response_lengths)
     base_loss_masks = batch["loss_masks"]
     has_opd_samples = any(loss_type == "opd" for loss_type in loss_types)
+    has_topk_opd = (
+        has_opd_samples
+        and batch.get("opd_topk_token_ids") is not None
+        and batch.get("opd_topk_teacher_log_probs") is not None
+    )
     rl_loss_masks = [
         loss_mask if loss_type == "rl" else torch.zeros_like(loss_mask)
         for loss_mask, loss_type in zip(base_loss_masks, loss_types, strict=False)
@@ -866,6 +916,17 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    topk_log_probs = None
+    if has_topk_opd:
+        topk_log_probs = get_topk_log_probs(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            topk_token_ids=batch["opd_topk_token_ids"],
+            max_seq_lens=max_seq_lens,
+        )
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
     need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
@@ -987,19 +1048,52 @@ def policy_loss_function(
     opd_loss = log_probs.new_tensor(0.0)
     opd_sampled_kl = None
     opd_teacher_logprob_coverage = None
+    opd_topk_kl = None
+    opd_topk_mass = None
+    opd_topk_teacher_coverage = None
     if has_opd_samples:
-        opd_loss = opd_sum_of_sample_mean(pg_loss_tokens)
-
-        if batch.get("teacher_log_probs") is not None:
-            teacher_log_probs = torch.cat(batch["teacher_log_probs"], dim=0).to(device=log_probs.device)
-            if batch.get("teacher_logprob_masks") is not None:
-                teacher_valid = torch.cat(batch["teacher_logprob_masks"], dim=0).to(
+        if has_topk_opd and topk_log_probs is not None:
+            default_opd_weight = float(getattr(args, "opd_lambda", 1.0) or 0.0)
+            opd_weights = batch.get("opd_weights") or [default_opd_weight] * len(response_lengths)
+            token_kls = []
+            token_losses = []
+            token_masses = []
+            token_coverages = []
+            for i, student_topk in enumerate(topk_log_probs):
+                teacher_topk = batch["opd_topk_teacher_log_probs"][i].to(
                     device=log_probs.device, dtype=log_probs.dtype
                 )
-            else:
-                teacher_valid = torch.ones_like(log_probs)
-            opd_sampled_kl = opd_sum_of_sample_mean((log_probs - teacher_log_probs) * teacher_valid)
-            opd_teacher_logprob_coverage = opd_sum_of_sample_mean(teacher_valid)
+                topk_mask = batch["opd_topk_masks"][i].to(device=log_probs.device, dtype=log_probs.dtype)
+                if student_topk.shape != teacher_topk.shape or student_topk.shape != topk_mask.shape:
+                    raise ValueError(
+                        f"OPD top-k shape mismatch sample={i}: "
+                        f"student={tuple(student_topk.shape)} teacher={tuple(teacher_topk.shape)} "
+                        f"mask={tuple(topk_mask.shape)}"
+                    )
+                student_prob = student_topk.exp()
+                token_kl = (student_prob * (student_topk - teacher_topk) * topk_mask).sum(dim=-1)
+                coef = float(opd_weights[i]) if i < len(opd_weights) else default_opd_weight
+                token_kls.append(token_kl)
+                token_losses.append(coef * token_kl)
+                token_masses.append((student_prob * topk_mask).sum(dim=-1))
+                token_coverages.append(topk_mask.mean(dim=-1))
+            opd_loss = opd_sum_of_sample_mean(torch.cat(token_losses, dim=0))
+            opd_topk_kl = opd_sum_of_sample_mean(torch.cat(token_kls, dim=0))
+            opd_topk_mass = opd_sum_of_sample_mean(torch.cat(token_masses, dim=0))
+            opd_topk_teacher_coverage = opd_sum_of_sample_mean(torch.cat(token_coverages, dim=0))
+        else:
+            opd_loss = opd_sum_of_sample_mean(pg_loss_tokens)
+
+            if batch.get("teacher_log_probs") is not None:
+                teacher_log_probs = torch.cat(batch["teacher_log_probs"], dim=0).to(device=log_probs.device)
+                if batch.get("teacher_logprob_masks") is not None:
+                    teacher_valid = torch.cat(batch["teacher_logprob_masks"], dim=0).to(
+                        device=log_probs.device, dtype=log_probs.dtype
+                    )
+                else:
+                    teacher_valid = torch.ones_like(log_probs)
+                opd_sampled_kl = opd_sum_of_sample_mean((log_probs - teacher_log_probs) * teacher_valid)
+                opd_teacher_logprob_coverage = opd_sum_of_sample_mean(teacher_valid)
 
     loss = pg_loss + opd_loss - args.entropy_coef * entropy_loss
 
@@ -1044,6 +1138,12 @@ def policy_loss_function(
         reported_loss["opd_sampled_kl"] = opd_sampled_kl.clone().detach()
     if opd_teacher_logprob_coverage is not None:
         reported_loss["opd_teacher_logprob_coverage"] = opd_teacher_logprob_coverage.clone().detach()
+    if opd_topk_kl is not None:
+        reported_loss["opd_topk_kl"] = opd_topk_kl.clone().detach()
+    if opd_topk_mass is not None:
+        reported_loss["opd_topk_mass"] = opd_topk_mass.clone().detach()
+    if opd_topk_teacher_coverage is not None:
+        reported_loss["opd_topk_teacher_coverage"] = opd_topk_teacher_coverage.clone().detach()
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()

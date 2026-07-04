@@ -61,6 +61,80 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
     return tokenizer.encode(sample.prompt, add_special_tokens=False)
 
 
+def _coerce_top_logprob_row(row: Any) -> tuple[list[int], list[float]]:
+    token_ids: list[int] = []
+    log_probs: list[float] = []
+    if isinstance(row, dict):
+        for key, value in row.items():
+            try:
+                token_id = int(key)
+                log_prob = float(value)
+            except (TypeError, ValueError):
+                continue
+            token_ids.append(token_id)
+            log_probs.append(log_prob)
+        return token_ids, log_probs
+
+    if not isinstance(row, list):
+        return token_ids, log_probs
+    for item in row:
+        token_id = None
+        log_prob = None
+        if isinstance(item, dict):
+            raw_token = item.get("token_id", item.get("id", item.get("token")))
+            raw_logprob = item.get("logprob", item.get("log_prob", item.get("log_probs")))
+            try:
+                token_id = int(raw_token)
+                log_prob = float(raw_logprob)
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            first, second = item[0], item[1]
+            try:
+                first_f = float(first)
+                second_i = int(second)
+                if first_f <= 0.0:
+                    log_prob = first_f
+                    token_id = second_i
+            except (TypeError, ValueError):
+                pass
+            if token_id is None or log_prob is None:
+                try:
+                    token_id = int(first)
+                    log_prob = float(second)
+                except (TypeError, ValueError):
+                    continue
+        if token_id is not None and log_prob is not None:
+            token_ids.append(token_id)
+            log_probs.append(log_prob)
+    return token_ids, log_probs
+
+
+def _extract_output_top_logprobs(meta: dict[str, Any], expected_len: int) -> tuple[list[list[int]], list[list[float]]]:
+    if expected_len <= 0:
+        return [], []
+    idx_rows = meta.get("output_top_logprobs_idx") or meta.get("output_top_logprobs_token_ids")
+    val_rows = meta.get("output_top_logprobs_val") or meta.get("output_top_logprobs_logprobs")
+    if isinstance(idx_rows, list) and isinstance(val_rows, list):
+        token_ids = [[int(x) for x in row] for row in idx_rows[-expected_len:] if isinstance(row, list)]
+        log_probs = [[float(x) for x in row] for row in val_rows[-expected_len:] if isinstance(row, list)]
+        if len(token_ids) == expected_len and len(log_probs) == expected_len:
+            return token_ids, log_probs
+
+    rows = meta.get("output_top_logprobs") or meta.get("top_logprobs") or []
+    if not isinstance(rows, list):
+        return [], []
+    token_ids: list[list[int]] = []
+    log_probs: list[list[float]] = []
+    for row in rows[-expected_len:]:
+        ids, lps = _coerce_top_logprob_row(row)
+        token_ids.append(ids)
+        log_probs.append(lps)
+    if len(token_ids) != expected_len or any(len(ids) == 0 for ids in token_ids):
+        return [], []
+    return token_ids, log_probs
+
+
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     """Return the router URL for a named model.
 
@@ -105,6 +179,9 @@ class GenerateState(metaclass=SingletonMeta):
             no_stop_trim=True,
             spaces_between_special_tokens=False,
         )
+        opd_topk = int(getattr(args, "opd_topk", 0) or 0)
+        if bool(getattr(args, "use_opd_relay", False)) and opd_topk > 0:
+            self.sampling_params["top_logprobs_num"] = opd_topk
 
         if getattr(args, "sglang_enable_deterministic_inference", False):
             sampling_seed_base = args.rollout_seed
@@ -207,6 +284,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     else:
         new_response_tokens, new_response_log_probs = [], []
 
+    new_topk_token_ids, new_topk_log_probs = _extract_output_top_logprobs(
+        output["meta_info"], len(new_response_tokens)
+    )
+
     # Update sample with tokens directly - avoiding re-tokenization
     sample.tokens = sample.tokens + new_response_tokens
     sample.response_length += len(new_response_tokens)
@@ -220,6 +301,14 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     if sample.rollout_log_probs is None:
         sample.rollout_log_probs = []
     sample.rollout_log_probs += new_response_log_probs
+
+    if new_topk_token_ids and len(new_topk_token_ids) == len(new_response_tokens):
+        if sample.rollout_topk_token_ids is None:
+            sample.rollout_topk_token_ids = []
+        if sample.rollout_topk_log_probs is None:
+            sample.rollout_topk_log_probs = []
+        sample.rollout_topk_token_ids += new_topk_token_ids
+        sample.rollout_topk_log_probs += new_topk_log_probs
 
     if "routed_experts" in output["meta_info"]:
         sample.rollout_routed_experts = np.frombuffer(

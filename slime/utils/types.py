@@ -24,9 +24,13 @@ class Sample:
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
+    rollout_topk_token_ids: list[list[int]] | None = None  # Per-position student top-k token ids from rollout
+    rollout_topk_log_probs: list[list[float]] | None = None  # Per-position student top-k logprobs from rollout
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
+    teacher_topk_log_probs: list[list[float]] | None = None  # Teacher logprobs on student top-k token ids
+    teacher_topk_logprob_masks: list[list[float]] | None = None  # 1 when teacher returned a top-k logprob
 
     class Status(Enum):
         PENDING = "pending"

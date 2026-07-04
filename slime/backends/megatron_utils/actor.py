@@ -259,6 +259,35 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 )
             ]
+        for key, dtype in [
+            ("opd_topk_token_ids", torch.long),
+            ("opd_topk_student_log_probs", torch.float32),
+            ("opd_topk_teacher_log_probs", torch.float32),
+            ("opd_topk_masks", torch.float32),
+        ]:
+            if key not in rollout_data:
+                continue
+            rollout_data[key] = [
+                torch.tensor(
+                    slice_log_prob_with_cp(
+                        value,
+                        total_length,
+                        response_length,
+                        self.args.qkv_format,
+                        rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None,
+                    ),
+                    device=torch.cuda.current_device(),
+                    dtype=dtype,
+                )
+                for i, (value, total_length, response_length) in enumerate(
+                    zip(
+                        rollout_data[key],
+                        rollout_data["total_lengths"],
+                        rollout_data["response_lengths"],
+                        strict=False,
+                    )
+                )
+            ]
         if "rollout_routed_experts" in rollout_data:
             rollout_data["rollout_routed_experts"] = [
                 torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]
