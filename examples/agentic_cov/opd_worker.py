@@ -45,6 +45,7 @@ JOB_TTL = int(os.environ.get("OPD_JOB_TTL", "0"))  # 0 keeps OPD audit artifacts
 MAX_CONCURRENT_JOBS = int(os.environ.get("OPD_MAX_CONCURRENT_JOBS", "4"))
 MAX_JOB_WORKERS = int(os.environ.get("OPD_MAX_JOB_WORKERS", "4"))
 TEACHER_TIMEOUT = float(os.environ.get("OPD_TEACHER_TIMEOUT", "900"))
+TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sheng/final_ckpts")
 EDA_SERVER = os.environ.get("OPD_EDA_SERVER", "local")
 EDA_REPO_DIR = os.environ.get("OPD_EDA_REPO_DIR", "/workspace/llm4cov_eda")
 EDA_TIMEOUT = int(os.environ.get("OPD_EDA_TIMEOUT", "30"))
@@ -95,6 +96,7 @@ def summarize_result(obj: dict[str, Any], final_dir: Path) -> dict[str, Any]:
         "round_idx": obj.get("round_idx"),
         "student_count": _summary_count(obj, "student_rollouts"),
         "teacher_count": _summary_count(obj, "teacher_rollouts"),
+        "teacher_model_paths": obj.get("teacher_model_paths") or {},
         "selection": obj.get("selection"),
         "elapsed_s": obj.get("elapsed_s"),
         "incoming_dir": str(IN / str(obj.get("job_id"))),
@@ -303,6 +305,30 @@ def teacher_url(name: str, cfg: dict[str, Any]) -> str:
     raise KeyError(f"missing teacher URL for {name!r}; set OPD_TEACHERS_JSON or {env_name}")
 
 
+def teacher_model_path(name: str, cfg: dict[str, Any]) -> str | None:
+    value = cfg.get(name)
+    if isinstance(value, dict):
+        for key in ("model_path", "checkpoint", "ckpt", "path"):
+            if value.get(key):
+                return str(value[key])
+    env_name = "OPD_TEACHER_" + re.sub(r"[^A-Za-z0-9]", "_", name).upper() + "_MODEL_PATH"
+    value = os.environ.get(env_name)
+    if value:
+        return value
+    if name in {"stage0", "stage1", "stage2"} and TEACHER_MODEL_ROOT:
+        return str(Path(TEACHER_MODEL_ROOT) / f"{name}_step999")
+    return None
+
+
+def teacher_model_paths(names: list[str], cfg: dict[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for name in sorted({n for n in names if n}):
+        path = teacher_model_path(name, cfg)
+        if path:
+            out[name] = path
+    return out
+
+
 def post_json(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
@@ -335,6 +361,7 @@ def extract_token_logprobs(meta: dict[str, Any]) -> tuple[list[int], list[float]
 
 def generate_teacher_rollout(name: str, slot: int, prompt: str, sampling_params: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     url = teacher_url(name, cfg)
+    model_path = teacher_model_path(name, cfg)
     payload = {"text": prompt, "sampling_params": sampling_params, "return_logprob": True}
     output = post_json(url, payload, timeout=TEACHER_TIMEOUT)
     response = str(output.get("text") or output.get("response") or output.get("output") or "")
@@ -343,6 +370,7 @@ def generate_teacher_rollout(name: str, slot: int, prompt: str, sampling_params:
     return {
         "id": f"{name}_t{slot:03d}",
         "teacher": name,
+        "teacher_model_path": model_path,
         "assistant_response": response,
         "generated_token_ids": token_ids,
         "generated_token_logprobs": logprobs,
@@ -584,6 +612,7 @@ def score_teacher_on_student(
     result = {
         "student_id": sid,
         "teacher": name,
+        "teacher_model_path": teacher_model_path(name, cfg),
         "status": status,
         "teacher_log_probs": teacher_log_probs,
         "response_token_count": response_len,
@@ -688,6 +717,7 @@ def process(job: Path) -> None:
                 name = str(spec.get("name"))
                 for i in range(int(spec.get("n", 1) or 0)):
                     teacher_jobs.append((name, i))
+            teacher_names = [name for name, _slot in teacher_jobs]
             teacher_entries: list[dict[str, Any]] = []
             teacher_request = manifest.get("teacher_request") if isinstance(manifest.get("teacher_request"), dict) else {}
             teacher_rollouts_file = manifest.get("teacher_rollouts_file")
@@ -731,6 +761,7 @@ def process(job: Path) -> None:
                 "round_idx": manifest.get("round_idx"),
                 "student_rollouts": student_entries,
                 "teacher_rollouts": teacher_entries,
+                "teacher_model_paths": teacher_model_paths(teacher_names, teacher_cfg),
                 "selection": sel,
                 "elapsed_s": time.time() - started,
             }

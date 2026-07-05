@@ -70,3 +70,58 @@ class LlmCovDataSource(RolloutDataSourceWithBuffer):
         self.dataset = _SimpleDataset(samples, seed=getattr(args, "rollout_seed", 42))
         if getattr(args, "rollout_shuffle", False):
             self.dataset.shuffle(self.epoch_id)
+        self._apply_dataset_step_offset()
+
+    def _prompts_per_rollout_step(self) -> int:
+        batch_size = int(getattr(self.args, "rollout_batch_size", 0) or 0)
+        num_rounds = int(getattr(self.args, "num_agentic_rounds", 1) or 1)
+        if batch_size <= 0:
+            raise ValueError(f"rollout_batch_size must be positive, got {batch_size}")
+        if num_rounds <= 0:
+            raise ValueError(f"num_agentic_rounds must be positive, got {num_rounds}")
+        if batch_size % num_rounds != 0:
+            raise ValueError(
+                f"rollout_batch_size ({batch_size}) must be divisible by "
+                f"num_agentic_rounds ({num_rounds}) to compute dataset step offset"
+            )
+        return batch_size // num_rounds
+
+    def _apply_dataset_step_offset(self) -> None:
+        step_offset = int(getattr(self.args, "llm4cov_dataset_step_offset", 0) or 0)
+        if step_offset < 0:
+            raise ValueError(f"llm4cov_dataset_step_offset must be >= 0, got {step_offset}")
+        if step_offset == 0:
+            return
+        dataset_len = len(self.dataset)
+        if dataset_len <= 0:
+            raise ValueError("Cannot apply llm4cov dataset step offset to an empty dataset")
+
+        prompts_per_step = self._prompts_per_rollout_step()
+        skipped_prompt_groups = step_offset * prompts_per_step
+        epoch_id, sample_offset = divmod(skipped_prompt_groups, dataset_len)
+
+        self.epoch_id = epoch_id
+        self.sample_offset = sample_offset
+        if getattr(self.args, "rollout_shuffle", False):
+            self.dataset.shuffle(self.epoch_id)
+
+        self.metadata.update(
+            {
+                "llm4cov_dataset_step_offset": step_offset,
+                "llm4cov_dataset_prompts_per_step": prompts_per_step,
+                "llm4cov_dataset_skipped_prompt_groups": skipped_prompt_groups,
+                "llm4cov_dataset_offset_epoch_id": self.epoch_id,
+                "llm4cov_dataset_offset_sample_offset": self.sample_offset,
+            }
+        )
+        logger.info(
+            "applied llm4cov dataset step offset: steps=%d prompts_per_step=%d "
+            "skipped_prompt_groups=%d dataset_len=%d epoch_id=%d sample_offset=%d seed=%s",
+            step_offset,
+            prompts_per_step,
+            skipped_prompt_groups,
+            dataset_len,
+            self.epoch_id,
+            self.sample_offset,
+            getattr(self.dataset, "seed", None),
+        )

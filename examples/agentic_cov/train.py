@@ -58,6 +58,16 @@ def add_agentic_args(parser):
         help="Split name for the training dataset.",
     )
     parser.add_argument(
+        "--llm4cov-dataset-step-offset",
+        type=int,
+        default=0,
+        help=(
+            "Skip this many rollout steps in the training dataset order before "
+            "starting. With the same rollout seed, training step n then consumes "
+            "the prompts that step n+offset would have consumed."
+        ),
+    )
+    parser.add_argument(
         "--llm4cov-eval-dataset-name",
         type=str,
         default="Senlimulin/2026UCSDIntern_SlimeRL_training_dataset",
@@ -274,8 +284,9 @@ if __name__ == "__main__":
     logger.info("  save_hf       : %s", args.save_hf)
 
     # ---------- datasets ----------
-    logger.info("  train dataset : %s  split=%s",
-                args.llm4cov_dataset_name, args.llm4cov_dataset_split)
+    logger.info("  train dataset : %s  split=%s  step_offset=%d",
+                args.llm4cov_dataset_name, args.llm4cov_dataset_split,
+                getattr(args, "llm4cov_dataset_step_offset", 0))
     logger.info("  eval  dataset : %s  split=%s",
                 args.llm4cov_eval_dataset_name, args.llm4cov_eval_dataset_split)
 

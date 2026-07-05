@@ -58,9 +58,16 @@ set -ex
 #   --train-dataset NAME     HuggingFace dataset name for training rollouts
 #                            (default: Senlimulin/CodeV_R1_5918_dataset).
 #                            Overrides the LLM4COV_DATASET env var.
+#   --dataset-step-offset N  Skip this many same-seed rollout steps in the
+#                            training dataset order before starting. Formal OPD
+#                            defaults to 1000 so step n uses the prompt batch
+#                            that step n+1000 would have used.
 #   --eval-dataset  NAME     HuggingFace dataset name for eval rollouts
 #                            (default: Senlimulin/2026UCSDIntern_SlimeRL_training_dataset).
 #                            Overrides the LLM4COV_EVAL_DATASET env var.
+#   --no-verify-student-step999
+#                            Disable sha256 verification that MODEL_NAME resolves
+#                            to the expected stage2 step999 HF checkpoint.
 #   --batch-size N           Number of task prompts per rollout step. Smoke uses 1;
 #                            full runs can use 4. Internal slime rollout_batch_size
 #                            is N * num_agentic_rounds.
@@ -89,8 +96,14 @@ while [ $# -gt 0 ]; do
         --steps=*)                NUM_ROLLOUT="${1#--steps=}" ;;
         --train-dataset)          LLM4COV_DATASET="${2:?--train-dataset requires a value}"; shift ;;
         --train-dataset=*)        LLM4COV_DATASET="${1#--train-dataset=}" ;;
+        --dataset-step-offset|--llm4cov-dataset-step-offset)
+                                  LLM4COV_DATASET_STEP_OFFSET="${2:?$1 requires a value}"; shift ;;
+        --dataset-step-offset=*|--llm4cov-dataset-step-offset=*)
+                                  LLM4COV_DATASET_STEP_OFFSET="${1#*=}" ;;
         --eval-dataset)           LLM4COV_EVAL_DATASET="${2:?--eval-dataset requires a value}"; shift ;;
         --eval-dataset=*)         LLM4COV_EVAL_DATASET="${1#--eval-dataset=}" ;;
+        --no-verify-student-step999)
+                                  VERIFY_STUDENT_STAGE2_STEP999=0 ;;
         --batch-size|--prompt-batch-size|--task-batch-size)
                                   PROMPT_BATCH_SIZE="${2:?$1 requires a value}"; shift ;;
         --batch-size=*|--prompt-batch-size=*|--task-batch-size=*)
@@ -144,10 +157,11 @@ echo "[run] ──────────────────────�
 : "${EDA_SERVER:?Set EDA_SERVER to the SSH alias of the llm4cov_eda worker}"
 : "${EDA_REPO_DIR:?Set EDA_REPO_DIR to the path of llm4cov_eda on that worker}"
 
-MODEL_NAME=${MODEL_NAME:-hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0}
+MODEL_NAME=${MODEL_NAME:-Senlimulin/2026UCSDIntern_Stage2_elft_elfe}
 ROOT_DIR=${ROOT_DIR:-$(pwd)}
 LLM4COV_DATASET=${LLM4COV_DATASET:-Senlimulin/CodeV_R1_5918_dataset}
 LLM4COV_SPLIT=${LLM4COV_SPLIT:-train}
+LLM4COV_DATASET_STEP_OFFSET=${LLM4COV_DATASET_STEP_OFFSET:-1000}
 LLM4COV_EVAL_DATASET=${LLM4COV_EVAL_DATASET:-Senlimulin/2026UCSDIntern_SlimeRL_training_dataset}
 LLM4COV_EVAL_SPLIT=${LLM4COV_EVAL_SPLIT:-validation}
 NUM_ROLLOUT=${NUM_ROLLOUT:-300}
@@ -155,6 +169,7 @@ CKPT_INTERVAL=${CKPT_INTERVAL:-50}   # shared interval for --save-interval and -
 NUM_AGENTIC_ROUNDS=${NUM_AGENTIC_ROUNDS:-2}
 PROMPT_BATCH_SIZE=${PROMPT_BATCH_SIZE:-4}
 N_STUDENT=${N_STUDENT:-4}
+VERIFY_STUDENT_STAGE2_STEP999=${VERIFY_STUDENT_STAGE2_STEP999:-1}
 ROLLOUT_BATCH_SIZE=$((PROMPT_BATCH_SIZE * NUM_AGENTIC_ROUNDS))
 GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_STUDENT))
 
@@ -202,6 +217,28 @@ MODEL_ARGS+=(--make-vocab-size-divisible-by 1)
 # first-time HF download / torch_dist conversion if those dirs are missing.
 source "${SCRIPT_DIR}/_setup_checkpoints.sh"
 
+_verify_student_stage2_step999() {
+    local shard1="${HF_CKPT}/model-00001-of-00002.safetensors"
+    local shard2="${HF_CKPT}/model-00002-of-00002.safetensors"
+    local expect1="fc5216698e9c048c70dcaecf53f0a93c0db82aba6b171fc77871edbe62a39590"
+    local expect2="187142a76e287a0e398a4bf1047f01a1e4aef84317350594ddf6064d05920dc6"
+    local got1 got2
+    got1=$(sha256sum "${shard1}" | awk '{print $1}')
+    got2=$(sha256sum "${shard2}" | awk '{print $1}')
+    if [ "${got1}" != "${expect1}" ] || [ "${got2}" != "${expect2}" ]; then
+        echo "ERROR: student checkpoint is not Paladin stage2_step999." >&2
+        echo "       ${shard1}: got ${got1}, expected ${expect1}" >&2
+        echo "       ${shard2}: got ${got2}, expected ${expect2}" >&2
+        echo "       Set VERIFY_STUDENT_STAGE2_STEP999=0 only for intentional non-formal smoke/debug runs." >&2
+        exit 1
+    fi
+    echo "[setup] verified student checkpoint matches stage2_step999 sha256"
+}
+
+if [ "${VERIFY_STUDENT_STAGE2_STEP999}" = "1" ]; then
+    _verify_student_stage2_step999
+fi
+
 # RUN_SUBDIR and LOCAL_LOG are set here (after SAVE_DIR is available) so the
 # subdirectory name incorporates the actual checkpoint base name.
 _TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -228,6 +265,8 @@ fi
 echo "[run] EDA_SERVER   = ${EDA_SERVER}"                            | tee -a "${LOCAL_LOG}"
 echo "[run] EDA_REPO_DIR = ${EDA_REPO_DIR}"                          | tee -a "${LOCAL_LOG}"
 echo "[run] RUN_SUBDIR   = ${RUN_SUBDIR}"                            | tee -a "${LOCAL_LOG}"
+echo "[run] DATASET_STEP_OFFSET = ${LLM4COV_DATASET_STEP_OFFSET}"     | tee -a "${LOCAL_LOG}"
+echo "[run] VERIFY_STUDENT_STAGE2_STEP999 = ${VERIFY_STUDENT_STAGE2_STEP999}" | tee -a "${LOCAL_LOG}"
 echo "[run] ───────────────────────────────────────────────────────" | tee -a "${LOCAL_LOG}"
 
 # -------------------- checkpoint paths --------------------
@@ -277,6 +316,7 @@ AGENTIC_ARGS=(
    --eval-num-agentic-rounds  3
    --llm4cov-dataset-name        "${LLM4COV_DATASET}"
    --llm4cov-dataset-split       "${LLM4COV_SPLIT}"
+   --llm4cov-dataset-step-offset "${LLM4COV_DATASET_STEP_OFFSET}"
    --llm4cov-eval-dataset-name   "${LLM4COV_EVAL_DATASET}"
    --llm4cov-eval-dataset-split  "${LLM4COV_EVAL_SPLIT}"
    --eda-server            "${EDA_SERVER}"
