@@ -188,11 +188,29 @@ def format_feedback(raw: dict[str, Any], context: SimpleNamespace) -> str:
     return f"- status: {status}\n- stage: success\n- coverage: {detail}"
 
 
+def _eda_summary(eda_log: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": eda_log.get("status"),
+        "filename": eda_log.get("filename"),
+        "overall_coverage": float(eda_log.get("overall_coverage", 0.0) or 0.0),
+        "is_pass_targets": bool(eda_log.get("is_pass_targets", False)),
+        "is_pass_xrun": bool(eda_log.get("is_pass_xrun", False)),
+        "has_coverage": bool(eda_log.get("has_coverage", False)),
+        "err_msg": eda_log.get("err_msg", ""),
+    }
+
+
+def _with_eda_summary(result: dict[str, Any]) -> dict[str, Any]:
+    eda_log = result.get("eda_log") if isinstance(result.get("eda_log"), dict) else {}
+    result["eda_summary"] = _eda_summary(eda_log)
+    return result
+
+
 def run_eda(context: SimpleNamespace, filename: str | None, body: str | None, want_detail: bool) -> dict[str, Any]:
     filename = safe_filename(filename)
     if not body:
         eda_log = {"status": "parse_failed", "filename": None, "has_coverage": False}
-        return {"reward": 0.0, "eda_feedback": "- status: failed (could not extract a valid testbench)", "eda_log": eda_log}
+        return _with_eda_summary({"reward": 0.0, "eda_feedback": "- status: failed (could not extract a valid testbench)", "eda_log": eda_log})
     if MOCK:
         eda_log = {
             "status": "success",
@@ -203,7 +221,7 @@ def run_eda(context: SimpleNamespace, filename: str | None, body: str | None, wa
             "has_coverage": True,
             "err_msg": "",
         }
-        return {"reward": 1.5, "eda_feedback": "- status: success\n- stage: mock\n- coverage: 50%", "eda_log": eda_log}
+        return _with_eda_summary({"reward": 1.5, "eda_feedback": "- status: success\n- stage: mock\n- coverage: 50%", "eda_log": eda_log})
     tb_file = SimpleNamespace(name=filename, content=body)
     try:
         raw = submit_cov_job(
@@ -225,10 +243,10 @@ def run_eda(context: SimpleNamespace, filename: str | None, body: str | None, wa
             "err_msg": eval_log.get("err_msg", ""),
         }
         reward = 1.0 + eda_log["overall_coverage"] if eda_log["has_coverage"] else 0.0
-        return {"reward": reward, "eda_feedback": format_feedback(raw, context) if want_detail else None, "eda_log": eda_log}
+        return _with_eda_summary({"reward": reward, "eda_feedback": format_feedback(raw, context) if want_detail else None, "eda_log": eda_log})
     except Exception as exc:
         eda_log = {"status": "exception", "filename": filename, "has_coverage": False, "exc": str(exc)}
-        return {"reward": 0.0, "eda_feedback": f"- status: failed (EDA exception: {exc})", "eda_log": eda_log}
+        return _with_eda_summary({"reward": 0.0, "eda_feedback": f"- status: failed (EDA exception: {exc})", "eda_log": eda_log})
 
 
 def load_teacher_config() -> dict[str, Any]:
@@ -545,10 +563,13 @@ def score_student(job: Path, entry: dict[str, Any], context: SimpleNamespace, wa
     else:
         body = extract_verilog(response)
     scored = run_eda(context, filename, body, want_detail)
+    testbench = {"filename": safe_filename(filename), "content": body} if body else None
     return {
         "id": sid,
         "sample_index": meta.get("sample_index"),
+        "assistant_response": response,
         "assistant_response_file": f"{base.relative_to(job).as_posix()}/assistant_response.txt",
+        "testbench": testbench,
         "input_token_ids": meta.get("input_token_ids") or meta.get("tokens") or [],
         "response_token_ids": meta.get("response_token_ids") or [],
         "response_token_count": int(meta.get("response_token_count") or len(meta.get("response_token_ids") or [])),
@@ -620,7 +641,13 @@ def process(job: Path) -> None:
                 for i in range(int(spec.get("n", 1) or 0)):
                     teacher_jobs.append((name, i))
             teacher_entries: list[dict[str, Any]] = []
-            if teacher_jobs:
+            teacher_request = manifest.get("teacher_request") if isinstance(manifest.get("teacher_request"), dict) else {}
+            teacher_rollouts_file = manifest.get("teacher_rollouts_file")
+            if isinstance(teacher_rollouts_file, str) and teacher_rollouts_file:
+                provided = read_json(job / teacher_rollouts_file).get("teacher_rollouts", [])
+                if isinstance(provided, list):
+                    teacher_entries = [e for e in provided if isinstance(e, dict)]
+            if teacher_jobs and teacher_request.get("generate_teacher_rollouts", True):
                 with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(teacher_jobs)))) as pool:
                     futures = [
                         pool.submit(generate_teacher_rollout, name, slot, prompt, sampling_params, teacher_cfg)
@@ -628,11 +655,10 @@ def process(job: Path) -> None:
                     ]
                     generated = [future.result() for future in as_completed(futures)]
                 with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(generated)))) as pool:
-                    teacher_entries = list(pool.map(lambda e: score_teacher(e, context, want_detail), generated))
+                    teacher_entries.extend(pool.map(lambda e: score_teacher(e, context, want_detail), generated))
 
             sel = selection(student_entries, teacher_entries)
             best_teacher_entry = max(teacher_entries, key=lambda e: float(e.get("reward", 0.0)), default=None)
-            teacher_request = manifest.get("teacher_request") if isinstance(manifest.get("teacher_request"), dict) else {}
             if teacher_request.get("score_student_rollouts") and best_teacher_entry is not None:
                 best_teacher_name = str(best_teacher_entry.get("teacher") or "")
                 if best_teacher_name:

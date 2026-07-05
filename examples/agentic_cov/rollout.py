@@ -533,6 +533,97 @@ async def _score_existing_group_locally(
     return scored
 
 
+def _build_opd_round_request(
+    *,
+    args: Namespace,
+    state: GenerateState,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    rollout_id: int,
+    round_idx: int,
+    dataset_id: str,
+    want_detail: bool,
+) -> dict[str, Any]:
+    reference = group[0]
+    apply_chat_template_kwargs = getattr(args, "apply_chat_template_kwargs", {}) or {}
+    prompt_text = _prompt_to_text(reference.prompt, state.tokenizer, apply_chat_template_kwargs)
+    messages_history = list(reference.metadata.get("chat_history") or reference.metadata.get("initial_messages") or [])
+    context = reference.metadata.get("llm4cov_context") or {}
+    if not isinstance(context, dict):
+        raise RuntimeError("OPD relay requires llm4cov_context metadata as a dict")
+    return {
+        "args": args,
+        "job_id": build_job_id(dataset_id, rollout_id, round_idx),
+        "dataset_id": dataset_id,
+        "rollout_id": rollout_id,
+        "round_idx": round_idx,
+        "prompt_text": prompt_text,
+        "messages_history": messages_history,
+        "context": context,
+        "sampling_params": sampling_params,
+        "want_detail": want_detail,
+    }
+
+
+def _run_opd_teacher_round_sync(
+    *,
+    args: Namespace,
+    job_id: str,
+    dataset_id: str,
+    rollout_id: int,
+    round_idx: int,
+    prompt_text: str,
+    messages_history: list[dict[str, str]],
+    context: dict[str, Any],
+    sampling_params: dict[str, Any],
+    want_detail: bool,
+) -> dict[str, Any]:
+    teachers = parse_teacher_specs(getattr(args, "opd_teachers", ""))
+    if not teachers:
+        raise ValueError("OPD relay enabled but no teachers configured")
+    files = build_round_files(
+        job_id=job_id,
+        dataset_id=dataset_id,
+        rollout_id=rollout_id,
+        round_idx=round_idx,
+        prompt=prompt_text,
+        state={
+            "round_idx": round_idx,
+            "messages_history": messages_history,
+            "prompt_is_chat_template_text": True,
+        },
+        context=context,
+        student_rollouts=[],
+        teachers=teachers,
+        sampling_params=sampling_params,
+        want_detail=want_detail,
+        score_student_rollouts=False,
+        topk_k=int(getattr(args, "opd_topk", 0) or 0),
+        generate_teacher_rollouts=True,
+    )
+    client = OpdRelayClient(args)
+    try:
+        client.submit(job_id, files)
+        logger.info(
+            "OPD_TEACHER_SUBMIT step=%d dataset_id=%s round=%d job=%s n_teachers=%d",
+            rollout_id,
+            dataset_id,
+            round_idx + 1,
+            job_id,
+            sum(t.n for t in teachers),
+        )
+        result_dir = client.wait_result(
+            job_id,
+            timeout_s=float(getattr(args, "opd_timeout", 1800.0) or 1800.0),
+            poll_s=float(getattr(args, "opd_poll", 2.0) or 2.0),
+        )
+        result = load_result_tree(result_dir)
+        result["_opd_teacher_job_id"] = job_id
+        return result
+    finally:
+        client.close()
+
+
 def _run_opd_relay_round_sync(
     *,
     args: Namespace,
@@ -582,6 +673,63 @@ def _run_opd_relay_round_sync(
         client.close()
 
 
+def _run_opd_score_round_sync(
+    *,
+    args: Namespace,
+    teacher_result: dict[str, Any],
+    job_id: str,
+    dataset_id: str,
+    rollout_id: int,
+    round_idx: int,
+    prompt_text: str,
+    messages_history: list[dict[str, str]],
+    context: dict[str, Any],
+    student_rollouts: list[dict[str, Any]],
+    sampling_params: dict[str, Any],
+    want_detail: bool,
+) -> dict[str, Any]:
+    teacher_rollouts = _result_entries(teacher_result, "teacher_rollouts", "teachers", "teacher")
+    if not teacher_rollouts:
+        raise RuntimeError("OPD teacher stage returned no teacher_rollouts")
+    score_job_id = f"{job_id}_score"
+    files = build_round_files(
+        job_id=score_job_id,
+        dataset_id=dataset_id,
+        rollout_id=rollout_id,
+        round_idx=round_idx,
+        prompt=prompt_text,
+        state={
+            "round_idx": round_idx,
+            "messages_history": messages_history,
+            "prompt_is_chat_template_text": True,
+            "teacher_stage_job_id": teacher_result.get("job_id") or job_id,
+        },
+        context=context,
+        student_rollouts=student_rollouts,
+        teachers=[],
+        sampling_params=sampling_params,
+        want_detail=want_detail,
+        score_student_rollouts=True,
+        topk_k=int(getattr(args, "opd_topk", 0) or 0),
+        teacher_rollouts=teacher_rollouts,
+        generate_teacher_rollouts=False,
+    )
+    client = OpdRelayClient(args)
+    try:
+        result_dir = client.submit_and_wait(
+            score_job_id,
+            files,
+            timeout_s=float(getattr(args, "opd_timeout", 1800.0) or 1800.0),
+            poll_s=float(getattr(args, "opd_poll", 2.0) or 2.0),
+        )
+        result = load_result_tree(result_dir)
+        result["_opd_teacher_job_id"] = teacher_result.get("job_id") or job_id
+        result["_opd_score_job_id"] = score_job_id
+        return result
+    finally:
+        client.close()
+
+
 async def _score_group_with_opd_relay(
     *,
     args: Namespace,
@@ -593,31 +741,34 @@ async def _score_group_with_opd_relay(
     dataset_id: str,
     want_detail: bool,
     sample_index_allocator,
+    teacher_result: dict[str, Any] | None = None,
+    opd_request: dict[str, Any] | None = None,
 ) -> tuple[list[Sample], list[Sample]]:
-    reference = group[0]
-    apply_chat_template_kwargs = getattr(args, "apply_chat_template_kwargs", {}) or {}
-    prompt_text = _prompt_to_text(reference.prompt, state.tokenizer, apply_chat_template_kwargs)
-    messages_history = list(reference.metadata.get("chat_history") or reference.metadata.get("initial_messages") or [])
-    context = reference.metadata.get("llm4cov_context") or {}
-    if not isinstance(context, dict):
-        raise RuntimeError("OPD relay requires llm4cov_context metadata as a dict")
-
-    student_rollouts = [_student_rollout_payload(sample, i) for i, sample in enumerate(group)]
-    job_id = build_job_id(dataset_id, rollout_id, round_idx)
-    result = await asyncio.to_thread(
-        _run_opd_relay_round_sync,
+    request = opd_request or _build_opd_round_request(
         args=args,
-        job_id=job_id,
-        dataset_id=dataset_id,
+        state=state,
+        group=group,
+        sampling_params=sampling_params,
         rollout_id=rollout_id,
         round_idx=round_idx,
-        prompt_text=prompt_text,
-        messages_history=messages_history,
-        context=context,
-        student_rollouts=student_rollouts,
-        sampling_params=sampling_params,
+        dataset_id=dataset_id,
         want_detail=want_detail,
     )
+    student_rollouts = [_student_rollout_payload(sample, i) for i, sample in enumerate(group)]
+    if teacher_result is None:
+        result = await asyncio.to_thread(
+            _run_opd_relay_round_sync,
+            student_rollouts=student_rollouts,
+            **request,
+        )
+    else:
+        result = await asyncio.to_thread(
+            _run_opd_score_round_sync,
+            teacher_result=teacher_result,
+            student_rollouts=student_rollouts,
+            **request,
+        )
+    job_id = result.get("_opd_score_job_id") or result.get("job_id") or request["job_id"]
 
     _apply_remote_student_scores(group, result)
     teacher_entries = _result_entries(result, "teacher_rollouts", "teachers", "teacher")
@@ -636,7 +787,7 @@ async def _score_group_with_opd_relay(
 
     logger.info(
         "OPD_GATE step=%d dataset_id=%s round=%d job=%s gate=%s "
-        "best_student=%.4f best_teacher=%.4f eps=%.4f n_teachers=%d",
+        "best_student=%.4f best_teacher=%.4f eps=%.4f n_teachers=%d teacher_job=%s",
         rollout_id,
         dataset_id,
         round_idx + 1,
@@ -646,6 +797,7 @@ async def _score_group_with_opd_relay(
         best_teacher_reward,
         gate_eps,
         len(teacher_entries),
+        result.get("_opd_teacher_job_id") or result.get("job_id") or "",
     )
 
     if gate_pass and best_teacher is not None:
@@ -910,8 +1062,20 @@ async def _rollout_one_prompt(
 
         train_group: list[Sample]
         if bool(getattr(args, "use_opd_relay", False)) and not evaluation:
+            opd_request = _build_opd_round_request(
+                args=args,
+                state=state,
+                group=current_group,
+                sampling_params=sampling_params,
+                rollout_id=rollout_id,
+                round_idx=round_idx,
+                dataset_id=context_id,
+                want_detail=_want_detail,
+            )
+            teacher_task = asyncio.create_task(asyncio.to_thread(_run_opd_teacher_round_sync, **opd_request))
             current_group = await _generate_group_only(args, state, current_group, sampling_params)
             try:
+                teacher_result = await teacher_task
                 train_group, current_group = await _score_group_with_opd_relay(
                     args=args,
                     state=state,
@@ -922,6 +1086,8 @@ async def _rollout_one_prompt(
                     dataset_id=context_id,
                     want_detail=_want_detail,
                     sample_index_allocator=sample_index_allocator,
+                    teacher_result=teacher_result,
+                    opd_request=opd_request,
                 )
             except Exception:
                 logger.exception(

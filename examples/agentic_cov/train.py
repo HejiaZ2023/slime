@@ -8,10 +8,10 @@ Usage (in place of ``python train.py`` in slime's docs):
         --data-source-path      examples.agentic_cov.data_source.LlmCovDataSource \
         --num-agentic-rounds 2 \
         --eval-num-agentic-rounds 1 \
-        --llm4cov-dataset-name       hez2024/CodeV-R1-dataset-RL-test \
+        --llm4cov-dataset-name       Senlimulin/CodeV_R1_5918_dataset \
         --llm4cov-dataset-split      train \
-        --llm4cov-eval-dataset-name  hez2024/cvdp_ecov_eval \
-        --llm4cov-eval-dataset-split eval \
+        --llm4cov-eval-dataset-name  Senlimulin/2026UCSDIntern_SlimeRL_training_dataset \
+        --llm4cov-eval-dataset-split validation \
         --eda-server            paladin_centos \
         --eda-repo-dir          /workspace/llm4cov_eda \
         --advantage-estimator grpo \
@@ -48,7 +48,7 @@ def add_agentic_args(parser):
     parser.add_argument(
         "--llm4cov-dataset-name",
         type=str,
-        default="hez2024/CodeV-R1-dataset-RL-test",
+        default="Senlimulin/CodeV_R1_5918_dataset",
         help="HF dataset name for training prompts (llm4cov.datasets.load.load_dataset_by_name).",
     )
     parser.add_argument(
@@ -60,13 +60,13 @@ def add_agentic_args(parser):
     parser.add_argument(
         "--llm4cov-eval-dataset-name",
         type=str,
-        default="hez2024/cvdp_ecov_eval",
+        default="Senlimulin/2026UCSDIntern_SlimeRL_training_dataset",
         help="HF dataset name for evaluation prompts. Loaded independently from training.",
     )
     parser.add_argument(
         "--llm4cov-eval-dataset-split",
         type=str,
-        default="eval",
+        default="validation",
         help="Split name for the eval dataset.",
     )
     parser.add_argument(

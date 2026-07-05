@@ -1,6 +1,6 @@
 #!/bin/bash
 # Multi-round agentic GRPO training for Qwen3-4B on 2x H100 (80 GB HBM),
-# WITH periodic eval on hez2024/cvdp_ecov_eval.
+# WITH periodic eval on Senlimulin/2026UCSDIntern_SlimeRL_training_dataset validation.
 # - DAPO-style: asymmetric clipping (low=0.2, high=0.28) + sequence-normalized
 #   loss (--calculate-per-token-loss). NO dynamic sampling.
 # - Collocated rollout + training (--colocate).
@@ -56,18 +56,18 @@ set -ex
 #   --steps N                Total number of rollout steps to train (default: 300).
 #                            Overrides the NUM_ROLLOUT env var.
 #   --train-dataset NAME     HuggingFace dataset name for training rollouts
-#                            (default: hez2024/CodeV-R1-dataset-RL-test).
+#                            (default: Senlimulin/CodeV_R1_5918_dataset).
 #                            Overrides the LLM4COV_DATASET env var.
 #   --eval-dataset  NAME     HuggingFace dataset name for eval rollouts
-#                            (default: hez2024/cvdp_ecov_eval).
+#                            (default: Senlimulin/2026UCSDIntern_SlimeRL_training_dataset).
 #                            Overrides the LLM4COV_EVAL_DATASET env var.
 #   --batch-size N           Number of task prompts per rollout step. Smoke uses 1;
 #                            full runs can use 4. Internal slime rollout_batch_size
 #                            is N * num_agentic_rounds.
 #   --n-student N            Number of student rollouts per prompt. Smoke uses 2.
 OFFLOAD=0
-EDA_LOG_FEEDBACK_TRAIN=0
-EDA_LOG_FEEDBACK_EVAL=0
+EDA_LOG_FEEDBACK_TRAIN=${EDA_LOG_FEEDBACK_TRAIN:-1}
+EDA_LOG_FEEDBACK_EVAL=${EDA_LOG_FEEDBACK_EVAL:-1}
 USE_UNCOVERED_LOG=0
 USE_UNCOVERED_REWARD=0
 DIV_LAM=""
@@ -76,8 +76,8 @@ OPD_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --offload)                OFFLOAD=1 ;;
-        --eda-log-feedback-train|--elft) EDA_LOG_FEEDBACK_TRAIN=1 ;;
-        --eda-log-feedback-eval|--elfe)  EDA_LOG_FEEDBACK_EVAL=1 ;;
+        --eda-log-feedback-train|--elft) EDA_LOG_FEEDBACK_TRAIN=${EDA_LOG_FEEDBACK_TRAIN:-1} ;;
+        --eda-log-feedback-eval|--elfe)  EDA_LOG_FEEDBACK_EVAL=${EDA_LOG_FEEDBACK_EVAL:-1} ;;
         --use-uncovered-log|--uul)       USE_UNCOVERED_LOG=1 ;;
         --use-uncovered-reward|--uur)    USE_UNCOVERED_REWARD=1 ;;
         --div-lam)                DIV_LAM="${2:?--div-lam requires a value}"; shift ;;
@@ -146,10 +146,10 @@ echo "[run] ──────────────────────�
 
 MODEL_NAME=${MODEL_NAME:-hez2024/LLM4Cov-Qwen3-4B-SFT-Stage0}
 ROOT_DIR=${ROOT_DIR:-$(pwd)}
-LLM4COV_DATASET=${LLM4COV_DATASET:-hez2024/CodeV-R1-dataset-RL-test}
+LLM4COV_DATASET=${LLM4COV_DATASET:-Senlimulin/CodeV_R1_5918_dataset}
 LLM4COV_SPLIT=${LLM4COV_SPLIT:-train}
-LLM4COV_EVAL_DATASET=${LLM4COV_EVAL_DATASET:-hez2024/cvdp_ecov_eval}
-LLM4COV_EVAL_SPLIT=${LLM4COV_EVAL_SPLIT:-eval}
+LLM4COV_EVAL_DATASET=${LLM4COV_EVAL_DATASET:-Senlimulin/2026UCSDIntern_SlimeRL_training_dataset}
+LLM4COV_EVAL_SPLIT=${LLM4COV_EVAL_SPLIT:-validation}
 NUM_ROLLOUT=${NUM_ROLLOUT:-300}
 CKPT_INTERVAL=${CKPT_INTERVAL:-50}   # shared interval for --save-interval and --eval-interval
 NUM_AGENTIC_ROUNDS=${NUM_AGENTIC_ROUNDS:-2}

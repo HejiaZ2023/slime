@@ -251,6 +251,12 @@ class OpdRelayClient:
         else:
             raise ValueError(f"unknown OPD transport: {transport}")
 
+    def submit(self, job_id: str, files: dict[str, bytes]) -> None:
+        self.transport.submit(job_id, files)
+
+    def wait_result(self, job_id: str, *, timeout_s: float, poll_s: float = 2.0) -> Path:
+        return self.transport.wait_result(job_id, timeout_s=timeout_s, poll_s=poll_s)
+
     def submit_and_wait(
         self,
         job_id: str,
@@ -259,8 +265,8 @@ class OpdRelayClient:
         timeout_s: float,
         poll_s: float = 2.0,
     ) -> Path:
-        self.transport.submit(job_id, files)
-        return self.transport.wait_result(job_id, timeout_s=timeout_s, poll_s=poll_s)
+        self.submit(job_id, files)
+        return self.wait_result(job_id, timeout_s=timeout_s, poll_s=poll_s)
 
     def close(self) -> None:
         self.transport.close()
@@ -281,6 +287,8 @@ def build_round_files(
     want_detail: bool,
     score_student_rollouts: bool = False,
     topk_k: int = 0,
+    teacher_rollouts: list[dict[str, Any]] | None = None,
+    generate_teacher_rollouts: bool = True,
 ) -> dict[str, bytes]:
     files: dict[str, bytes] = {
         "prompt.txt": _encode_text(prompt),
@@ -288,6 +296,9 @@ def build_round_files(
         "context.json": _encode_text(_json_dumps(context)),
     }
     student_entries = []
+    if teacher_rollouts is not None:
+        files["teacher_rollouts.json"] = _encode_text(_json_dumps({"teacher_rollouts": teacher_rollouts}))
+
     for i, rollout in enumerate(student_rollouts):
         sid = rollout.get("id") or f"s{i:03d}"
         base = f"student/{sid}"
@@ -309,11 +320,12 @@ def build_round_files(
         "state_file": "state.json",
         "context_file": "context.json",
         "student_rollouts": student_entries,
+        "teacher_rollouts_file": "teacher_rollouts.json" if teacher_rollouts is not None else None,
         "teachers": [{"name": t.name, "n": t.n} for t in teachers],
         "sampling_params": sampling_params,
         "eda": {"want_detail": bool(want_detail)},
         "teacher_request": {
-            "generate_teacher_rollouts": True,
+            "generate_teacher_rollouts": bool(generate_teacher_rollouts),
             "return_teacher_assistant_response": True,
             "return_teacher_token_ids": True,
             "return_teacher_logprobs": True,
