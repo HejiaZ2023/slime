@@ -564,7 +564,10 @@ def get_topk_log_probs(
             continue
         cols = []
         for col in range(ids.size(1)):
-            cols.append(compute_log_probs(logits_chunk, ids[:, col], tp_group).squeeze(-1))
+            # Megatron fused CE saves tensors for backward; each top-k gather
+            # needs independent storage to avoid version-counter conflicts.
+            logits_for_ce = logits_chunk.contiguous().clone()
+            cols.append(compute_log_probs(logits_for_ce, ids[:, col], tp_group).squeeze(-1))
         out.append(torch.stack(cols, dim=-1))
     return out
 
