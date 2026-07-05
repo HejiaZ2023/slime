@@ -41,7 +41,7 @@ RES = XFER / "results" / NAMESPACE
 WORK = XFER / ".work" / NAMESPACE
 STATE = XFER / ".state" / NAMESPACE
 POLL_SEC = float(os.environ.get("OPD_POLL_SEC", "2"))
-JOB_TTL = int(os.environ.get("OPD_JOB_TTL", str(6 * 3600)))
+JOB_TTL = int(os.environ.get("OPD_JOB_TTL", "0"))  # 0 keeps OPD audit artifacts indefinitely
 MAX_CONCURRENT_JOBS = int(os.environ.get("OPD_MAX_CONCURRENT_JOBS", "4"))
 MAX_JOB_WORKERS = int(os.environ.get("OPD_MAX_JOB_WORKERS", "4"))
 TEACHER_TIMEOUT = float(os.environ.get("OPD_TEACHER_TIMEOUT", "900"))
@@ -78,6 +78,37 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def write_json(path: Path, obj: dict[str, Any]) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+
+
+def _summary_count(obj: dict[str, Any], key: str) -> int:
+    value = obj.get(key)
+    return len(value) if isinstance(value, list) else 0
+
+
+def summarize_result(obj: dict[str, Any], final_dir: Path) -> dict[str, Any]:
+    return {
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "job_id": obj.get("job_id"),
+        "status": obj.get("status"),
+        "dataset_id": obj.get("dataset_id"),
+        "rollout_id": obj.get("rollout_id"),
+        "round_idx": obj.get("round_idx"),
+        "student_count": _summary_count(obj, "student_rollouts"),
+        "teacher_count": _summary_count(obj, "teacher_rollouts"),
+        "selection": obj.get("selection"),
+        "elapsed_s": obj.get("elapsed_s"),
+        "incoming_dir": str(IN / str(obj.get("job_id"))),
+        "result_dir": str(final_dir),
+        "result_file": str(final_dir / "result.json"),
+    }
+
+
+def append_index(summary: dict[str, Any]) -> None:
+    index = RES / "index.jsonl"
+    line = json.dumps(summary, ensure_ascii=False, sort_keys=True)
+    with _LOCK:
+        with index.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 
 def safe_filename(name: str | None, default: str = "tb_generated.sv") -> str:
@@ -625,6 +656,9 @@ def publish(job_id: str, obj: dict[str, Any]) -> None:
     if final.exists():
         shutil.rmtree(final)
     os.rename(staging, final)
+    summary = summarize_result(obj, final)
+    write_json(final / "summary.json", summary)
+    append_index(summary)
     (final / ".done").write_text("", encoding="utf-8")
 
 
@@ -721,6 +755,8 @@ def process(job: Path) -> None:
 
 
 def gc() -> None:
+    if JOB_TTL <= 0:
+        return
     now = time.time()
     for base in (IN, RES):
         for d in base.iterdir() if base.exists() else []:
