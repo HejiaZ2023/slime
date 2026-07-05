@@ -465,7 +465,8 @@ def _extract_requested_topk_logprobs(
             candidate_maps.append(row)
     else:
         rows = (
-            meta.get("input_top_logprobs")
+            meta.get("input_token_ids_logprobs")
+            or meta.get("input_top_logprobs")
             or meta.get("input_token_top_logprobs")
             or meta.get("top_logprobs")
             or []
