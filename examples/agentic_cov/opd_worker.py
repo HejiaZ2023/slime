@@ -440,8 +440,18 @@ def _extract_requested_topk_logprobs(
             mask_matrix = [[1.0] * width for _ in range(response_len)]
         return direct_matrix, mask_matrix
 
-    idx_rows = meta.get("input_top_logprobs_idx") or meta.get("input_top_logprobs_token_ids")
-    val_rows = meta.get("input_top_logprobs_val") or meta.get("input_top_logprobs_logprobs")
+    idx_rows = (
+        meta.get("input_token_ids_logprobs_idx")
+        or meta.get("input_token_ids_logprobs_token_ids")
+        or meta.get("input_top_logprobs_idx")
+        or meta.get("input_top_logprobs_token_ids")
+    )
+    val_rows = (
+        meta.get("input_token_ids_logprobs_val")
+        or meta.get("input_token_ids_logprobs_logprobs")
+        or meta.get("input_top_logprobs_val")
+        or meta.get("input_top_logprobs_logprobs")
+    )
     candidate_maps: list[dict[int, float]] = []
     if isinstance(idx_rows, list) and isinstance(val_rows, list):
         for ids, vals in zip(idx_rows[-response_len:], val_rows[-response_len:], strict=False):
@@ -509,10 +519,13 @@ def score_teacher_on_student(
         "logprob_start_len": 0,
     }
     if requested_topk:
+        token_ids_logprob = sorted({int(token_id) for row in requested_topk for token_id in row})
         payload["topk_token_ids"] = requested_topk
         payload["return_topk_logprobs"] = True
-        payload["top_logprobs_num"] = topk_k
-        payload["sampling_params"]["top_logprobs_num"] = topk_k
+        # Ask SGLang to gather the union of the student's top-k support for
+        # every forced-scored position; _extract_requested_topk_logprobs maps
+        # those rows back to the per-position student top-k ids.
+        payload["token_ids_logprob"] = token_ids_logprob
     try:
         output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
     except Exception as exc:

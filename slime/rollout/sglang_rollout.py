@@ -179,10 +179,6 @@ class GenerateState(metaclass=SingletonMeta):
             no_stop_trim=True,
             spaces_between_special_tokens=False,
         )
-        opd_topk = int(getattr(args, "opd_topk", 0) or 0)
-        if bool(getattr(args, "use_opd_relay", False)) and opd_topk > 0:
-            self.sampling_params["top_logprobs_num"] = opd_topk
-
         if getattr(args, "sglang_enable_deterministic_inference", False):
             sampling_seed_base = args.rollout_seed
             self.group_sampling_seeds = [sampling_seed_base + i for i in range(args.n_samples_per_prompt)]
@@ -252,6 +248,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
+    opd_topk = int(getattr(args, "opd_topk", 0) or 0)
+    if bool(getattr(args, "use_opd_relay", False)) and opd_topk > 0:
+        # SGLang 0.5.x expects top_logprobs_num at the /generate payload level,
+        # not inside sampling_params.
+        payload["top_logprobs_num"] = opd_topk
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
