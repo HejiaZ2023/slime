@@ -45,6 +45,10 @@ JOB_TTL = int(os.environ.get("OPD_JOB_TTL", "0"))  # 0 keeps OPD audit artifacts
 MAX_CONCURRENT_JOBS = int(os.environ.get("OPD_MAX_CONCURRENT_JOBS", "4"))
 MAX_JOB_WORKERS = int(os.environ.get("OPD_MAX_JOB_WORKERS", "4"))
 TEACHER_TIMEOUT = float(os.environ.get("OPD_TEACHER_TIMEOUT", "900"))
+TEACHER_CONTEXT_LENGTH = int(os.environ.get("OPD_TEACHER_CONTEXT_LENGTH", "32768"))
+TEACHER_TOKEN_BUDGET_MARGIN = int(os.environ.get("OPD_TEACHER_TOKEN_BUDGET_MARGIN", "256"))
+TEACHER_MIN_NEW_TOKENS = int(os.environ.get("OPD_TEACHER_MIN_NEW_TOKENS", "16"))
+TEACHER_SCORE_CHUNK_TOKENS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_TOKENS", "512"))
 TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sheng/final_ckpts")
 EDA_SERVER = os.environ.get("OPD_EDA_SERVER", "local")
 EDA_REPO_DIR = os.environ.get("OPD_EDA_REPO_DIR", "/workspace/llm4cov_eda")
@@ -343,6 +347,76 @@ def post_json(url: str, payload: dict[str, Any], timeout: float) -> dict[str, An
     return obj
 
 
+def teacher_tokenize_url(generate_url: str) -> str:
+    return re.sub(r"/generate/?$", "/tokenize", generate_url.rstrip("/"))
+
+
+def count_teacher_prompt_tokens(url: str, prompt: str) -> int:
+    obj = post_json(teacher_tokenize_url(url), {"prompt": prompt}, timeout=TEACHER_TIMEOUT)
+    count = obj.get("count")
+    if count is not None:
+        return int(count)
+    tokens = obj.get("tokens")
+    if isinstance(tokens, list):
+        return len(tokens)
+    raise RuntimeError(f"teacher tokenize returned no token count: {obj.keys()}")
+
+
+def _requested_max_new_tokens(sampling_params: dict[str, Any]) -> int:
+    for key in ("max_new_tokens", "max_tokens"):
+        if sampling_params.get(key) is not None:
+            try:
+                return int(sampling_params[key])
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def teacher_sampling_with_budget(
+    name: str,
+    url: str,
+    prompt: str,
+    sampling_params: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+    params = dict(sampling_params or {})
+    requested = _requested_max_new_tokens(params)
+    budget = {
+        "requested_max_new_tokens": requested,
+        "effective_max_new_tokens": requested,
+        "teacher_context_length": TEACHER_CONTEXT_LENGTH,
+        "teacher_token_budget_margin": TEACHER_TOKEN_BUDGET_MARGIN,
+    }
+    if requested <= 0 or TEACHER_CONTEXT_LENGTH <= 0:
+        return params, budget, None
+    try:
+        prompt_tokens = count_teacher_prompt_tokens(url, prompt)
+    except Exception as exc:
+        budget["token_count_error"] = str(exc)
+        log("WARN", "teacher_token_count_failed", name, str(exc))
+        return params, budget, None
+    budget["prompt_token_count"] = prompt_tokens
+    available = TEACHER_CONTEXT_LENGTH - prompt_tokens - max(0, TEACHER_TOKEN_BUDGET_MARGIN)
+    budget["available_new_tokens"] = available
+    if available < max(1, TEACHER_MIN_NEW_TOKENS):
+        budget["effective_max_new_tokens"] = 0
+        return params, budget, "teacher_context_exceeded"
+    effective = min(requested, available)
+    params["max_new_tokens"] = effective
+    if "max_tokens" in params:
+        params["max_tokens"] = effective
+    budget["effective_max_new_tokens"] = effective
+    if effective < requested:
+        log(
+            "teacher_budget_clamp",
+            name,
+            f"prompt_tokens={prompt_tokens}",
+            f"requested={requested}",
+            f"effective={effective}",
+            f"context={TEACHER_CONTEXT_LENGTH}",
+        )
+    return params, budget, None
+
+
 def extract_token_logprobs(meta: dict[str, Any]) -> tuple[list[int], list[float]]:
     pairs = meta.get("output_token_logprobs") or []
     token_ids: list[int] = []
@@ -362,19 +436,45 @@ def extract_token_logprobs(meta: dict[str, Any]) -> tuple[list[int], list[float]
 def generate_teacher_rollout(name: str, slot: int, prompt: str, sampling_params: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     url = teacher_url(name, cfg)
     model_path = teacher_model_path(name, cfg)
-    payload = {"text": prompt, "sampling_params": sampling_params, "return_logprob": True}
-    output = post_json(url, payload, timeout=TEACHER_TIMEOUT)
+    effective_sampling_params, budget, skip_reason = teacher_sampling_with_budget(name, url, prompt, sampling_params)
+    base = {
+        "id": f"{name}_t{slot:03d}",
+        "teacher": name,
+        "teacher_model_path": model_path,
+        "teacher_generation_budget": budget,
+    }
+    if skip_reason:
+        return {
+            **base,
+            "assistant_response": "",
+            "generated_token_ids": [],
+            "generated_token_logprobs": [],
+            "finish_reason": skip_reason,
+            "teacher_generation_status": skip_reason,
+        }
+    payload = {"text": prompt, "sampling_params": effective_sampling_params, "return_logprob": True}
+    try:
+        output = post_json(url, payload, timeout=TEACHER_TIMEOUT)
+    except Exception as exc:
+        return {
+            **base,
+            "assistant_response": "",
+            "generated_token_ids": [],
+            "generated_token_logprobs": [],
+            "finish_reason": "teacher_generate_error",
+            "teacher_generation_status": "teacher_generate_error",
+            "teacher_generation_error": str(exc),
+        }
     response = str(output.get("text") or output.get("response") or output.get("output") or "")
     meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
     token_ids, logprobs = extract_token_logprobs(meta)
     return {
-        "id": f"{name}_t{slot:03d}",
-        "teacher": name,
-        "teacher_model_path": model_path,
+        **base,
         "assistant_response": response,
         "generated_token_ids": token_ids,
         "generated_token_logprobs": logprobs,
         "finish_reason": meta.get("finish_reason"),
+        "teacher_generation_status": "success",
     }
 
 
@@ -568,26 +668,73 @@ def score_teacher_on_student(
             "status": "missing_student_tokens",
             "teacher_log_probs": [],
         }
-    payload = {
-        "input_ids": [int(x) for x in input_ids],
-        "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": 0,
-            "skip_special_tokens": False,
-        },
-        "return_logprob": True,
-        "logprob_start_len": 0,
-    }
-    if requested_topk:
-        token_ids_logprob = sorted({int(token_id) for row in requested_topk for token_id in row})
-        payload["topk_token_ids"] = requested_topk
-        payload["return_topk_logprobs"] = True
-        # Ask SGLang to gather the union of the student's top-k support for
-        # every forced-scored position; _extract_requested_topk_logprobs maps
-        # those rows back to the per-position student top-k ids.
-        payload["token_ids_logprob"] = token_ids_logprob
+    prompt_len = max(0, len(input_ids) - response_len)
+    input_ids_int = [int(x) for x in input_ids]
+    teacher_log_probs: list[float] = []
+    teacher_topk_parts: list[list[list[float]] | None] = []
+    teacher_mask_parts: list[list[list[float]] | None] = []
+    timings: list[dict[str, Any]] = []
+    total_started = time.monotonic()
+    chunk_size = response_len
+    if requested_topk and TEACHER_SCORE_CHUNK_TOKENS > 0:
+        chunk_size = min(response_len, max(1, TEACHER_SCORE_CHUNK_TOKENS))
+
     try:
-        output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
+        for offset in range(0, response_len, chunk_size):
+            chunk_len = min(chunk_size, response_len - offset)
+            chunk_start = prompt_len + offset
+            logprob_start_len = max(0, chunk_start - 1)
+            chunk_requested_topk = (
+                requested_topk[offset : offset + chunk_len] if requested_topk is not None else None
+            )
+            chunk_input_ids = input_ids_int[: chunk_start + chunk_len]
+            payload = {
+                "input_ids": chunk_input_ids,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 0,
+                    "skip_special_tokens": False,
+                },
+                "return_logprob": True,
+                # Only response-token logprobs are consumed by OPD.  SGLang
+                # returns a leading None row at logprob_start_len, so start one
+                # token before this chunk and keep the final chunk_len rows.
+                "logprob_start_len": logprob_start_len,
+            }
+            token_ids_logprob: list[int] = []
+            if chunk_requested_topk:
+                token_ids_logprob = sorted({int(token_id) for row in chunk_requested_topk for token_id in row})
+                payload["topk_token_ids"] = chunk_requested_topk
+                payload["return_topk_logprobs"] = True
+                # SGLang currently accepts a request-level token_ids_logprob
+                # list, not a per-position list.  Chunking keeps this union
+                # small while preserving exact logprobs for the student top-k
+                # support at each response position.
+                payload["token_ids_logprob"] = token_ids_logprob
+            started = time.monotonic()
+            output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
+            meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
+            teacher_log_probs.extend(extract_input_logprobs(meta, chunk_len))
+            chunk_topk, chunk_masks = _extract_requested_topk_logprobs(
+                output,
+                chunk_len,
+                chunk_requested_topk,
+            )
+            teacher_topk_parts.append(chunk_topk)
+            teacher_mask_parts.append(chunk_masks)
+            timings.append(
+                {
+                    "offset": offset,
+                    "chunk_response_token_count": chunk_len,
+                    "request_seconds": time.monotonic() - started,
+                    "input_token_count": len(chunk_input_ids),
+                    "prompt_token_count": prompt_len,
+                    "logprob_start_len": logprob_start_len,
+                    "input_logprob_rows": len(meta.get("input_token_logprobs") or []),
+                    "input_token_ids_logprob_rows": len(meta.get("input_token_ids_logprobs") or []),
+                    "token_ids_logprob_count": len(token_ids_logprob),
+                }
+            )
     except Exception as exc:
         return {
             "student_id": sid,
@@ -597,11 +744,26 @@ def score_teacher_on_student(
             "teacher_log_probs": [],
             "response_token_count": response_len,
             "num_teacher_log_probs": 0,
+            "teacher_score_timing": {
+                "request_seconds": time.monotonic() - total_started,
+                "input_token_count": len(input_ids),
+                "prompt_token_count": prompt_len,
+                "response_token_count": response_len,
+                "chunk_size": chunk_size,
+                "chunks": timings,
+            },
         }
-    meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
-    teacher_log_probs = extract_input_logprobs(meta, response_len)
+
     status = "success" if len(teacher_log_probs) == response_len else "length_mismatch"
-    teacher_topk, teacher_topk_masks = _extract_requested_topk_logprobs(output, response_len, requested_topk)
+    teacher_topk = None
+    teacher_topk_masks = None
+    if requested_topk is not None:
+        if all(part is not None for part in teacher_topk_parts) and all(part is not None for part in teacher_mask_parts):
+            teacher_topk = [row for part in teacher_topk_parts for row in (part or [])]
+            teacher_topk_masks = [row for part in teacher_mask_parts for row in (part or [])]
+        else:
+            teacher_topk = None
+            teacher_topk_masks = None
     if requested_topk is not None:
         if teacher_topk is not None and teacher_topk_masks is not None:
             topk_total = sum(len(row) for row in teacher_topk_masks)
@@ -617,6 +779,14 @@ def score_teacher_on_student(
         "teacher_log_probs": teacher_log_probs,
         "response_token_count": response_len,
         "num_teacher_log_probs": len(teacher_log_probs),
+        "teacher_score_timing": {
+            "request_seconds": time.monotonic() - total_started,
+            "input_token_count": len(input_ids),
+            "prompt_token_count": prompt_len,
+            "response_token_count": response_len,
+            "chunk_size": chunk_size,
+            "chunks": timings,
+        },
     }
     if requested_topk is not None:
         result["topk_token_ids"] = requested_topk
