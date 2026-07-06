@@ -543,6 +543,8 @@ def get_topk_log_probs(
         raise NotImplementedError("OPD top-k KL does not support allgather_cp yet")
 
     tp_group = mpu.get_tensor_model_parallel_group()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
     out: list[torch.Tensor] = []
     for (logits_chunk, _), ids in zip(
         get_responses(
@@ -562,13 +564,32 @@ def get_topk_log_probs(
         if logits_chunk.size(0) == 0 or ids.numel() == 0:
             out.append(logits_chunk.new_zeros((logits_chunk.size(0), ids.size(-1) if ids.dim() == 2 else 0)))
             continue
-        cols = []
-        for col in range(ids.size(1)):
-            # Megatron fused CE saves tensors for backward; each top-k gather
-            # needs independent storage to avoid version-counter conflicts.
-            logits_for_ce = logits_chunk.contiguous().clone()
-            cols.append(compute_log_probs(logits_for_ce, ids[:, col], tp_group).squeeze(-1))
-        out.append(torch.stack(cols, dim=-1))
+
+        local_vocab_size = logits_chunk.size(-1)
+        vocab_start = tp_rank * local_vocab_size
+        vocab_end = vocab_start + local_vocab_size
+
+        local_lse = torch.logsumexp(logits_chunk, dim=-1, keepdim=True)
+        if tp_size > 1:
+            lse_max = local_lse.detach().clone()
+            dist.all_reduce(lse_max, op=dist.ReduceOp.MAX, group=tp_group)
+            lse_exp_sum = torch.exp(local_lse - lse_max)
+            dist.all_reduce(lse_exp_sum, op=dist.ReduceOp.SUM, group=tp_group)
+            global_lse = lse_max + lse_exp_sum.log()
+        else:
+            global_lse = local_lse
+
+        local_ids = (ids - vocab_start).clamp_(min=0, max=local_vocab_size - 1)
+        local_mask = (ids >= vocab_start) & (ids < vocab_end)
+        local_selected = logits_chunk.gather(dim=-1, index=local_ids)
+        selected = torch.where(local_mask, local_selected, torch.zeros_like(local_selected))
+        if tp_size > 1:
+            dist.all_reduce(selected, op=dist.ReduceOp.SUM, group=tp_group)
+            valid = local_mask.to(dtype=selected.dtype)
+            dist.all_reduce(valid, op=dist.ReduceOp.SUM, group=tp_group)
+            selected = selected.masked_fill(valid <= 0, torch.finfo(selected.dtype).min)
+
+        out.append(selected - global_lse)
     return out
 
 
