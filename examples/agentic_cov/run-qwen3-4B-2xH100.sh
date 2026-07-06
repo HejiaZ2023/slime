@@ -222,17 +222,55 @@ _verify_student_stage2_step999() {
     local shard2="${HF_CKPT}/model-00002-of-00002.safetensors"
     local expect1="fc5216698e9c048c70dcaecf53f0a93c0db82aba6b171fc77871edbe62a39590"
     local expect2="187142a76e287a0e398a4bf1047f01a1e4aef84317350594ddf6064d05920dc6"
+    local expect_tensor_manifest="0188da438c4f625e7f5771afc0adb4a968d7639eaf0aee3745684acfde6d78f4"
     local got1 got2
-    got1=$(sha256sum "${shard1}" | awk '{print $1}')
-    got2=$(sha256sum "${shard2}" | awk '{print $1}')
-    if [ "${got1}" != "${expect1}" ] || [ "${got2}" != "${expect2}" ]; then
+    if [ -f "${shard1}" ] && [ -f "${shard2}" ]; then
+        got1=$(sha256sum "${shard1}" | awk '{print $1}')
+        got2=$(sha256sum "${shard2}" | awk '{print $1}')
+        if [ "${got1}" = "${expect1}" ] && [ "${got2}" = "${expect2}" ]; then
+            echo "[setup] verified student checkpoint matches stage2_step999 shard sha256"
+            return 0
+        fi
+        echo "[setup] shard sha256 did not match Paladin backup; checking tensor manifest" >&2
+        echo "        ${shard1}: got ${got1}, expected ${expect1}" >&2
+        echo "        ${shard2}: got ${got2}, expected ${expect2}" >&2
+    else
+        echo "[setup] Paladin shard filenames not present; checking tensor manifest" >&2
+    fi
+
+    local tensor_count tensor_manifest
+    read -r tensor_count tensor_manifest < <(python3 - "${HF_CKPT}" <<'PY'
+import glob
+import hashlib
+import json
+import sys
+
+import torch
+from safetensors import safe_open
+
+root = sys.argv[1]
+items = []
+for path in sorted(glob.glob(f"{root}/model-*.safetensors")):
+    with safe_open(path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            tensor = f.get_tensor(key).contiguous()
+            raw = tensor.view(torch.uint8).numpy().tobytes()
+            items.append((key, list(tensor.shape), str(tensor.dtype), hashlib.sha256(raw).hexdigest()))
+items.sort(key=lambda x: x[0])
+digest = hashlib.sha256()
+for item in items:
+    digest.update(json.dumps(item, separators=(",", ":")).encode("utf-8") + b"\n")
+print(len(items), digest.hexdigest())
+PY
+)
+    if [ "${tensor_count}" != "398" ] || [ "${tensor_manifest}" != "${expect_tensor_manifest}" ]; then
         echo "ERROR: student checkpoint is not Paladin stage2_step999." >&2
-        echo "       ${shard1}: got ${got1}, expected ${expect1}" >&2
-        echo "       ${shard2}: got ${got2}, expected ${expect2}" >&2
+        echo "       tensor_count=${tensor_count}, expected 398" >&2
+        echo "       tensor_manifest=${tensor_manifest}, expected ${expect_tensor_manifest}" >&2
         echo "       Set VERIFY_STUDENT_STAGE2_STEP999=0 only for intentional non-formal smoke/debug runs." >&2
         exit 1
     fi
-    echo "[setup] verified student checkpoint matches stage2_step999 sha256"
+    echo "[setup] verified student checkpoint matches stage2_step999 tensor manifest sha256"
 }
 
 if [ "${VERIFY_STUDENT_STAGE2_STEP999}" = "1" ]; then
