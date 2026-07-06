@@ -32,6 +32,7 @@ set -ex
 #                                     [--use-uncovered-log] [--use-uncovered-reward --div-lam V]
 #                                     [--interval N] [--steps N]
 #                                     [--train-dataset NAME] [--eval-dataset NAME]
+#                                     [--no-final-save|--save-final-rollout]
 #   --offload                Enable --offload-rollout: SGLang offloads model weights to
 #                            CPU during training phase, freeing ~4 GB/GPU for Megatron.
 #                            Off by default.
@@ -71,6 +72,11 @@ set -ex
 #   --batch-size N           Number of task prompts per rollout step. Smoke uses 1;
 #                            full runs can use 4. Internal slime rollout_batch_size
 #                            is N * num_agentic_rounds.
+#   --no-final-save          Do not force a checkpoint on the final rollout if the
+#                            checkpoint interval has not fired. This is auto-enabled
+#                            for short smoke tests where --steps < --interval.
+#   --save-final-rollout     Force the legacy behavior: always save on the final
+#                            rollout even when --steps < --interval.
 #   --n-student N            Number of student rollouts per prompt. Smoke uses 2.
 OFFLOAD=0
 EDA_LOG_FEEDBACK_TRAIN=${EDA_LOG_FEEDBACK_TRAIN:-1}
@@ -80,6 +86,7 @@ USE_UNCOVERED_REWARD=0
 DIV_LAM=""
 SKIP_EVAL_BEFORE_TRAIN=0
 OPD_ARGS=()
+NO_FINAL_SAVE=${NO_FINAL_SAVE:-auto}
 while [ $# -gt 0 ]; do
     case "$1" in
         --offload)                OFFLOAD=1 ;;
@@ -110,6 +117,10 @@ while [ $# -gt 0 ]; do
                                   PROMPT_BATCH_SIZE="${1#*=}" ;;
         --n-student|--n-samples-per-prompt)
                                   N_STUDENT="${2:?$1 requires a value}"; shift ;;
+        --no-final-save|--no-save-final-rollout)
+                                  NO_FINAL_SAVE=1 ;;
+        --save-final-rollout|--final-save)
+                                  NO_FINAL_SAVE=0 ;;
         --n-student=*|--n-samples-per-prompt=*)
                                   N_STUDENT="${1#*=}" ;;
         --use-opd-relay|--opd-score-student-rollouts)
@@ -314,6 +325,21 @@ echo "[run] DATASET_STEP_OFFSET = ${LLM4COV_DATASET_STEP_OFFSET}"     | tee -a "
 echo "[run] VERIFY_STUDENT_STAGE2_STEP999 = ${VERIFY_STUDENT_STAGE2_STEP999}" | tee -a "${LOCAL_LOG}"
 echo "[run] ───────────────────────────────────────────────────────" | tee -a "${LOCAL_LOG}"
 
+NO_FINAL_SAVE_ARGS=()
+if [ "${NO_FINAL_SAVE}" = "auto" ]; then
+    if [ "${NUM_ROLLOUT}" -lt "${CKPT_INTERVAL}" ]; then
+        NO_FINAL_SAVE=1
+    else
+        NO_FINAL_SAVE=0
+    fi
+fi
+if [ "${NO_FINAL_SAVE}" = "1" ]; then
+    NO_FINAL_SAVE_ARGS=(--no-save-final-rollout)
+    echo "[run] no-save-final-rollout enabled: final rollout will not force a checkpoint" | tee -a "${LOCAL_LOG}"
+else
+    echo "[run] final rollout checkpoint behavior: save when interval fires or on final rollout" | tee -a "${LOCAL_LOG}"
+fi
+
 # -------------------- checkpoint paths --------------------
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT}"
@@ -324,6 +350,7 @@ CKPT_ARGS=(
    # HF-format dump alongside the torch_dist save. {rollout_id} is filled
    # in by slime via args.save_hf.format(rollout_id=...).
    --save-hf       "${RUN_DIR}/step_{rollout_id}"
+   "${NO_FINAL_SAVE_ARGS[@]}"
 )
 
 # -------------------- rollout / batching --------------------
@@ -585,7 +612,7 @@ echo "[run] NUM_ROLLOUT=${NUM_ROLLOUT}  ckpt_interval=${CKPT_INTERVAL}  eval_int
 echo "[run] prompt_batch_size=${PROMPT_BATCH_SIZE}  num_agentic_rounds=${NUM_AGENTIC_ROUNDS}  rollout_batch_size=${ROLLOUT_BATCH_SIZE}  n_student=${N_STUDENT}  global_batch_size=${GLOBAL_BATCH_SIZE}" | tee -a "${LOCAL_LOG}"
 echo "[run] num_agentic_rounds=${NUM_AGENTIC_ROUNDS}  eval_num_agentic_rounds=3" | tee -a "${LOCAL_LOG}"
 echo "[run] offload=${OFFLOAD}  eda_log_feedback_train=${EDA_LOG_FEEDBACK_TRAIN}  eda_log_feedback_eval=${EDA_LOG_FEEDBACK_EVAL}  use_uncovered_log=${USE_UNCOVERED_LOG}  use_uncovered_reward=${USE_UNCOVERED_REWARD}  div_lam=${DIV_LAM:-unset}" | tee -a "${LOCAL_LOG}"
-echo "[run] max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}" | tee -a "${LOCAL_LOG}"
+echo "[run] max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}  no_final_save=${NO_FINAL_SAVE}" | tee -a "${LOCAL_LOG}"
 echo "[run] train_dataset=${LLM4COV_DATASET}  eval_dataset=${LLM4COV_EVAL_DATASET}" | tee -a "${LOCAL_LOG}"
 echo "[run] ROTARY_BASE=${ROTARY_BASE}" | tee -a "${LOCAL_LOG}"
 echo "[run] ─────────────────────────────────────────────────────────" | tee -a "${LOCAL_LOG}"

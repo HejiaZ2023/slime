@@ -737,6 +737,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--no-save-final-rollout",
+                action="store_true",
+                default=False,
+                help=(
+                    "If set, do not force a checkpoint on the final rollout when save_interval "
+                    "has not otherwise fired. Periodic checkpoint saves are unchanged."
+                ),
+            )
+            parser.add_argument(
                 "--save-hf",
                 type=str,
                 default=None,
