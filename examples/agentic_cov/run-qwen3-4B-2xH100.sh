@@ -393,6 +393,7 @@ fi
 # to ~20k tokens per CP rank; --max-tokens-per-gpu 24576 leaves headroom for
 # packing a few short sequences alongside one long one. Same setting as
 # H200 — H200 is not full at 24k, so 80 GB H100 should still fit.
+MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-24576}
 PERF_ARGS=(
    --tensor-model-parallel-size  2
    --sequence-parallel
@@ -406,7 +407,7 @@ PERF_ARGS=(
    --recompute-num-layers  1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu    24576
+   --max-tokens-per-gpu    "${MAX_TOKENS_PER_GPU}"
 )
 
 # -------------------- DAPO ----------------------
@@ -584,6 +585,7 @@ echo "[run] NUM_ROLLOUT=${NUM_ROLLOUT}  ckpt_interval=${CKPT_INTERVAL}  eval_int
 echo "[run] prompt_batch_size=${PROMPT_BATCH_SIZE}  num_agentic_rounds=${NUM_AGENTIC_ROUNDS}  rollout_batch_size=${ROLLOUT_BATCH_SIZE}  n_student=${N_STUDENT}  global_batch_size=${GLOBAL_BATCH_SIZE}" | tee -a "${LOCAL_LOG}"
 echo "[run] num_agentic_rounds=${NUM_AGENTIC_ROUNDS}  eval_num_agentic_rounds=3" | tee -a "${LOCAL_LOG}"
 echo "[run] offload=${OFFLOAD}  eda_log_feedback_train=${EDA_LOG_FEEDBACK_TRAIN}  eda_log_feedback_eval=${EDA_LOG_FEEDBACK_EVAL}  use_uncovered_log=${USE_UNCOVERED_LOG}  use_uncovered_reward=${USE_UNCOVERED_REWARD}  div_lam=${DIV_LAM:-unset}" | tee -a "${LOCAL_LOG}"
+echo "[run] max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}" | tee -a "${LOCAL_LOG}"
 echo "[run] train_dataset=${LLM4COV_DATASET}  eval_dataset=${LLM4COV_EVAL_DATASET}" | tee -a "${LOCAL_LOG}"
 echo "[run] ROTARY_BASE=${ROTARY_BASE}" | tee -a "${LOCAL_LOG}"
 echo "[run] ─────────────────────────────────────────────────────────" | tee -a "${LOCAL_LOG}"
