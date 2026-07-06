@@ -1169,6 +1169,17 @@ def policy_loss_function(
     if opd_topk_teacher_coverage is not None:
         reported_loss["opd_topk_teacher_coverage"] = opd_topk_teacher_coverage.clone().detach()
 
+    if (
+        batch.get("opd_topk_token_ids") is not None
+        and batch.get("opd_topk_teacher_log_probs") is not None
+    ):
+        # Keep the microbatch logging schema stable when top-k OPD fields are present
+        # but no sample in this microbatch used the OPD loss.
+        zero_opd_topk_metric = log_probs.new_zeros(())
+        reported_loss.setdefault("opd_topk_kl", zero_opd_topk_metric)
+        reported_loss.setdefault("opd_topk_mass", zero_opd_topk_metric)
+        reported_loss.setdefault("opd_topk_teacher_coverage", zero_opd_topk_metric)
+
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
