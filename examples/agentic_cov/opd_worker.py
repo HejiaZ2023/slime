@@ -48,7 +48,8 @@ TEACHER_TIMEOUT = float(os.environ.get("OPD_TEACHER_TIMEOUT", "900"))
 TEACHER_CONTEXT_LENGTH = int(os.environ.get("OPD_TEACHER_CONTEXT_LENGTH", "32768"))
 TEACHER_TOKEN_BUDGET_MARGIN = int(os.environ.get("OPD_TEACHER_TOKEN_BUDGET_MARGIN", "256"))
 TEACHER_MIN_NEW_TOKENS = int(os.environ.get("OPD_TEACHER_MIN_NEW_TOKENS", "16"))
-TEACHER_SCORE_CHUNK_TOKENS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_TOKENS", "512"))
+TEACHER_SCORE_CHUNK_TOKENS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_TOKENS", "1024"))
+TEACHER_SCORE_CONTEXT_MARGIN = int(os.environ.get("OPD_TEACHER_SCORE_CONTEXT_MARGIN", "16"))
 TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sheng/final_ckpts")
 EDA_SERVER = os.environ.get("OPD_EDA_SERVER", "local")
 EDA_REPO_DIR = os.environ.get("OPD_EDA_REPO_DIR", "/workspace/llm4cov_eda")
@@ -678,16 +679,22 @@ def score_teacher_on_student(
     chunk_size = response_len
     if requested_topk and TEACHER_SCORE_CHUNK_TOKENS > 0:
         chunk_size = min(response_len, max(1, TEACHER_SCORE_CHUNK_TOKENS))
+    score_context_len = max(0, TEACHER_CONTEXT_LENGTH - max(0, TEACHER_SCORE_CONTEXT_MARGIN))
 
     try:
         for offset in range(0, response_len, chunk_size):
             chunk_len = min(chunk_size, response_len - offset)
             chunk_start = prompt_len + offset
-            logprob_start_len = max(0, chunk_start - 1)
+            chunk_end = chunk_start + chunk_len
+            window_start = 0
+            if score_context_len > 0:
+                window_start = max(0, chunk_end - score_context_len)
+            chunk_start_in_window = chunk_start - window_start
+            logprob_start_len = max(0, chunk_start_in_window - 1)
             chunk_requested_topk = (
                 requested_topk[offset : offset + chunk_len] if requested_topk is not None else None
             )
-            chunk_input_ids = input_ids_int[: chunk_start + chunk_len]
+            chunk_input_ids = input_ids_int[window_start:chunk_end]
             payload = {
                 "input_ids": chunk_input_ids,
                 "sampling_params": {
@@ -696,9 +703,11 @@ def score_teacher_on_student(
                     "skip_special_tokens": False,
                 },
                 "return_logprob": True,
-                # Only response-token logprobs are consumed by OPD.  SGLang
+                # Only response-token logprobs are consumed by OPD.  Keep a
+                # teacher-context-sized sliding window for long responses; SGLang
                 # returns a leading None row at logprob_start_len, so start one
-                # token before this chunk and keep the final chunk_len rows.
+                # token before this chunk within the local window and keep the
+                # final chunk_len rows.
                 "logprob_start_len": logprob_start_len,
             }
             token_ids_logprob: list[int] = []
@@ -728,7 +737,12 @@ def score_teacher_on_student(
                     "chunk_response_token_count": chunk_len,
                     "request_seconds": time.monotonic() - started,
                     "input_token_count": len(chunk_input_ids),
+                    "window_start": window_start,
+                    "window_end": chunk_end,
+                    "chunk_start_in_window": chunk_start_in_window,
+                    "truncated_prefix_token_count": window_start,
                     "prompt_token_count": prompt_len,
+                    "teacher_context_length": score_context_len,
                     "logprob_start_len": logprob_start_len,
                     "input_logprob_rows": len(meta.get("input_token_logprobs") or []),
                     "input_token_ids_logprob_rows": len(meta.get("input_token_ids_logprobs") or []),
@@ -746,10 +760,15 @@ def score_teacher_on_student(
             "num_teacher_log_probs": 0,
             "teacher_score_timing": {
                 "request_seconds": time.monotonic() - total_started,
-                "input_token_count": len(input_ids),
+                "full_input_token_count": len(input_ids),
                 "prompt_token_count": prompt_len,
                 "response_token_count": response_len,
                 "chunk_size": chunk_size,
+                "teacher_context_length": score_context_len,
+                "max_request_input_token_count": max(
+                    (int(t.get("input_token_count") or 0) for t in timings),
+                    default=0,
+                ),
                 "chunks": timings,
             },
         }
@@ -781,10 +800,15 @@ def score_teacher_on_student(
         "num_teacher_log_probs": len(teacher_log_probs),
         "teacher_score_timing": {
             "request_seconds": time.monotonic() - total_started,
-            "input_token_count": len(input_ids),
+            "full_input_token_count": len(input_ids),
             "prompt_token_count": prompt_len,
             "response_token_count": response_len,
             "chunk_size": chunk_size,
+            "teacher_context_length": score_context_len,
+            "max_request_input_token_count": max(
+                (int(t.get("input_token_count") or 0) for t in timings),
+                default=0,
+            ),
             "chunks": timings,
         },
     }

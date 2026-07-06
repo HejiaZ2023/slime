@@ -188,9 +188,16 @@ HF_SYNC_REPO_PREFIX=${HF_SYNC_REPO_PREFIX:-"Senlimulin/2026UCSDIntern_"}
 # paladin (rsync) fallback config:
 REMOTE_SYNC_BASE=${REMOTE_SYNC_BASE:-"slu375@paladin.ucsd.edu:/mnt/raid0_ssd/sheng/brev_result/rl"}
 REMOTE_SYNC_SSH_KEY=${REMOTE_SYNC_SSH_KEY:-""}
+_HF_SYNC_TOKEN_XTRACE=0
+case "$-" in
+    *x*) _HF_SYNC_TOKEN_XTRACE=1; set +x ;;
+esac
 if [ "${REMOTE_SYNC_TARGET}" = "hf" ] && [ -z "${HF_SYNC_TOKEN:-}" ]; then
     echo "ERROR: REMOTE_SYNC_TARGET=hf requires a write token in HF_SYNC_TOKEN (pass -e HF_SYNC_TOKEN=...)" >&2
     exit 1
+fi
+if [ "${_HF_SYNC_TOKEN_XTRACE}" = "1" ]; then
+    set -x
 fi
 
 # Default model is SFT'd from Qwen3-4B-Instruct-2507 (rotary base 5,000,000).
