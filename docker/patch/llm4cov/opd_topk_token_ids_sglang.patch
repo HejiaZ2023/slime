@@ -1,0 +1,512 @@
+diff -ruN orig/python/sglang/srt/layers/logits_processor.py mod/python/sglang/srt/layers/logits_processor.py
+--- orig/python/sglang/srt/layers/logits_processor.py	2026-07-06 03:48:37.100160380 -0400
++++ mod/python/sglang/srt/layers/logits_processor.py	2026-07-06 03:56:32.205929329 -0400
+@@ -43,6 +43,8 @@
+ from sglang.srt.layers.utils.logprob import (
+     InputLogprobsResult,
+     compute_temp_top_p_normalized_logprobs,
++    get_requested_token_ids_logprobs_chunk,
++    get_requested_token_ids_logprobs_prefill,
+     get_token_ids_logprobs_chunk,
+     get_token_ids_logprobs_prefill,
+     get_top_logprobs_chunk,
+@@ -123,6 +125,7 @@
+     top_logprobs_nums: Optional[List[int]] = None
+     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+     token_ids_logprobs: Optional[List[List[int]]] = None
++    topk_token_ids_logprobs: Optional[List[Optional[List[List[int]]]]] = None
+ 
+     # logits and logprobs post processing
+     temp_scaled_logprobs: bool = False
+@@ -162,6 +165,8 @@
+             )
+             extend_token_ids_logprob = any(
+                 x is not None for x in forward_batch.token_ids_logprobs
++            ) or any(
++                x is not None for x in (forward_batch.topk_token_ids_logprobs or [])
+             )
+             extend_return_logprob = False
+             extend_logprob_pruned_lens_cpu = []
+@@ -190,6 +195,7 @@
+             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
+             top_logprobs_nums=forward_batch.top_logprobs_nums,
+             token_ids_logprobs=forward_batch.token_ids_logprobs,
++            topk_token_ids_logprobs=forward_batch.topk_token_ids_logprobs,
+             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
+             padded_static_len=forward_batch.padded_static_len,
+             is_prefill_only=forward_batch.is_prefill_only,
+@@ -624,7 +630,9 @@
+             (
+                 input_token_ids_logprobs_val,
+                 input_token_ids_logprobs_idx,
+-            ) = get_token_ids_logprobs_prefill(input_logprobs, logits_metadata)
++            ) = get_requested_token_ids_logprobs_prefill(
++                input_logprobs, logits_metadata
++            )
+         else:
+             input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
+ 
+@@ -771,12 +779,18 @@
+             # Get the logprob of given token id
+             if logits_metadata.extend_token_ids_logprob:
+                 token_ids_logprobs = logits_metadata.token_ids_logprobs[chunk_slice]
++                all_topk_token_ids_logprobs = (
++                    logits_metadata.topk_token_ids_logprobs
++                    or [None] * len(logits_metadata.token_ids_logprobs)
++                )
++                topk_token_ids_logprobs = all_topk_token_ids_logprobs[chunk_slice]
+                 pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
+                     chunk_slice
+                 ]
+-                split_len_token_ids = get_token_ids_logprobs_chunk(
++                split_len_token_ids = get_requested_token_ids_logprobs_chunk(
+                     chunk_input_logprobs,
+                     token_ids_logprobs,
++                    topk_token_ids_logprobs,
+                     pruned_lens,
+                     input_token_ids_logprobs_val,
+                     input_token_ids_logprobs_idx,
+diff -ruN orig/python/sglang/srt/layers/utils/logprob.py mod/python/sglang/srt/layers/utils/logprob.py
+--- orig/python/sglang/srt/layers/utils/logprob.py	2026-07-06 03:48:36.872187558 -0400
++++ mod/python/sglang/srt/layers/utils/logprob.py	2026-07-06 04:02:33.483199420 -0400
+@@ -164,6 +164,56 @@
+     )
+ 
+ 
++def get_requested_token_ids_logprobs_prefill(
++    all_logprobs, logits_metadata: LogitsMetadata, delay_cpu_copy=False
++):
++    """Get request-level or per-position requested token id logprobs."""
++    topk_token_ids_logprobs = getattr(logits_metadata, "topk_token_ids_logprobs", None)
++    if not topk_token_ids_logprobs or not any(
++        token_rows is not None for token_rows in topk_token_ids_logprobs
++    ):
++        return get_token_ids_logprobs_prefill(
++            all_logprobs, logits_metadata, delay_cpu_copy=delay_cpu_copy
++        )
++
++    vals, idxs = [], []
++    pt = 0
++    token_ids_logprobs = logits_metadata.token_ids_logprobs or [
++        None
++    ] * len(logits_metadata.extend_logprob_pruned_lens_cpu)
++    for token_ids, token_rows, pruned_len in zip(
++        token_ids_logprobs,
++        topk_token_ids_logprobs,
++        logits_metadata.extend_logprob_pruned_lens_cpu,
++    ):
++        if pruned_len <= 0:
++            vals.append([])
++            idxs.append([])
++            continue
++
++        if token_rows is None:
++            if token_ids is None:
++                vals.append([])
++                idxs.append([])
++            else:
++                pos_logprobs = all_logprobs[pt : pt + pruned_len, token_ids]
++                vals.append(pos_logprobs if delay_cpu_copy else pos_logprobs.tolist())
++                idxs.append([token_ids for _ in range(pruned_len)])
++            pt += pruned_len
++            continue
++
++        req_vals, req_idxs = [], []
++        for j in range(pruned_len):
++            row_token_ids = token_rows[j] if j < len(token_rows) else []
++            pos_logprobs = all_logprobs[pt + j, row_token_ids]
++            req_vals.append(pos_logprobs if delay_cpu_copy else pos_logprobs.tolist())
++            req_idxs.append(row_token_ids)
++        vals.append(req_vals)
++        idxs.append(req_idxs)
++        pt += pruned_len
++    return vals, idxs
++
++
+ def get_top_logprobs_chunk(
+     logprobs: torch.Tensor,
+     logits_metadata: LogitsMetadata,
+@@ -311,6 +361,73 @@
+     return next_split_pruned_len
+ 
+ 
++def get_requested_token_ids_logprobs_chunk(
++    logprobs: torch.Tensor,
++    token_ids_logprobs: List[int],
++    topk_token_ids_logprobs: Optional[List[Optional[List[List[int]]]]],
++    pruned_lens: List[int],
++    input_token_ids_logprobs_val: List,
++    input_token_ids_logprobs_idx: List,
++    split_pruned_len: int = 0,
++):
++    """Get request-level or per-position requested token id logprobs for a chunk."""
++    if not topk_token_ids_logprobs or not any(
++        token_rows is not None for token_rows in topk_token_ids_logprobs
++    ):
++        return get_token_ids_logprobs_chunk(
++            logprobs,
++            token_ids_logprobs,
++            pruned_lens,
++            input_token_ids_logprobs_val,
++            input_token_ids_logprobs_idx,
++            split_pruned_len,
++        )
++
++    if logprobs.shape[0] == 0:
++        return 0
++
++    token_ids_logprobs = token_ids_logprobs or [None] * len(pruned_lens)
++    pt = 0
++    next_split_pruned_len = 0
++    for n, (token_ids, token_rows, pruned_len) in enumerate(
++        zip(token_ids_logprobs, topk_token_ids_logprobs, pruned_lens)
++    ):
++        row_offset = split_pruned_len if n == 0 else 0
++        remaining_len = pruned_len - row_offset
++        if n != 0:
++            split_pruned_len = 0
++
++        if remaining_len <= 0:
++            input_token_ids_logprobs_val.append([])
++            input_token_ids_logprobs_idx.append([])
++            continue
++
++        val = []
++        idx = []
++        for j in range(remaining_len):
++            if pt + j >= logprobs.shape[0]:
++                next_split_pruned_len = row_offset + j
++                break
++            row_idx = row_offset + j
++            if token_rows is None:
++                row_token_ids = token_ids or []
++            else:
++                row_token_ids = token_rows[row_idx] if row_idx < len(token_rows) else []
++            val.append(logprobs[pt + j, row_token_ids].tolist())
++            idx.append(row_token_ids)
++
++        if len(val) > 0:
++            if row_offset > 0:
++                input_token_ids_logprobs_val[-1].extend(val)
++                input_token_ids_logprobs_idx[-1].extend(idx)
++            else:
++                input_token_ids_logprobs_val.append(val)
++                input_token_ids_logprobs_idx.append(idx)
++
++        pt += remaining_len
++    return next_split_pruned_len
++
++
+ def add_output_logprobs_for_spec_v1(
+     batch: ScheduleBatch,
+     res: Union[EagleVerifyOutput, NgramVerifyInput],
+diff -ruN orig/python/sglang/srt/managers/io_struct.py mod/python/sglang/srt/managers/io_struct.py
+--- orig/python/sglang/srt/managers/io_struct.py	2026-07-06 03:48:38.375262662 -0400
++++ mod/python/sglang/srt/managers/io_struct.py	2026-07-06 03:53:15.533222842 -0400
+@@ -234,6 +234,9 @@
+     top_logprobs_num: Optional[Union[List[int], int]] = None
+     # If return logprobs, the token ids to return logprob for.
+     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
++    # If return logprobs, per-position token ids to return logprob for.
++    # Shape for a single request: [num_returned_input_positions, k].
++    topk_token_ids: Optional[Union[List[List[List[int]]], List[List[int]]]] = None
+     # Whether to detokenize tokens in text in the returned logprobs.
+     return_text_in_logprobs: bool = False
+     # Whether to stream output.
+@@ -425,6 +428,8 @@
+             self.top_logprobs_num = 0
+         if not self.token_ids_logprob:  # covers both None and []
+             self.token_ids_logprob = None
++        if not self.topk_token_ids:  # covers both None and []
++            self.topk_token_ids = None
+ 
+     def _normalize_batch_inputs(self):
+         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
+@@ -603,6 +608,21 @@
+                 "Cannot use list token_ids_logprob with parallel_sample_num > 1"
+             )
+ 
++        # topk_token_ids is a per-position matrix for each request. For a
++        # single prompt it can be passed directly as [num_positions, k].
++        if not self.topk_token_ids:
++            self.topk_token_ids = [None] * num
++        elif self.parallel_sample_num > 1:
++            raise ValueError(
++                "Cannot use list topk_token_ids with parallel_sample_num > 1"
++            )
++        elif self.is_single:
++            self.topk_token_ids = [copy.deepcopy(self.topk_token_ids)]
++        elif len(self.topk_token_ids) != num:
++            raise ValueError(
++                "topk_token_ids must have one per-position matrix per request"
++            )
++
+     def _normalize_custom_logit_processor(self, num):
+         """Normalize custom logit processor for batch processing."""
+         if self.custom_logit_processor is None:
+@@ -672,6 +692,7 @@
+             logprob_start_len=self.logprob_start_len[i],
+             top_logprobs_num=self.top_logprobs_num[i],
+             token_ids_logprob=self.token_ids_logprob[i],
++            topk_token_ids=self.topk_token_ids[i],
+             return_text_in_logprobs=self.return_text_in_logprobs,
+             stream=self.stream,
+             log_metrics=self.log_metrics,
+@@ -745,6 +766,8 @@
+     top_logprobs_num: int
+     # If return logprobs, the token id to return logprob for
+     token_ids_logprob: List[int]
++    # If return logprobs, per-position token ids to return logprob for
++    topk_token_ids: Optional[List[List[int]]]
+     # Whether to stream output
+     stream: bool
+ 
+diff -ruN orig/python/sglang/srt/managers/schedule_batch.py mod/python/sglang/srt/managers/schedule_batch.py
+--- orig/python/sglang/srt/managers/schedule_batch.py	2026-07-06 03:48:38.008187763 -0400
++++ mod/python/sglang/srt/managers/schedule_batch.py	2026-07-06 03:55:12.483133937 -0400
+@@ -522,6 +522,7 @@
+         top_logprobs_num: int = 0,
+         dllm_config: Optional[DllmConfig] = None,
+         token_ids_logprob: List[int] = None,
++        topk_token_ids: Optional[List[List[int]]] = None,
+         stream: bool = False,
+         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
+         lora_id: Optional[str] = None,
+@@ -692,6 +693,7 @@
+         self.logprob_start_len = 0
+         self.top_logprobs_num = top_logprobs_num
+         self.token_ids_logprob = token_ids_logprob
++        self.topk_token_ids = topk_token_ids
+         self.temp_scaled_logprobs = False
+         self.top_p_normalized_logprobs = False
+ 
+@@ -1261,6 +1263,7 @@
+     return_logprob: bool = False
+     top_logprobs_nums: Optional[List[int]] = None
+     token_ids_logprobs: Optional[List[List[int]]] = None
++    topk_token_ids_logprobs: Optional[List[Optional[List[List[int]]]]] = None
+ 
+     # For logits and logprob post processing
+     temp_scaled_logprobs: bool = False
+@@ -1652,6 +1655,7 @@
+         if self.return_logprob:
+             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+             self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
++            self.topk_token_ids_logprobs = [r.topk_token_ids for r in reqs]
+ 
+         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+@@ -2098,9 +2102,13 @@
+         if self.return_logprob:
+             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
+             self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
++            self.topk_token_ids_logprobs = [
++                self.topk_token_ids_logprobs[i] for i in keep_indices
++            ]
+         else:
+             self.top_logprobs_nums = None
+             self.token_ids_logprobs = None
++            self.topk_token_ids_logprobs = None
+ 
+         self.has_stream = any(req.stream for req in self.reqs)
+         self.has_grammar = any(req.grammar for req in self.reqs)
+@@ -2147,12 +2155,17 @@
+         if self.return_logprob and other.return_logprob:
+             self.top_logprobs_nums.extend(other.top_logprobs_nums)
+             self.token_ids_logprobs.extend(other.token_ids_logprobs)
++            self.topk_token_ids_logprobs.extend(other.topk_token_ids_logprobs)
+         elif self.return_logprob:
+             self.top_logprobs_nums.extend([0] * len(other.reqs))
+             self.token_ids_logprobs.extend([None] * len(other.reqs))
++            self.topk_token_ids_logprobs.extend([None] * len(other.reqs))
+         elif other.return_logprob:
+             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
+             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
++            self.topk_token_ids_logprobs = (
++                [None] * len(self.reqs) + other.topk_token_ids_logprobs
++            )
+         self.reqs.extend(other.reqs)
+         if self.multimodal_inputs is not None:
+             self.multimodal_inputs.extend(other.multimodal_inputs)
+@@ -2197,6 +2210,7 @@
+             return_logprob=self.return_logprob,
+             top_logprobs_nums=self.top_logprobs_nums,
+             token_ids_logprobs=self.token_ids_logprobs,
++            topk_token_ids_logprobs=self.topk_token_ids_logprobs,
+             global_num_tokens=self.global_num_tokens,
+             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+             is_extend_in_batch=self.is_extend_in_batch,
+@@ -2356,6 +2370,7 @@
+     return_logprob: bool
+     top_logprobs_nums: Optional[List[int]]
+     token_ids_logprobs: Optional[List[List[int]]]
++    topk_token_ids_logprobs: Optional[List[Optional[List[List[int]]]]]
+ 
+     # For DP attention
+     global_num_tokens: Optional[List[int]]
+diff -ruN orig/python/sglang/srt/managers/scheduler.py mod/python/sglang/srt/managers/scheduler.py
+--- orig/python/sglang/srt/managers/scheduler.py	2026-07-06 03:50:35.527765704 -0400
++++ mod/python/sglang/srt/managers/scheduler.py	2026-07-06 03:54:39.123701027 -0400
+@@ -1513,6 +1513,7 @@
+                 return_logprob=recv_req.return_logprob,
+                 top_logprobs_num=recv_req.top_logprobs_num,
+                 token_ids_logprob=recv_req.token_ids_logprob,
++                topk_token_ids=recv_req.topk_token_ids,
+                 stream=recv_req.stream,
+                 lora_id=recv_req.lora_id,
+                 input_embeds=recv_req.input_embeds,
+@@ -1624,7 +1625,11 @@
+             recv_req.logprob_start_len = -1
+ 
+         if recv_req.logprob_start_len == -1:
+-            if recv_req.return_logprob and recv_req.token_ids_logprob is None:
++            if (
++                recv_req.return_logprob
++                and recv_req.token_ids_logprob is None
++                and recv_req.topk_token_ids is None
++            ):
+                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
+                 # set, return the logprobs for output tokens by default
+                 req.logprob_start_len = len(req.origin_input_ids) - 1
+diff -ruN orig/python/sglang/srt/managers/scheduler_output_processor_mixin.py mod/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+--- orig/python/sglang/srt/managers/scheduler_output_processor_mixin.py	2026-07-06 03:48:37.826582287 -0400
++++ mod/python/sglang/srt/managers/scheduler_output_processor_mixin.py	2026-07-06 03:56:51.746222104 -0400
+@@ -626,7 +626,7 @@
+ 
+     def _process_input_token_ids_logprobs(self, req: Req) -> None:
+         """Process input token IDs logprobs."""
+-        if req.token_ids_logprob is None:
++        if req.token_ids_logprob is None and req.topk_token_ids is None:
+             return
+ 
+         is_multi_item_scoring = self._is_multi_item_scoring(req)
+@@ -761,7 +761,7 @@
+             req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
+             req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
+ 
+-        if req.token_ids_logprob is not None:
++        if req.token_ids_logprob is not None or req.topk_token_ids is not None:
+             req.temp_input_token_ids_logprobs_val.append(
+                 output.input_token_ids_logprobs_val[i]
+             )
+@@ -790,7 +790,7 @@
+                 if req.top_logprobs_num > 0:
+                     assert len(req.input_top_logprobs_val) == relevant_tokens_len
+                     assert len(req.input_top_logprobs_idx) == relevant_tokens_len
+-                if req.token_ids_logprob is not None:
++                if req.token_ids_logprob is not None or req.topk_token_ids is not None:
+                     assert len(req.input_token_ids_logprobs_val) == relevant_tokens_len
+                     assert len(req.input_token_ids_logprobs_idx) == relevant_tokens_len
+ 
+diff -ruN orig/python/sglang/srt/managers/session_controller.py mod/python/sglang/srt/managers/session_controller.py
+--- orig/python/sglang/srt/managers/session_controller.py	2026-07-06 03:50:36.667500710 -0400
++++ mod/python/sglang/srt/managers/session_controller.py	2026-07-06 03:54:44.282667785 -0400
+@@ -149,6 +149,7 @@
+             return_logprob=req.return_logprob,
+             top_logprobs_num=req.top_logprobs_num,
+             token_ids_logprob=req.token_ids_logprob,
++            topk_token_ids=req.topk_token_ids,
+             vocab_size=vocab_size,
+         )
+         if last_req is not None:
+diff -ruN orig/python/sglang/srt/managers/tokenizer_manager.py mod/python/sglang/srt/managers/tokenizer_manager.py
+--- orig/python/sglang/srt/managers/tokenizer_manager.py	2026-07-06 03:48:38.189793242 -0400
++++ mod/python/sglang/srt/managers/tokenizer_manager.py	2026-07-06 03:54:30.573147151 -0400
+@@ -931,6 +931,7 @@
+                 obj.logprob_start_len,
+                 obj.top_logprobs_num,
+                 obj.token_ids_logprob,
++                obj.topk_token_ids,
+                 obj.stream,
+                 rid=obj.rid,
+                 http_worker_ipc=obj.http_worker_ipc,
+@@ -1555,6 +1556,7 @@
+                     state,
+                     state.obj.top_logprobs_num,
+                     state.obj.token_ids_logprob,
++                    state.obj.topk_token_ids,
+                     state.obj.return_text_in_logprobs
+                     and not self.server_args.skip_tokenizer_init,
+                     recv_obj,
+@@ -1676,6 +1678,7 @@
+         state: ReqState,
+         top_logprobs_num: int,
+         token_ids_logprob: List[int],
++        topk_token_ids: List[List[int]],
+         return_text_in_logprobs: bool,
+     ):
+         # 1. Handle regular logprobs
+@@ -1756,12 +1759,29 @@
+             meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
+             meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
+ 
++        # 4. Handle per-position requested token ids. Keep these as raw
++        # matrices so clients can consume [num_positions, k] values directly.
++        if topk_token_ids is not None:
++            requested_len = len(topk_token_ids)
++            input_vals = [
++                row for row in state.input_token_ids_logprobs_val if isinstance(row, list)
++            ]
++            input_idxs = [
++                row for row in state.input_token_ids_logprobs_idx if isinstance(row, list)
++            ]
++            if requested_len > 0:
++                input_vals = input_vals[-requested_len:]
++                input_idxs = input_idxs[-requested_len:]
++            meta_info["input_requested_token_logprobs"] = input_vals
++            meta_info["input_requested_token_ids"] = input_idxs
++
+     def convert_logprob_style(
+         self,
+         meta_info: dict,
+         state: ReqState,
+         top_logprobs_num: int,
+         token_ids_logprob: List[int],
++        topk_token_ids: List[List[int]],
+         return_text_in_logprobs: bool,
+         recv_obj: BatchStrOutput,
+         recv_obj_index: int,
+@@ -1801,7 +1821,7 @@
+                 recv_obj.output_top_logprobs_idx[recv_obj_index]
+             )
+ 
+-        if token_ids_logprob is not None:
++        if token_ids_logprob is not None or topk_token_ids is not None:
+             if len(recv_obj.input_token_ids_logprobs_val) > 0:
+                 state.input_token_ids_logprobs_val.extend(
+                     recv_obj.input_token_ids_logprobs_val[recv_obj_index]
+@@ -1821,6 +1841,7 @@
+             state,
+             state.obj.top_logprobs_num,
+             state.obj.token_ids_logprob,
++            state.obj.topk_token_ids,
+             return_text_in_logprobs,
+         )
+ 
+@@ -2215,6 +2236,7 @@
+                 state,
+                 state.obj.top_logprobs_num,
+                 state.obj.token_ids_logprob,
++                state.obj.topk_token_ids,
+                 state.obj.return_text_in_logprobs
+                 and not self.server_args.skip_tokenizer_init,
+             )
+diff -ruN orig/python/sglang/srt/model_executor/forward_batch_info.py mod/python/sglang/srt/model_executor/forward_batch_info.py
+--- orig/python/sglang/srt/model_executor/forward_batch_info.py	2026-07-06 03:48:37.463371338 -0400
++++ mod/python/sglang/srt/model_executor/forward_batch_info.py	2026-07-06 03:55:33.796706875 -0400
+@@ -267,6 +267,7 @@
+     return_logprob: bool = False
+     top_logprobs_nums: Optional[List[int]] = None
+     token_ids_logprobs: Optional[List[List[int]]] = None
++    topk_token_ids_logprobs: Optional[List[Optional[List[List[int]]]]] = None
+ 
+     # For logits and logprobs post processing
+     next_token_logits_buffer: torch.Tensor = None
+@@ -400,6 +401,7 @@
+             return_logprob=batch.return_logprob,
+             top_logprobs_nums=batch.top_logprobs_nums,
+             token_ids_logprobs=batch.token_ids_logprobs,
++            topk_token_ids_logprobs=batch.topk_token_ids_logprobs,
+             is_extend_in_batch=batch.is_extend_in_batch,
+             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
+             global_forward_mode=batch.global_forward_mode,

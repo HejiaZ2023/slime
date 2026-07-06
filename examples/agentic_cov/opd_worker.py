@@ -50,6 +50,7 @@ TEACHER_TOKEN_BUDGET_MARGIN = int(os.environ.get("OPD_TEACHER_TOKEN_BUDGET_MARGI
 TEACHER_MIN_NEW_TOKENS = int(os.environ.get("OPD_TEACHER_MIN_NEW_TOKENS", "16"))
 TEACHER_SCORE_CHUNK_TOKENS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_TOKENS", "1024"))
 TEACHER_SCORE_CONTEXT_MARGIN = int(os.environ.get("OPD_TEACHER_SCORE_CONTEXT_MARGIN", "16"))
+TEACHER_SCORE_POSITION_TOPK = os.environ.get("OPD_TEACHER_SCORE_POSITION_TOPK", "1") != "0"
 TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sheng/final_ckpts")
 EDA_SERVER = os.environ.get("OPD_EDA_SERVER", "local")
 EDA_REPO_DIR = os.environ.get("OPD_EDA_REPO_DIR", "/workspace/llm4cov_eda")
@@ -712,14 +713,13 @@ def score_teacher_on_student(
             }
             token_ids_logprob: list[int] = []
             if chunk_requested_topk:
-                token_ids_logprob = sorted({int(token_id) for row in chunk_requested_topk for token_id in row})
                 payload["topk_token_ids"] = chunk_requested_topk
                 payload["return_topk_logprobs"] = True
-                # SGLang currently accepts a request-level token_ids_logprob
-                # list, not a per-position list.  Chunking keeps this union
-                # small while preserving exact logprobs for the student top-k
-                # support at each response position.
-                payload["token_ids_logprob"] = token_ids_logprob
+                if not TEACHER_SCORE_POSITION_TOPK:
+                    token_ids_logprob = sorted({int(token_id) for row in chunk_requested_topk for token_id in row})
+                    # Fallback for old SGLang builds that only accept a
+                    # request-level token_ids_logprob union.
+                    payload["token_ids_logprob"] = token_ids_logprob
             started = time.monotonic()
             output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
             meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
@@ -746,6 +746,8 @@ def score_teacher_on_student(
                     "logprob_start_len": logprob_start_len,
                     "input_logprob_rows": len(meta.get("input_token_logprobs") or []),
                     "input_token_ids_logprob_rows": len(meta.get("input_token_ids_logprobs") or []),
+                    "input_requested_token_logprob_rows": len(meta.get("input_requested_token_logprobs") or []),
+                    "position_topk_enabled": bool(TEACHER_SCORE_POSITION_TOPK),
                     "token_ids_logprob_count": len(token_ids_logprob),
                 }
             )

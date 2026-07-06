@@ -37,6 +37,12 @@ ARG SLIME_COMMIT=main
 RUN rm -rf /root/slime
 COPY . /root/slime
 
+# Patch the base-image SGLang to support OPD teacher forced scoring with
+# per-position requested token ids. This keeps teacher scoring responses at
+# [response_chunk_len, topk] instead of [response_chunk_len, union(topk)].
+RUN cd /sgl-workspace/sglang && \
+    git apply -p1 /root/slime/docker/patch/llm4cov/opd_topk_token_ids_sglang.patch
+
 # Integrity check: fail the build early if the vendored llm4cov_oss is the gutted
 # version (missing the sftp transport / local-parquet loader) instead of the
 # complete one — exactly the files the old submodule path used to drop.
