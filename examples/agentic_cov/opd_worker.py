@@ -246,10 +246,16 @@ def _with_eda_summary(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_eda(context: SimpleNamespace, filename: str | None, body: str | None, want_detail: bool) -> dict[str, Any]:
+    started = time.monotonic()
     filename = safe_filename(filename)
     if not body:
         eda_log = {"status": "parse_failed", "filename": None, "has_coverage": False}
-        return _with_eda_summary({"reward": 0.0, "eda_feedback": "- status: failed (could not extract a valid testbench)", "eda_log": eda_log})
+        return _with_eda_summary({
+            "reward": 0.0,
+            "eda_feedback": "- status: failed (could not extract a valid testbench)",
+            "eda_log": eda_log,
+            "eda_timing": {"total_seconds": time.monotonic() - started, "submit_cov_job_seconds": 0.0},
+        })
     if MOCK:
         eda_log = {
             "status": "success",
@@ -260,9 +266,15 @@ def run_eda(context: SimpleNamespace, filename: str | None, body: str | None, wa
             "has_coverage": True,
             "err_msg": "",
         }
-        return _with_eda_summary({"reward": 1.5, "eda_feedback": "- status: success\n- stage: mock\n- coverage: 50%", "eda_log": eda_log})
+        return _with_eda_summary({
+            "reward": 1.5,
+            "eda_feedback": "- status: success\n- stage: mock\n- coverage: 50%",
+            "eda_log": eda_log,
+            "eda_timing": {"total_seconds": time.monotonic() - started, "submit_cov_job_seconds": 0.0},
+        })
     tb_file = SimpleNamespace(name=filename, content=body)
     try:
+        submit_started = time.monotonic()
         raw = submit_cov_job(
             EDA_SERVER,
             EDA_REPO_DIR,
@@ -271,6 +283,7 @@ def run_eda(context: SimpleNamespace, filename: str | None, body: str | None, wa
             skip_detail=not want_detail,
             timeout=EDA_TIMEOUT,
         )
+        submit_seconds = time.monotonic() - submit_started
         eval_log = evaluate_cov(context, raw)
         eda_log = {
             "status": eval_log["status"],
@@ -282,10 +295,23 @@ def run_eda(context: SimpleNamespace, filename: str | None, body: str | None, wa
             "err_msg": eval_log.get("err_msg", ""),
         }
         reward = 1.0 + eda_log["overall_coverage"] if eda_log["has_coverage"] else 0.0
-        return _with_eda_summary({"reward": reward, "eda_feedback": format_feedback(raw, context) if want_detail else None, "eda_log": eda_log})
+        return _with_eda_summary({
+            "reward": reward,
+            "eda_feedback": format_feedback(raw, context) if want_detail else None,
+            "eda_log": eda_log,
+            "eda_timing": {
+                "total_seconds": time.monotonic() - started,
+                "submit_cov_job_seconds": submit_seconds,
+            },
+        })
     except Exception as exc:
         eda_log = {"status": "exception", "filename": filename, "has_coverage": False, "exc": str(exc)}
-        return _with_eda_summary({"reward": 0.0, "eda_feedback": f"- status: failed (EDA exception: {exc})", "eda_log": eda_log})
+        return _with_eda_summary({
+            "reward": 0.0,
+            "eda_feedback": f"- status: failed (EDA exception: {exc})",
+            "eda_log": eda_log,
+            "eda_timing": {"total_seconds": time.monotonic() - started},
+        })
 
 
 def load_teacher_config() -> dict[str, Any]:
@@ -380,6 +406,7 @@ def teacher_sampling_with_budget(
     prompt: str,
     sampling_params: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+    started = time.monotonic()
     params = dict(sampling_params or {})
     requested = _requested_max_new_tokens(params)
     budget = {
@@ -389,11 +416,15 @@ def teacher_sampling_with_budget(
         "teacher_token_budget_margin": TEACHER_TOKEN_BUDGET_MARGIN,
     }
     if requested <= 0 or TEACHER_CONTEXT_LENGTH <= 0:
+        budget["budget_seconds"] = time.monotonic() - started
         return params, budget, None
     try:
+        tokenize_started = time.monotonic()
         prompt_tokens = count_teacher_prompt_tokens(url, prompt)
+        budget["tokenize_seconds"] = time.monotonic() - tokenize_started
     except Exception as exc:
         budget["token_count_error"] = str(exc)
+        budget["budget_seconds"] = time.monotonic() - started
         log("WARN", "teacher_token_count_failed", name, str(exc))
         return params, budget, None
     budget["prompt_token_count"] = prompt_tokens
@@ -401,6 +432,7 @@ def teacher_sampling_with_budget(
     budget["available_new_tokens"] = available
     if available < max(1, TEACHER_MIN_NEW_TOKENS):
         budget["effective_max_new_tokens"] = 0
+        budget["budget_seconds"] = time.monotonic() - started
         return params, budget, "teacher_context_exceeded"
     effective = min(requested, available)
     params["max_new_tokens"] = effective
@@ -416,6 +448,7 @@ def teacher_sampling_with_budget(
             f"effective={effective}",
             f"context={TEACHER_CONTEXT_LENGTH}",
         )
+    budget["budget_seconds"] = time.monotonic() - started
     return params, budget, None
 
 
@@ -436,6 +469,7 @@ def extract_token_logprobs(meta: dict[str, Any]) -> tuple[list[int], list[float]
 
 
 def generate_teacher_rollout(name: str, slot: int, prompt: str, sampling_params: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    started = time.monotonic()
     url = teacher_url(name, cfg)
     model_path = teacher_model_path(name, cfg)
     effective_sampling_params, budget, skip_reason = teacher_sampling_with_budget(name, url, prompt, sampling_params)
@@ -453,10 +487,16 @@ def generate_teacher_rollout(name: str, slot: int, prompt: str, sampling_params:
             "generated_token_logprobs": [],
             "finish_reason": skip_reason,
             "teacher_generation_status": skip_reason,
+            "teacher_generation_timing": {
+                "total_seconds": time.monotonic() - started,
+                "request_seconds": 0.0,
+            },
         }
     payload = {"text": prompt, "sampling_params": effective_sampling_params, "return_logprob": True}
     try:
+        request_started = time.monotonic()
         output = post_json(url, payload, timeout=TEACHER_TIMEOUT)
+        request_seconds = time.monotonic() - request_started
     except Exception as exc:
         return {
             **base,
@@ -466,6 +506,10 @@ def generate_teacher_rollout(name: str, slot: int, prompt: str, sampling_params:
             "finish_reason": "teacher_generate_error",
             "teacher_generation_status": "teacher_generate_error",
             "teacher_generation_error": str(exc),
+            "teacher_generation_timing": {
+                "total_seconds": time.monotonic() - started,
+                "request_seconds": time.monotonic() - request_started,
+            },
         }
     response = str(output.get("text") or output.get("response") or output.get("output") or "")
     meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
@@ -477,6 +521,12 @@ def generate_teacher_rollout(name: str, slot: int, prompt: str, sampling_params:
         "generated_token_logprobs": logprobs,
         "finish_reason": meta.get("finish_reason"),
         "teacher_generation_status": "success",
+        "teacher_generation_timing": {
+            "total_seconds": time.monotonic() - started,
+            "request_seconds": request_seconds,
+            "response_chars": len(response),
+            "generated_token_count": len(token_ids),
+        },
     }
 
 
@@ -889,9 +939,12 @@ def publish(job_id: str, obj: dict[str, Any]) -> None:
 
 def process(job: Path) -> None:
     job_id = job.name
-    started = time.time()
+    started_wall = time.time()
+    started = time.monotonic()
+    timing: dict[str, Any] = {}
     with _JOB_SEM:
         try:
+            phase_started = time.monotonic()
             manifest = read_json(job / "manifest.json")
             if manifest.get("version") != SCHEMA_VERSION:
                 raise ValueError(f"bad schema version: {manifest.get('version')}")
@@ -900,11 +953,23 @@ def process(job: Path) -> None:
             want_detail = bool((manifest.get("eda") or {}).get("want_detail", False))
             sampling_params = manifest.get("sampling_params") if isinstance(manifest.get("sampling_params"), dict) else {}
             teacher_cfg = load_teacher_config()
+            timing["load_request_seconds"] = time.monotonic() - phase_started
 
             student_specs = manifest.get("student_rollouts") if isinstance(manifest.get("student_rollouts"), list) else []
+            phase_started = time.monotonic()
             with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(student_specs) or 1))) as pool:
                 student_entries = list(pool.map(lambda e: score_student(job, e, context, want_detail), student_specs))
+            timing["student_eda_seconds"] = time.monotonic() - phase_started
+            timing["student_eda_max_seconds"] = max(
+                (
+                    float((entry.get("eda_timing") or {}).get("total_seconds", 0.0) or 0.0)
+                    for entry in student_entries
+                    if isinstance(entry, dict)
+                ),
+                default=0.0,
+            )
 
+            phase_started = time.monotonic()
             teacher_specs = manifest.get("teachers") if isinstance(manifest.get("teachers"), list) else []
             teacher_jobs: list[tuple[str, int]] = []
             for spec in teacher_specs:
@@ -917,28 +982,70 @@ def process(job: Path) -> None:
             teacher_entries: list[dict[str, Any]] = []
             teacher_request = manifest.get("teacher_request") if isinstance(manifest.get("teacher_request"), dict) else {}
             teacher_rollouts_file = manifest.get("teacher_rollouts_file")
+            timing["parse_teacher_request_seconds"] = time.monotonic() - phase_started
+            phase_started = time.monotonic()
             if isinstance(teacher_rollouts_file, str) and teacher_rollouts_file:
                 provided = read_json(job / teacher_rollouts_file).get("teacher_rollouts", [])
                 if isinstance(provided, list):
                     teacher_entries = [e for e in provided if isinstance(e, dict)]
+            timing["load_teacher_rollouts_seconds"] = time.monotonic() - phase_started
             if teacher_jobs and teacher_request.get("generate_teacher_rollouts", True):
+                phase_started = time.monotonic()
                 with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(teacher_jobs)))) as pool:
                     futures = [
                         pool.submit(generate_teacher_rollout, name, slot, prompt, sampling_params, teacher_cfg)
                         for name, slot in teacher_jobs
                     ]
                     generated = [future.result() for future in as_completed(futures)]
+                timing["teacher_generate_seconds"] = time.monotonic() - phase_started
+                timing["teacher_generate_max_seconds"] = max(
+                    (
+                        float((entry.get("teacher_generation_timing") or {}).get("total_seconds", 0.0) or 0.0)
+                        for entry in generated
+                        if isinstance(entry, dict)
+                    ),
+                    default=0.0,
+                )
+                phase_started = time.monotonic()
                 with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(generated)))) as pool:
                     teacher_entries.extend(pool.map(lambda e: score_teacher(e, context, want_detail), generated))
+                timing["teacher_eda_seconds"] = time.monotonic() - phase_started
+                timing["teacher_eda_max_seconds"] = max(
+                    (
+                        float((entry.get("eda_timing") or {}).get("total_seconds", 0.0) or 0.0)
+                        for entry in teacher_entries
+                        if isinstance(entry, dict)
+                    ),
+                    default=0.0,
+                )
+            else:
+                timing.setdefault("teacher_generate_seconds", 0.0)
+                timing.setdefault("teacher_generate_max_seconds", 0.0)
+                timing.setdefault("teacher_eda_seconds", 0.0)
+                timing.setdefault("teacher_eda_max_seconds", 0.0)
 
+            phase_started = time.monotonic()
             sel = selection(student_entries, teacher_entries)
             best_teacher_entry = max(teacher_entries, key=lambda e: float(e.get("reward", 0.0)), default=None)
+            timing["selection_seconds"] = time.monotonic() - phase_started
+            timing["teacher_score_student_seconds"] = 0.0
+            timing["teacher_score_student_max_seconds"] = 0.0
             if teacher_request.get("score_student_rollouts") and best_teacher_entry is not None:
                 best_teacher_name = str(best_teacher_entry.get("teacher") or "")
                 if best_teacher_name:
+                    phase_started = time.monotonic()
                     with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(student_entries) or 1))) as pool:
                         topk_k = int(teacher_request.get("student_topk_k") or 0)
                         scores = list(pool.map(lambda e: score_teacher_on_student(best_teacher_name, e, teacher_cfg, topk_k), student_entries))
+                    timing["teacher_score_student_seconds"] = time.monotonic() - phase_started
+                    timing["teacher_score_student_max_seconds"] = max(
+                        (
+                            float((score.get("teacher_score_timing") or {}).get("request_seconds", 0.0) or 0.0)
+                            for score in scores
+                            if isinstance(score, dict)
+                        ),
+                        default=0.0,
+                    )
                     for entry, score in zip(student_entries, scores, strict=False):
                         entry.setdefault("teacher_scores", []).append(score)
                         if score.get("status") in {"success", "topk_success", "partial_topk"}:
@@ -948,6 +1055,7 @@ def process(job: Path) -> None:
                             entry["teacher_topk_log_probs"] = score.get("teacher_topk_log_probs") or []
                             entry["teacher_topk_logprob_masks"] = score.get("teacher_topk_logprob_masks") or []
 
+            timing["worker_total_before_publish_seconds"] = time.monotonic() - started
             result = {
                 "version": SCHEMA_VERSION,
                 "status": "success",
@@ -959,9 +1067,23 @@ def process(job: Path) -> None:
                 "teacher_rollouts": teacher_entries,
                 "teacher_model_paths": teacher_model_paths(teacher_names, teacher_cfg),
                 "selection": sel,
-                "elapsed_s": time.time() - started,
+                "elapsed_s": time.time() - started_wall,
+                "timing": timing,
             }
+            publish_started = time.monotonic()
             publish(job_id, result)
+            publish_seconds = time.monotonic() - publish_started
+            log(
+                "OPD_WORKER_TIMING",
+                job_id,
+                f"load={timing.get('load_request_seconds', 0.0):.3f}",
+                f"student_eda={timing.get('student_eda_seconds', 0.0):.3f}",
+                f"teacher_generate={timing.get('teacher_generate_seconds', 0.0):.3f}",
+                f"teacher_eda={timing.get('teacher_eda_seconds', 0.0):.3f}",
+                f"teacher_score={timing.get('teacher_score_student_seconds', 0.0):.3f}",
+                f"publish={publish_seconds:.3f}",
+                f"total={time.monotonic() - started:.3f}",
+            )
             log("done", job_id, f"students={len(student_entries)}", f"teachers={len(teacher_entries)}")
         except Exception as exc:
             result = {
@@ -970,7 +1092,8 @@ def process(job: Path) -> None:
                 "job_id": job_id,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
-                "elapsed_s": time.time() - started,
+                "elapsed_s": time.time() - started_wall,
+                "timing": {**timing, "worker_total_before_failure_seconds": time.monotonic() - started},
             }
             publish(job_id, result)
             log("FAIL", job_id, exc)

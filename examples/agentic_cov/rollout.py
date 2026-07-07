@@ -34,6 +34,7 @@ import asyncio
 import copy
 import logging
 import re
+import time
 import uuid
 from argparse import Namespace
 from typing import Any
@@ -54,6 +55,78 @@ from .opd_remote_client import (
 from .reward import _parse_testbench, compute_reward
 
 logger = logging.getLogger(__name__)
+
+
+def _seconds_since(started: float) -> float:
+    return time.monotonic() - started
+
+
+def _payload_bytes(files: dict[str, bytes]) -> int:
+    return sum(len(data) for data in files.values())
+
+
+def _result_timing(result: dict[str, Any] | None, key: str, default: float = 0.0) -> float:
+    timing = result.get("timing") if isinstance(result, dict) else None
+    if isinstance(timing, dict):
+        try:
+            return float(timing.get(key, default) or default)
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def _client_timing_value(timing: dict[str, Any], section: str, key: str, default: float = 0.0) -> float:
+    value = timing.get(section)
+    if isinstance(value, dict):
+        try:
+            return float(value.get(key, default) or default)
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def _log_opd_client_timing(
+    *,
+    stage: str,
+    rollout_id: int,
+    dataset_id: str,
+    round_idx: int,
+    job_id: str,
+    payload_bytes: int,
+    build_seconds: float,
+    load_seconds: float,
+    total_seconds: float,
+    client_timing: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    submit = client_timing.get("submit") if isinstance(client_timing.get("submit"), dict) else {}
+    wait = client_timing.get("wait_result") if isinstance(client_timing.get("wait_result"), dict) else {}
+    logger.info(
+        "OPD_CLIENT_TIMING stage=%s step=%d dataset_id=%s round=%d job=%s "
+        "build=%.3f client_init=%.3f connect=%.3f submit=%.3f upload=%.3f "
+        "wait=%.3f download=%.3f load_json=%.3f total=%.3f worker_elapsed=%.3f "
+        "payload_bytes=%d submit_files=%d download_bytes=%d download_files=%d polls=%d",
+        stage,
+        rollout_id,
+        dataset_id,
+        round_idx + 1,
+        job_id,
+        build_seconds,
+        float(client_timing.get("client_init_seconds", 0.0) or 0.0),
+        _client_timing_value(client_timing, "connect", "seconds"),
+        _client_timing_value(client_timing, "submit", "seconds"),
+        _client_timing_value(client_timing, "submit", "upload_seconds"),
+        _client_timing_value(client_timing, "wait_result", "wait_seconds"),
+        _client_timing_value(client_timing, "wait_result", "download_seconds"),
+        load_seconds,
+        total_seconds,
+        float(result.get("elapsed_s", 0.0) or 0.0),
+        payload_bytes,
+        int(submit.get("file_count", 0) or 0),
+        int(wait.get("download_bytes", 0) or 0),
+        int(wait.get("download_files", 0) or 0),
+        int(wait.get("polls", 0) or 0),
+    )
 
 # ---------------------------------------------------------------------------
 # Per-rollout split log helpers
@@ -578,9 +651,11 @@ def _run_opd_teacher_round_sync(
     sampling_params: dict[str, Any],
     want_detail: bool,
 ) -> dict[str, Any]:
+    total_started = time.monotonic()
     teachers = parse_teacher_specs(getattr(args, "opd_teachers", ""))
     if not teachers:
         raise ValueError("OPD relay enabled but no teachers configured")
+    build_started = time.monotonic()
     files = build_round_files(
         job_id=job_id,
         dataset_id=dataset_id,
@@ -601,7 +676,10 @@ def _run_opd_teacher_round_sync(
         topk_k=int(getattr(args, "opd_topk", 0) or 0),
         generate_teacher_rollouts=True,
     )
+    build_seconds = _seconds_since(build_started)
+    client_started = time.monotonic()
     client = OpdRelayClient(args)
+    client_init_seconds = _seconds_since(client_started)
     try:
         client.submit(job_id, files)
         logger.info(
@@ -617,8 +695,26 @@ def _run_opd_teacher_round_sync(
             timeout_s=float(getattr(args, "opd_timeout", 1800.0) or 1800.0),
             poll_s=float(getattr(args, "opd_poll", 2.0) or 2.0),
         )
+        load_started = time.monotonic()
         result = load_result_tree(result_dir)
+        load_seconds = _seconds_since(load_started)
         result["_opd_teacher_job_id"] = job_id
+        client_timing = client.timing()
+        client_timing["client_init_seconds"] = client_init_seconds
+        result["_opd_client_timing"] = client_timing
+        _log_opd_client_timing(
+            stage="teacher",
+            rollout_id=rollout_id,
+            dataset_id=dataset_id,
+            round_idx=round_idx,
+            job_id=job_id,
+            payload_bytes=_payload_bytes(files),
+            build_seconds=build_seconds,
+            load_seconds=load_seconds,
+            total_seconds=_seconds_since(total_started),
+            client_timing=client_timing,
+            result=result,
+        )
         return result
     finally:
         client.close()
@@ -638,9 +734,11 @@ def _run_opd_relay_round_sync(
     sampling_params: dict[str, Any],
     want_detail: bool,
 ) -> dict[str, Any]:
+    total_started = time.monotonic()
     teachers = parse_teacher_specs(getattr(args, "opd_teachers", ""))
     if not teachers:
         raise ValueError("OPD relay enabled but no teachers configured")
+    build_started = time.monotonic()
     files = build_round_files(
         job_id=job_id,
         dataset_id=dataset_id,
@@ -660,7 +758,10 @@ def _run_opd_relay_round_sync(
         score_student_rollouts=True,
         topk_k=int(getattr(args, "opd_topk", 0) or 0),
     )
+    build_seconds = _seconds_since(build_started)
+    client_started = time.monotonic()
     client = OpdRelayClient(args)
+    client_init_seconds = _seconds_since(client_started)
     try:
         result_dir = client.submit_and_wait(
             job_id,
@@ -668,7 +769,26 @@ def _run_opd_relay_round_sync(
             timeout_s=float(getattr(args, "opd_timeout", 1800.0) or 1800.0),
             poll_s=float(getattr(args, "opd_poll", 2.0) or 2.0),
         )
-        return load_result_tree(result_dir)
+        load_started = time.monotonic()
+        result = load_result_tree(result_dir)
+        load_seconds = _seconds_since(load_started)
+        client_timing = client.timing()
+        client_timing["client_init_seconds"] = client_init_seconds
+        result["_opd_client_timing"] = client_timing
+        _log_opd_client_timing(
+            stage="combined",
+            rollout_id=rollout_id,
+            dataset_id=dataset_id,
+            round_idx=round_idx,
+            job_id=job_id,
+            payload_bytes=_payload_bytes(files),
+            build_seconds=build_seconds,
+            load_seconds=load_seconds,
+            total_seconds=_seconds_since(total_started),
+            client_timing=client_timing,
+            result=result,
+        )
+        return result
     finally:
         client.close()
 
@@ -688,10 +808,12 @@ def _run_opd_score_round_sync(
     sampling_params: dict[str, Any],
     want_detail: bool,
 ) -> dict[str, Any]:
+    total_started = time.monotonic()
     teacher_rollouts = _result_entries(teacher_result, "teacher_rollouts", "teachers", "teacher")
     if not teacher_rollouts:
         raise RuntimeError("OPD teacher stage returned no teacher_rollouts")
     score_job_id = f"{job_id}_score"
+    build_started = time.monotonic()
     files = build_round_files(
         job_id=score_job_id,
         dataset_id=dataset_id,
@@ -714,7 +836,10 @@ def _run_opd_score_round_sync(
         teacher_rollouts=teacher_rollouts,
         generate_teacher_rollouts=False,
     )
+    build_seconds = _seconds_since(build_started)
+    client_started = time.monotonic()
     client = OpdRelayClient(args)
+    client_init_seconds = _seconds_since(client_started)
     try:
         result_dir = client.submit_and_wait(
             score_job_id,
@@ -722,9 +847,27 @@ def _run_opd_score_round_sync(
             timeout_s=float(getattr(args, "opd_timeout", 1800.0) or 1800.0),
             poll_s=float(getattr(args, "opd_poll", 2.0) or 2.0),
         )
+        load_started = time.monotonic()
         result = load_result_tree(result_dir)
+        load_seconds = _seconds_since(load_started)
         result["_opd_teacher_job_id"] = teacher_result.get("job_id") or job_id
         result["_opd_score_job_id"] = score_job_id
+        client_timing = client.timing()
+        client_timing["client_init_seconds"] = client_init_seconds
+        result["_opd_client_timing"] = client_timing
+        _log_opd_client_timing(
+            stage="score",
+            rollout_id=rollout_id,
+            dataset_id=dataset_id,
+            round_idx=round_idx,
+            job_id=score_job_id,
+            payload_bytes=_payload_bytes(files),
+            build_seconds=build_seconds,
+            load_seconds=load_seconds,
+            total_seconds=_seconds_since(total_started),
+            client_timing=client_timing,
+            result=result,
+        )
         return result
     finally:
         client.close()
@@ -744,6 +887,7 @@ async def _score_group_with_opd_relay(
     teacher_result: dict[str, Any] | None = None,
     opd_request: dict[str, Any] | None = None,
 ) -> tuple[list[Sample], list[Sample]]:
+    total_started = time.monotonic()
     request = opd_request or _build_opd_round_request(
         args=args,
         state=state,
@@ -754,23 +898,32 @@ async def _score_group_with_opd_relay(
         dataset_id=dataset_id,
         want_detail=want_detail,
     )
+    payload_started = time.monotonic()
     student_rollouts = [_student_rollout_payload(sample, i) for i, sample in enumerate(group)]
+    payload_seconds = _seconds_since(payload_started)
+    relay_started = time.monotonic()
     if teacher_result is None:
+        relay_stage = "combined"
         result = await asyncio.to_thread(
             _run_opd_relay_round_sync,
             student_rollouts=student_rollouts,
             **request,
         )
     else:
+        relay_stage = "score"
         result = await asyncio.to_thread(
             _run_opd_score_round_sync,
             teacher_result=teacher_result,
             student_rollouts=student_rollouts,
             **request,
         )
+    relay_seconds = _seconds_since(relay_started)
     job_id = result.get("_opd_score_job_id") or result.get("job_id") or request["job_id"]
 
+    apply_started = time.monotonic()
     _apply_remote_student_scores(group, result)
+    apply_seconds = _seconds_since(apply_started)
+    gate_started = time.monotonic()
     teacher_entries = _result_entries(result, "teacher_rollouts", "teachers", "teacher")
     best_teacher = _best_entry(teacher_entries)
     best_student = max(group, key=lambda s: float(s.reward or 0.0))
@@ -799,6 +952,39 @@ async def _score_group_with_opd_relay(
         len(teacher_entries),
         result.get("_opd_teacher_job_id") or result.get("job_id") or "",
     )
+
+    def _log_score_timing(outcome: str) -> None:
+        response_lengths = [int(sample.response_length or 0) for sample in group]
+        logger.info(
+            "OPD_SCORE_TIMING stage=%s step=%d dataset_id=%s round=%d job=%s "
+            "outcome=%s payload=%.3f relay=%.3f apply=%.3f gate=%.3f total=%.3f "
+            "worker_elapsed=%.3f client_total=%.3f response_tokens_sum=%d response_tokens_max=%d "
+            "student_count=%d teacher_count=%d",
+            relay_stage,
+            rollout_id,
+            dataset_id,
+            round_idx + 1,
+            job_id,
+            outcome,
+            payload_seconds,
+            relay_seconds,
+            apply_seconds,
+            _seconds_since(gate_started),
+            _seconds_since(total_started),
+            float(result.get("elapsed_s", 0.0) or 0.0),
+            sum(
+                _client_timing_value(result.get("_opd_client_timing") or {}, section, key)
+                for section, key in (
+                    ("submit", "seconds"),
+                    ("wait_result", "wait_seconds"),
+                    ("wait_result", "download_seconds"),
+                )
+            ),
+            sum(response_lengths),
+            max(response_lengths, default=0),
+            len(group),
+            len(teacher_entries),
+        )
 
     if gate_pass and best_teacher is not None:
         student_entries_by_id = {
@@ -911,6 +1097,7 @@ async def _score_group_with_opd_relay(
                     teacher=best_teacher_name,
                     opd_topk=requested_topk,
                 )
+            _log_score_timing("opd_topk")
             return group, group
 
         if not require_topk:
@@ -942,6 +1129,7 @@ async def _score_group_with_opd_relay(
                         best_teacher_reward=best_teacher_reward,
                         teacher=best_teacher_name,
                     )
+                _log_score_timing("opd_logprob")
                 return group, group
 
         for sample in group:
@@ -951,6 +1139,9 @@ async def _score_group_with_opd_relay(
                 "missing_teacher_topk_log_probs" if require_topk else "missing_teacher_log_probs",
             )
             _set_train_loss_type(sample, "rl")
+        _log_score_timing("gate_pass_but_missing_teacher_logprobs")
+    else:
+        _log_score_timing("rl_fallback")
 
     return group, group
 
@@ -1057,11 +1248,13 @@ async def _rollout_one_prompt(
     rounds_output: list[list[Sample]] = []
     current_group = initial_group
     for round_idx in range(num_rounds):
+        round_started = time.monotonic()
         for s in current_group:
             s.metadata["round_number"] = round_idx
 
         train_group: list[Sample]
         if bool(getattr(args, "use_opd_relay", False)) and not evaluation:
+            request_started = time.monotonic()
             opd_request = _build_opd_round_request(
                 args=args,
                 state=state,
@@ -1072,10 +1265,17 @@ async def _rollout_one_prompt(
                 dataset_id=context_id,
                 want_detail=_want_detail,
             )
+            request_seconds = _seconds_since(request_started)
+            teacher_started = time.monotonic()
             teacher_task = asyncio.create_task(asyncio.to_thread(_run_opd_teacher_round_sync, **opd_request))
+            student_started = time.monotonic()
             current_group = await _generate_group_only(args, state, current_group, sampling_params)
+            student_seconds = _seconds_since(student_started)
             try:
+                teacher_wait_started = time.monotonic()
                 teacher_result = await teacher_task
+                teacher_wait_after_student_seconds = _seconds_since(teacher_wait_started)
+                score_started = time.monotonic()
                 train_group, current_group = await _score_group_with_opd_relay(
                     args=args,
                     state=state,
@@ -1089,18 +1289,77 @@ async def _rollout_one_prompt(
                     teacher_result=teacher_result,
                     opd_request=opd_request,
                 )
+                score_seconds = _seconds_since(score_started)
+                response_lengths = [int(sample.response_length or 0) for sample in current_group]
+                logger.info(
+                    "OPD_ROUND_TIMING step=%d dataset_id=%s round=%d/%d "
+                    "request_build=%.3f teacher_wall=%.3f student_generate=%.3f "
+                    "teacher_wait_after_student=%.3f score=%.3f total=%.3f "
+                    "teacher_worker_elapsed=%.3f teacher_client_total=%.3f "
+                    "response_tokens_sum=%d response_tokens_max=%d",
+                    rollout_id,
+                    context_id,
+                    round_idx + 1,
+                    num_rounds,
+                    request_seconds,
+                    _seconds_since(teacher_started),
+                    student_seconds,
+                    teacher_wait_after_student_seconds,
+                    score_seconds,
+                    _seconds_since(round_started),
+                    float(teacher_result.get("elapsed_s", 0.0) or 0.0),
+                    sum(
+                        _client_timing_value(teacher_result.get("_opd_client_timing") or {}, section, key)
+                        for section, key in (
+                            ("submit", "seconds"),
+                            ("wait_result", "wait_seconds"),
+                            ("wait_result", "download_seconds"),
+                        )
+                    ),
+                    sum(response_lengths),
+                    max(response_lengths, default=0),
+                )
             except Exception:
                 logger.exception(
                     "OPD relay failed; falling back to local RL scoring "
                     "step=%d dataset_id=%s round=%d",
                     rollout_id, context_id, round_idx + 1,
                 )
+                fallback_started = time.monotonic()
                 current_group = await _score_existing_group_locally(args, current_group, _want_detail)
+                logger.info(
+                    "OPD_ROUND_TIMING step=%d dataset_id=%s round=%d/%d "
+                    "request_build=%.3f teacher_wall=%.3f student_generate=%.3f "
+                    "teacher_wait_after_student=nan fallback_local_score=%.3f total=%.3f",
+                    rollout_id,
+                    context_id,
+                    round_idx + 1,
+                    num_rounds,
+                    request_seconds,
+                    _seconds_since(teacher_started),
+                    student_seconds,
+                    _seconds_since(fallback_started),
+                    _seconds_since(round_started),
+                )
                 train_group = current_group
         else:
+            round_generate_score_started = time.monotonic()
             current_group = await _generate_and_score_group(
                 args, state, current_group, sampling_params,
                 max_retries=max_retries, want_detail=_want_detail,
+            )
+            response_lengths = [int(sample.response_length or 0) for sample in current_group]
+            logger.info(
+                "RL_ROUND_TIMING step=%d dataset_id=%s round=%d/%d generate_score=%.3f total=%.3f "
+                "response_tokens_sum=%d response_tokens_max=%d",
+                rollout_id,
+                context_id,
+                round_idx + 1,
+                num_rounds,
+                _seconds_since(round_generate_score_started),
+                _seconds_since(round_started),
+                sum(response_lengths),
+                max(response_lengths, default=0),
             )
             train_group = current_group
         rounds_output.append(train_group)
