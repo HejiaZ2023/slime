@@ -19,8 +19,21 @@ diff -ruN a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/lay
              extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
 diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
 --- a/python/sglang/srt/layers/sampler.py	2026-07-08 04:17:33.249423155 -0400
-+++ b/python/sglang/srt/layers/sampler.py	2026-07-08 04:17:33.249423155 -0400
-@@ -79,6 +79,7 @@
++++ b/python/sglang/srt/layers/sampler.py	2026-07-08 04:30:45.457087385 -0400
+@@ -12,7 +12,11 @@
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.layers.utils.hash import murmur_hash32
+-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
++from sglang.srt.layers.utils.logprob import (
++    get_token_ids_logprobs,
++    get_top_logprob_ids_from_logits,
++    get_top_logprobs,
++)
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.sampling.sampling_params import TOP_K_ALL
+ from sglang.srt.server_args import get_global_server_args
+@@ -79,6 +83,7 @@
          sampling_info: SamplingBatchInfo,
          return_logprob: bool,
          top_logprobs_nums: List[int],
@@ -28,7 +41,76 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
          token_ids_logprobs: List[List[int]],
          positions: torch.Tensor,
      ):
-@@ -176,6 +177,7 @@
+@@ -100,11 +105,21 @@
+ 
+         # Preprocess logits (custom processors and NaN handling)
+         logits = self._preprocess_logits(logits, sampling_info)
++        top_logprobs_ids_only_fast_path = self._can_skip_logprob_values(
++            return_logprob, top_logprobs_nums, top_logprobs_ids_only, token_ids_logprobs
++        )
++        if top_logprobs_ids_only_fast_path:
++            # Top-k token ids are invariant under positive temperature scaling and
++            # log_softmax, so ids-only OPD can avoid materializing full logprobs.
++            (
++                logits_output.next_token_top_logprobs_val,
++                logits_output.next_token_top_logprobs_idx,
++            ) = get_top_logprob_ids_from_logits(logits, top_logprobs_nums)
+ 
+         if sampling_info.is_all_greedy:
+             # Use torch.argmax if all requests use greedy sampling
+             batch_next_token_ids = torch.argmax(logits, -1)
+-            if return_logprob:
++            if return_logprob and not top_logprobs_ids_only_fast_path:
+                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
+                     logits, dim=-1
+                 )
+@@ -134,7 +149,10 @@
+             if self.use_ascend_backend:
+                 # Ascend backend: sample from logits directly.
+                 batch_next_token_ids, logprobs = self._forward_ascend_backend(
+-                    logits, sampling_info, simple_sampling_case, return_logprob
++                    logits,
++                    sampling_info,
++                    simple_sampling_case,
++                    return_logprob and not top_logprobs_ids_only_fast_path,
+                 )
+             elif (
+                 self.use_log_softmax_logprob
+@@ -147,7 +165,11 @@
+                     sampling_info,
+                     positions,
+                 )
+-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
++                if (
++                    return_logprob
++                    and not SGLANG_RETURN_ORIGINAL_LOGPROB
++                    and not top_logprobs_ids_only_fast_path
++                ):
+                     logprobs = logprobs_via_logsoftmax_kernel
+             else:
+                 # Standard path: do softmax and sample from probs.
+@@ -160,7 +182,11 @@
+                 batch_next_token_ids = self._sample_from_probs(
+                     probs, sampling_info, positions, simple_sampling_case
+                 )
+-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
++                if (
++                    return_logprob
++                    and not SGLANG_RETURN_ORIGINAL_LOGPROB
++                    and not top_logprobs_ids_only_fast_path
++                ):
+                     logprobs = (
+                         logprobs_via_logsoftmax_kernel
+                         if logprobs_via_logsoftmax_kernel is not None
+@@ -169,13 +195,14 @@
+                 del probs
+ 
+         # Attach logprobs to logits_output (in-place modification)
+-        if return_logprob:
++        if return_logprob and not top_logprobs_ids_only_fast_path:
+             if SGLANG_RETURN_ORIGINAL_LOGPROB:
+                 logprobs = original_logprobs
+             self._attach_logprobs_to_output(
                  logits_output,
                  logprobs,
                  top_logprobs_nums,
@@ -36,7 +118,33 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
                  token_ids_logprobs,
                  sampling_info,
                  batch_next_token_ids,
-@@ -314,6 +316,7 @@
+@@ -185,6 +212,25 @@
+ 
+         return batch_next_token_ids
+ 
++    @staticmethod
++    def _can_skip_logprob_values(
++        return_logprob: bool,
++        top_logprobs_nums: List[int],
++        top_logprobs_ids_only: Optional[List[bool]],
++        token_ids_logprobs: List[List[int]],
++    ) -> bool:
++        if (
++            not return_logprob
++            or SGLANG_RETURN_ORIGINAL_LOGPROB
++            or not any(k > 0 for k in top_logprobs_nums)
++        ):
++            return False
++        if any(token_ids is not None for token_ids in token_ids_logprobs):
++            return False
++
++        ids_only = top_logprobs_ids_only or [False] * len(top_logprobs_nums)
++        return all(k <= 0 or ids_only[i] for i, k in enumerate(top_logprobs_nums))
++
+     def _sample_from_probs(
+         self,
+         probs: torch.Tensor,
+@@ -314,6 +360,7 @@
          logits_output: LogitsProcessorOutput,
          logprobs: torch.Tensor,
          top_logprobs_nums: List[int],
@@ -44,7 +152,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
          token_ids_logprobs: List[List[int]],
          sampling_info: SamplingBatchInfo,
          batch_next_token_ids: torch.Tensor,
-@@ -326,7 +329,11 @@
+@@ -326,7 +373,11 @@
              (
                  logits_output.next_token_top_logprobs_val,
                  logits_output.next_token_top_logprobs_idx,
@@ -57,7 +165,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
  
          if any(x is not None for x in token_ids_logprobs):
              (
-@@ -362,6 +369,7 @@
+@@ -362,6 +413,7 @@
          sampling_info: SamplingBatchInfo,
          return_logprob: bool,
          top_logprobs_nums: List[int],
@@ -65,7 +173,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
          token_ids_logprobs: List[List[int]],
      ) -> None:
          """
-@@ -396,7 +404,11 @@
+@@ -396,7 +448,11 @@
              (
                  logits_output.next_token_top_logprobs_val,
                  logits_output.next_token_top_logprobs_idx,
@@ -80,7 +188,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
          if needs_token_ids_logprobs:
 diff -ruN a/python/sglang/srt/layers/utils/logprob.py b/python/sglang/srt/layers/utils/logprob.py
 --- a/python/sglang/srt/layers/utils/logprob.py	2026-07-08 04:17:33.249423155 -0400
-+++ b/python/sglang/srt/layers/utils/logprob.py	2026-07-08 04:17:33.249423155 -0400
++++ b/python/sglang/srt/layers/utils/logprob.py	2026-07-08 04:32:02.853114635 -0400
 @@ -68,10 +68,15 @@
      top_logprobs_nums: List[int],
      stage: LogprobStage,
@@ -90,7 +198,7 @@ diff -ruN a/python/sglang/srt/layers/utils/logprob.py b/python/sglang/srt/layers
      max_k = max(top_logprobs_nums)
 -    values, indices = logprobs.topk(max_k, dim=-1)
 -    values = values.tolist()
-+    values, indices = logprobs.topk(max_k, dim=-1, sorted=False)
++    values, indices = logprobs.topk(max_k, dim=-1, sorted=True)
 +    ids_only = top_logprobs_ids_only or [False] * len(top_logprobs_nums)
 +    if all(ids_only):
 +        values = None
@@ -127,7 +235,7 @@ diff -ruN a/python/sglang/srt/layers/utils/logprob.py b/python/sglang/srt/layers
              top_logprobs_idx.append([indices[pt + j][:k] for j in range(pruned_len)])
              pt += pruned_len
  
-@@ -104,14 +116,21 @@
+@@ -104,14 +116,37 @@
          logits_metadata.top_logprobs_nums,
          stage=LogprobStage.PREFILL,
          extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
@@ -139,14 +247,30 @@ diff -ruN a/python/sglang/srt/layers/utils/logprob.py b/python/sglang/srt/layers
      logprobs: torch.Tensor,
      top_logprobs_nums: List[int],
 +    top_logprobs_ids_only: Optional[List[bool]] = None,
- ):
--    return get_top_logprobs_raw(logprobs, top_logprobs_nums, stage=LogprobStage.DECODE)
++):
 +    return get_top_logprobs_raw(
 +        logprobs,
 +        top_logprobs_nums,
 +        stage=LogprobStage.DECODE,
 +        top_logprobs_ids_only=top_logprobs_ids_only,
 +    )
++
++
++def get_top_logprob_ids_from_logits(
++    logits: torch.Tensor,
++    top_logprobs_nums: List[int],
+ ):
+-    return get_top_logprobs_raw(logprobs, top_logprobs_nums, stage=LogprobStage.DECODE)
++    max_k = max(top_logprobs_nums)
++    _, indices = logits.topk(max_k, dim=-1, sorted=True)
++    indices = indices.tolist()
++
++    top_logprobs_val = []
++    top_logprobs_idx = []
++    for i, k in enumerate(top_logprobs_nums):
++        top_logprobs_val.append([])
++        top_logprobs_idx.append(indices[i][:k])
++    return top_logprobs_val, top_logprobs_idx
  
  
  def get_token_ids_logprobs_raw(
@@ -201,7 +325,7 @@ diff -ruN a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers
      # If return logprobs, per-position token ids to return logprob for
 diff -ruN a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
 --- a/python/sglang/srt/managers/schedule_batch.py	2026-07-08 04:17:33.237423147 -0400
-+++ b/python/sglang/srt/managers/schedule_batch.py	2026-07-08 04:17:33.237423147 -0400
++++ b/python/sglang/srt/managers/schedule_batch.py	2026-07-08 04:30:45.457087385 -0400
 @@ -520,6 +520,7 @@
          sampling_params: SamplingParams,
          return_logprob: bool = False,
@@ -210,7 +334,14 @@ diff -ruN a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/man
          dllm_config: Optional[DllmConfig] = None,
          token_ids_logprob: List[int] = None,
          topk_token_ids: Optional[List[List[int]]] = None,
-@@ -692,6 +693,7 @@
+@@ -686,12 +687,14 @@
+         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
+         # because the decode server does not have the first output token logprobs
+         self.send_output_token_logprobs_offset: int = 0
++        self.send_output_top_logprobs_offset: int = 0
+ 
+         # Logprobs (arguments)
+         self.return_logprob = return_logprob
          # Start index to compute logprob from.
          self.logprob_start_len = 0
          self.top_logprobs_num = top_logprobs_num
@@ -218,7 +349,7 @@ diff -ruN a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/man
          self.token_ids_logprob = token_ids_logprob
          self.topk_token_ids = topk_token_ids
          self.temp_scaled_logprobs = False
-@@ -1654,6 +1656,7 @@
+@@ -1654,6 +1657,7 @@
  
          if self.return_logprob:
              self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
@@ -226,7 +357,7 @@ diff -ruN a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/man
              self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
              self.topk_token_ids_logprobs = [r.topk_token_ids for r in reqs]
  
-@@ -2101,12 +2104,16 @@
+@@ -2101,12 +2105,16 @@
          self.return_logprob = any(req.return_logprob for req in self.reqs)
          if self.return_logprob:
              self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -243,7 +374,7 @@ diff -ruN a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/man
              self.token_ids_logprobs = None
              self.topk_token_ids_logprobs = None
  
-@@ -2154,14 +2161,19 @@
+@@ -2154,14 +2162,19 @@
          self.mamba_track_seqlens = None
          if self.return_logprob and other.return_logprob:
              self.top_logprobs_nums.extend(other.top_logprobs_nums)
@@ -263,7 +394,7 @@ diff -ruN a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/man
              self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
              self.topk_token_ids_logprobs = (
                  [None] * len(self.reqs) + other.topk_token_ids_logprobs
-@@ -2209,6 +2221,7 @@
+@@ -2209,6 +2222,7 @@
              seq_lens_sum=self.seq_lens_sum,
              return_logprob=self.return_logprob,
              top_logprobs_nums=self.top_logprobs_nums,
@@ -271,7 +402,7 @@ diff -ruN a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/man
              token_ids_logprobs=self.token_ids_logprobs,
              topk_token_ids_logprobs=self.topk_token_ids_logprobs,
              global_num_tokens=self.global_num_tokens,
-@@ -2369,6 +2382,7 @@
+@@ -2369,6 +2383,7 @@
      # For logprob
      return_logprob: bool
      top_logprobs_nums: Optional[List[int]]
@@ -279,9 +410,69 @@ diff -ruN a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/man
      token_ids_logprobs: Optional[List[List[int]]]
      topk_token_ids_logprobs: Optional[List[Optional[List[List[int]]]]]
  
+diff -ruN a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py	2026-07-08 04:30:45.461087463 -0400
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py	2026-07-08 04:30:45.461087463 -0400
+@@ -430,7 +430,8 @@
+ 
+         if batch.spec_algorithm.is_none():
+             next_token_ids = next_token_ids.tolist()
+-            if batch.return_logprob:
++            next_token_logprobs = None
++            if batch.return_logprob and logits_output.next_token_logprobs is not None:
+                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
+         elif batch.is_spec_v2:
+             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+@@ -485,8 +486,9 @@
+ 
+             if req.return_logprob and batch.spec_algorithm.is_none():
+                 # speculative worker handles logprob in speculative decoding
+-                req.output_token_logprobs_val.append(next_token_logprobs[i])
+-                req.output_token_logprobs_idx.append(next_token_id)
++                if next_token_logprobs is not None:
++                    req.output_token_logprobs_val.append(next_token_logprobs[i])
++                    req.output_token_logprobs_idx.append(next_token_id)
+                 if req.top_logprobs_num > 0:
+                     req.output_top_logprobs_val.append(
+                         logits_output.next_token_top_logprobs_val[i]
+@@ -1005,6 +1007,9 @@
+                 send_output_token_logprobs_offset = (
+                     req.send_output_token_logprobs_offset
+                 )
++                send_output_top_logprobs_offset = (
++                    req.send_output_top_logprobs_offset
++                )
+                 rids.append(req.rid)
+                 http_worker_ipcs.append(req.http_worker_ipc)
+                 finished_reasons.append(
+@@ -1128,12 +1133,12 @@
+                         )
+                         output_top_logprobs_val.append(
+                             req.output_top_logprobs_val[
+-                                send_output_token_logprobs_offset:
++                                send_output_top_logprobs_offset:
+                             ]
+                         )
+                         output_top_logprobs_idx.append(
+                             req.output_top_logprobs_idx[
+-                                send_output_token_logprobs_offset:
++                                send_output_top_logprobs_offset:
+                             ]
+                         )
+                         output_token_ids_logprobs_val.append(
+@@ -1149,6 +1154,9 @@
+                         req.send_output_token_logprobs_offset = len(
+                             req.output_token_logprobs_val
+                         )
++                        req.send_output_top_logprobs_offset = len(
++                            req.output_top_logprobs_idx
++                        )
+                     else:
+                         output_token_logprobs_val.append([])
+                         output_token_logprobs_idx.append([])
 diff -ruN a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
 --- a/python/sglang/srt/managers/tokenizer_manager.py	2026-07-08 04:17:33.241423148 -0400
-+++ b/python/sglang/srt/managers/tokenizer_manager.py	2026-07-08 04:17:33.241423148 -0400
++++ b/python/sglang/srt/managers/tokenizer_manager.py	2026-07-08 04:30:45.461087463 -0400
 @@ -930,6 +930,7 @@
                  obj.return_logprob,
                  obj.logprob_start_len,
@@ -298,9 +489,9 @@ diff -ruN a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/
 +            # mode values are intentionally omitted while idx rows remain exact.
 +            meta_info["input_top_logprobs_idx"] = state.input_top_logprobs_idx
 +            meta_info["output_top_logprobs_idx"] = state.output_top_logprobs_idx
-+            if state.input_top_logprobs_val:
++            if any(state.input_top_logprobs_val):
 +                meta_info["input_top_logprobs_val"] = state.input_top_logprobs_val
-+            if state.output_top_logprobs_val:
++            if any(state.output_top_logprobs_val):
 +                meta_info["output_top_logprobs_val"] = state.output_top_logprobs_val
  
          # 3. Handle token_ids_logprob
