@@ -48,9 +48,9 @@ TEACHER_TIMEOUT = float(os.environ.get("OPD_TEACHER_TIMEOUT", "900"))
 TEACHER_CONTEXT_LENGTH = int(os.environ.get("OPD_TEACHER_CONTEXT_LENGTH", "32768"))
 TEACHER_TOKEN_BUDGET_MARGIN = int(os.environ.get("OPD_TEACHER_TOKEN_BUDGET_MARGIN", "256"))
 TEACHER_MIN_NEW_TOKENS = int(os.environ.get("OPD_TEACHER_MIN_NEW_TOKENS", "16"))
-TEACHER_SCORE_CHUNK_TOKENS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_TOKENS", "1024"))
+TEACHER_SCORE_CHUNK_TOKENS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_TOKENS", "128"))
 TEACHER_SCORE_CONTEXT_MARGIN = int(os.environ.get("OPD_TEACHER_SCORE_CONTEXT_MARGIN", "16"))
-TEACHER_SCORE_POSITION_TOPK = os.environ.get("OPD_TEACHER_SCORE_POSITION_TOPK", "1") != "0"
+TEACHER_SCORE_POSITION_TOPK = os.environ.get("OPD_TEACHER_SCORE_POSITION_TOPK", "0") != "0"
 TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sheng/final_ckpts")
 EDA_SERVER = os.environ.get("OPD_EDA_SERVER", "local")
 EDA_REPO_DIR = os.environ.get("OPD_EDA_REPO_DIR", "/workspace/llm4cov_eda")
@@ -847,7 +847,7 @@ def score_teacher_on_student(
         "teacher": name,
         "teacher_model_path": teacher_model_path(name, cfg),
         "status": status,
-        "teacher_log_probs": teacher_log_probs,
+        "teacher_log_probs": teacher_log_probs if requested_topk is None else [],
         "response_token_count": response_len,
         "num_teacher_log_probs": len(teacher_log_probs),
         "teacher_score_timing": {
@@ -865,8 +865,6 @@ def score_teacher_on_student(
         },
     }
     if requested_topk is not None:
-        result["topk_token_ids"] = requested_topk
-        result["topk_student_log_probs"] = entry.get("topk_student_log_probs") or []
         result["teacher_topk_log_probs"] = teacher_topk or []
         result["teacher_topk_logprob_masks"] = teacher_topk_masks or []
     return result
@@ -1049,11 +1047,21 @@ def process(job: Path) -> None:
                     for entry, score in zip(student_entries, scores, strict=False):
                         entry.setdefault("teacher_scores", []).append(score)
                         if score.get("status") in {"success", "topk_success", "partial_topk"}:
-                            entry["teacher_log_probs"] = score.get("teacher_log_probs") or []
                             entry["teacher_logprob_teacher"] = best_teacher_name
-                        if score.get("teacher_topk_log_probs"):
-                            entry["teacher_topk_log_probs"] = score.get("teacher_topk_log_probs") or []
-                            entry["teacher_topk_logprob_masks"] = score.get("teacher_topk_logprob_masks") or []
+
+                    # Training keeps these tensors locally and only needs the
+                    # teacher score payload from the relay.  Dropping them here
+                    # keeps Paladin audit data focused on testbenches/EDA while
+                    # avoiding a large SFTP download back to Brev.
+                    for entry in student_entries:
+                        for key in (
+                            "input_token_ids",
+                            "response_token_ids",
+                            "rollout_log_probs",
+                            "topk_token_ids",
+                            "topk_student_log_probs",
+                        ):
+                            entry.pop(key, None)
 
             timing["worker_total_before_publish_seconds"] = time.monotonic() - started
             result = {

@@ -375,7 +375,20 @@ def build_round_files(
         sid = rollout.get("id") or f"s{i:03d}"
         base = f"student/{sid}"
         response = str(rollout.get("assistant_response") or "")
-        meta = {k: v for k, v in rollout.items() if k not in {"assistant_response", "testbench"}}
+        meta = {
+            k: v
+            for k, v in rollout.items()
+            if k not in {
+                "assistant_response",
+                "testbench",
+                # The relay only needs full input ids, response length, and
+                # top-k token ids to score teacher probabilities.  Student-side
+                # logprobs stay local on the training worker.
+                "rollout_log_probs",
+                "response_token_ids",
+                "topk_student_log_probs",
+            }
+        }
         files[f"{base}/assistant_response.txt"] = _encode_text(response)
         files[f"{base}/meta.json"] = _encode_text(_json_dumps(meta))
         if rollout.get("testbench") is not None:
