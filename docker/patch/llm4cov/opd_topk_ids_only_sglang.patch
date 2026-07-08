@@ -19,7 +19,7 @@ diff -ruN a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/lay
              extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
 diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
 --- a/python/sglang/srt/layers/sampler.py	2026-07-08 04:17:33.249423155 -0400
-+++ b/python/sglang/srt/layers/sampler.py	2026-07-08 04:30:45.457087385 -0400
++++ b/python/sglang/srt/layers/sampler.py	2026-07-08 04:35:33.005092430 -0400
 @@ -12,7 +12,11 @@
  )
  from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -41,12 +41,16 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
          token_ids_logprobs: List[List[int]],
          positions: torch.Tensor,
      ):
-@@ -100,11 +105,21 @@
+@@ -100,11 +105,25 @@
  
          # Preprocess logits (custom processors and NaN handling)
          logits = self._preprocess_logits(logits, sampling_info)
 +        top_logprobs_ids_only_fast_path = self._can_skip_logprob_values(
 +            return_logprob, top_logprobs_nums, top_logprobs_ids_only, token_ids_logprobs
++        ) and (
++            not sampling_info.need_top_p_sampling
++            and not sampling_info.need_top_k_sampling
++            and not sampling_info.need_min_p_sampling
 +        )
 +        if top_logprobs_ids_only_fast_path:
 +            # Top-k token ids are invariant under positive temperature scaling and
@@ -64,7 +68,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
                  original_logprobs = logprobs = torch.nn.functional.log_softmax(
                      logits, dim=-1
                  )
-@@ -134,7 +149,10 @@
+@@ -134,7 +153,10 @@
              if self.use_ascend_backend:
                  # Ascend backend: sample from logits directly.
                  batch_next_token_ids, logprobs = self._forward_ascend_backend(
@@ -76,7 +80,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
                  )
              elif (
                  self.use_log_softmax_logprob
-@@ -147,7 +165,11 @@
+@@ -147,7 +169,11 @@
                      sampling_info,
                      positions,
                  )
@@ -89,7 +93,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
                      logprobs = logprobs_via_logsoftmax_kernel
              else:
                  # Standard path: do softmax and sample from probs.
-@@ -160,7 +182,11 @@
+@@ -160,7 +186,11 @@
                  batch_next_token_ids = self._sample_from_probs(
                      probs, sampling_info, positions, simple_sampling_case
                  )
@@ -102,7 +106,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
                      logprobs = (
                          logprobs_via_logsoftmax_kernel
                          if logprobs_via_logsoftmax_kernel is not None
-@@ -169,13 +195,14 @@
+@@ -169,13 +199,14 @@
                  del probs
  
          # Attach logprobs to logits_output (in-place modification)
@@ -118,7 +122,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
                  token_ids_logprobs,
                  sampling_info,
                  batch_next_token_ids,
-@@ -185,6 +212,25 @@
+@@ -185,6 +216,25 @@
  
          return batch_next_token_ids
  
@@ -144,7 +148,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
      def _sample_from_probs(
          self,
          probs: torch.Tensor,
-@@ -314,6 +360,7 @@
+@@ -314,6 +364,7 @@
          logits_output: LogitsProcessorOutput,
          logprobs: torch.Tensor,
          top_logprobs_nums: List[int],
@@ -152,7 +156,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
          token_ids_logprobs: List[List[int]],
          sampling_info: SamplingBatchInfo,
          batch_next_token_ids: torch.Tensor,
-@@ -326,7 +373,11 @@
+@@ -326,7 +377,11 @@
              (
                  logits_output.next_token_top_logprobs_val,
                  logits_output.next_token_top_logprobs_idx,
@@ -165,7 +169,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
  
          if any(x is not None for x in token_ids_logprobs):
              (
-@@ -362,6 +413,7 @@
+@@ -362,6 +417,7 @@
          sampling_info: SamplingBatchInfo,
          return_logprob: bool,
          top_logprobs_nums: List[int],
@@ -173,7 +177,7 @@ diff -ruN a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampl
          token_ids_logprobs: List[List[int]],
      ) -> None:
          """
-@@ -396,7 +448,11 @@
+@@ -396,7 +452,11 @@
              (
                  logits_output.next_token_top_logprobs_val,
                  logits_output.next_token_top_logprobs_idx,
