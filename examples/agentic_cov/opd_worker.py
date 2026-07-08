@@ -10,6 +10,8 @@ publishes results under results/<namespace>/<job_id>.
 from __future__ import annotations
 
 import contextlib
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -55,6 +57,9 @@ TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sh
 EDA_SERVER = os.environ.get("OPD_EDA_SERVER", "local")
 EDA_REPO_DIR = os.environ.get("OPD_EDA_REPO_DIR", "/workspace/llm4cov_eda")
 EDA_TIMEOUT = int(os.environ.get("OPD_EDA_TIMEOUT", "30"))
+COMPACT_SCORE_RESULT = os.environ.get("OPD_COMPACT_SCORE_RESULT", "1") != "0"
+AUDIT_RESULT_GZIP = os.environ.get("OPD_AUDIT_RESULT_GZIP", "1") != "0"
+SCORE_TENSOR_DTYPE = os.environ.get("OPD_SCORE_TENSOR_DTYPE", "float32")
 MOCK = os.environ.get("OPD_MOCK", "0") == "1"
 
 _JOB_SEM = threading.Semaphore(MAX_CONCURRENT_JOBS)
@@ -85,6 +90,26 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def write_json(path: Path, obj: dict[str, Any]) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+
+
+def _json_compact_bytes(obj: Any) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_json(obj: Any) -> str:
+    return _sha256_bytes(_json_compact_bytes(obj))
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _summary_count(obj: dict[str, Any], key: str) -> int:
@@ -713,12 +738,14 @@ def score_teacher_on_student(
     requested_topk = _coerce_int_matrix(entry.get("topk_token_ids")) if topk_k > 1 else None
     if requested_topk is not None:
         requested_topk = [row[:topk_k] for row in requested_topk]
+    requested_topk_sha256 = _sha256_json(requested_topk) if requested_topk is not None else ""
     if not isinstance(input_ids, list) or response_len <= 0:
         return {
             "student_id": sid,
             "teacher": name,
             "status": "missing_student_tokens",
             "teacher_log_probs": [],
+            "topk_token_ids_sha256": requested_topk_sha256,
         }
     prompt_len = max(0, len(input_ids) - response_len)
     input_ids_int = [int(x) for x in input_ids]
@@ -808,6 +835,7 @@ def score_teacher_on_student(
             "status": "teacher_score_error",
             "error": str(exc),
             "teacher_log_probs": [],
+            "topk_token_ids_sha256": requested_topk_sha256,
             "response_token_count": response_len,
             "num_teacher_log_probs": 0,
             "teacher_score_timing": {
@@ -848,6 +876,7 @@ def score_teacher_on_student(
         "teacher_model_path": teacher_model_path(name, cfg),
         "status": status,
         "teacher_log_probs": teacher_log_probs if requested_topk is None else [],
+        "topk_token_ids_sha256": requested_topk_sha256,
         "response_token_count": response_len,
         "num_teacher_log_probs": len(teacher_log_probs),
         "teacher_score_timing": {
@@ -919,17 +948,189 @@ def selection(student_entries: list[dict[str, Any]], teacher_entries: list[dict[
     }
 
 
+def _safe_component(value: Any, default: str) -> str:
+    text = str(value or default)
+    text = re.sub(r"[^A-Za-z0-9._-]", "_", text)
+    return text[:80] or default
+
+
+def _write_teacher_topk_sidecar(
+    staging: Path,
+    *,
+    student_id: str,
+    teacher: str,
+    score_idx: int,
+    log_probs: Any,
+    masks: Any,
+    token_ids_sha256: str | None = None,
+) -> dict[str, Any]:
+    import numpy as np  # type: ignore[import-untyped]
+
+    tensor_dir = staging / "score_tensors"
+    tensor_dir.mkdir(parents=True, exist_ok=True)
+    sid = _safe_component(student_id, "student")
+    tname = _safe_component(teacher, "teacher")
+    rel = f"score_tensors/{sid}_{tname}_{score_idx:02d}.npz"
+    path = staging / rel
+
+    dtype = np.float16 if SCORE_TENSOR_DTYPE == "float16" else np.float32
+    log_probs_arr = np.asarray(log_probs, dtype=dtype)
+    masks_arr = np.asarray(masks, dtype=np.uint8)
+    if log_probs_arr.ndim != 2 or masks_arr.ndim != 2 or log_probs_arr.shape != masks_arr.shape:
+        raise ValueError(
+            "bad teacher top-k sidecar shape "
+            f"student={student_id} teacher={teacher} log_probs={log_probs_arr.shape} masks={masks_arr.shape}"
+        )
+    np.savez_compressed(
+        path,
+        teacher_topk_log_probs=log_probs_arr,
+        teacher_topk_logprob_masks=masks_arr,
+    )
+    return {
+        "format": "npz_v1",
+        "file": rel,
+        "sha256": _sha256_file(path),
+        "shape": [int(log_probs_arr.shape[0]), int(log_probs_arr.shape[1])],
+        "log_probs_dtype": str(log_probs_arr.dtype),
+        "masks_dtype": str(masks_arr.dtype),
+        "aligned_to": "student_topk_token_ids_order",
+        "topk_token_ids_sha256": token_ids_sha256 or "",
+    }
+
+
+def _materialize_score_sidecars(obj: dict[str, Any], staging: Path) -> None:
+    for entry in obj.get("student_rollouts") or []:
+        if not isinstance(entry, dict):
+            continue
+        for score_idx, score in enumerate(entry.get("teacher_scores") or []):
+            if not isinstance(score, dict):
+                continue
+            log_probs = score.pop("teacher_topk_log_probs", None)
+            masks = score.pop("teacher_topk_logprob_masks", None)
+            if not log_probs or not masks:
+                continue
+            score["teacher_topk_sidecar"] = _write_teacher_topk_sidecar(
+                staging,
+                student_id=str(entry.get("id") or score.get("student_id") or "student"),
+                teacher=str(score.get("teacher") or "teacher"),
+                score_idx=score_idx,
+                log_probs=log_probs,
+                masks=masks,
+                token_ids_sha256=str(score.get("topk_token_ids_sha256") or ""),
+            )
+
+
+def _compact_score(score: dict[str, Any]) -> dict[str, Any]:
+    keep = {
+        "student_id",
+        "teacher",
+        "teacher_model_path",
+        "status",
+        "error",
+        "teacher_log_probs",
+        "response_token_count",
+        "num_teacher_log_probs",
+        "teacher_score_timing",
+        "teacher_topk_sidecar",
+        "topk_token_ids_sha256",
+    }
+    return {k: v for k, v in score.items() if k in keep and v not in (None, [], {})}
+
+
+def _compact_student_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    keep = {
+        "id",
+        "sample_index",
+        "reward",
+        "eda_summary",
+        "eda_log",
+        "response_token_count",
+        "teacher_logprob_teacher",
+    }
+    compact = {k: v for k, v in entry.items() if k in keep and v not in (None, [], {})}
+    compact["teacher_scores"] = [
+        _compact_score(score)
+        for score in (entry.get("teacher_scores") or [])
+        if isinstance(score, dict)
+    ]
+    return compact
+
+
+def _compact_teacher_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    keep = {
+        "id",
+        "teacher",
+        "teacher_name",
+        "teacher_model_path",
+        "reward",
+        "eda_summary",
+        "eda_log",
+        "response_token_count",
+    }
+    return {k: v for k, v in entry.items() if k in keep and v not in (None, [], {})}
+
+
+def _compact_result_for_training(obj: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "version": obj.get("version"),
+        "status": obj.get("status"),
+        "result_kind": "training_compact",
+        "job_id": obj.get("job_id"),
+        "dataset_id": obj.get("dataset_id"),
+        "rollout_id": obj.get("rollout_id"),
+        "round_idx": obj.get("round_idx"),
+        "teacher_model_paths": obj.get("teacher_model_paths") or {},
+        "selection": obj.get("selection") or {},
+        "elapsed_s": obj.get("elapsed_s"),
+        "timing": obj.get("timing") or {},
+        "audit_result_file": "audit/result.json.gz" if AUDIT_RESULT_GZIP else "audit/result.json",
+        "score_tensor_format": "npz_v1",
+        "student_rollouts": [
+            _compact_student_entry(entry)
+            for entry in (obj.get("student_rollouts") or [])
+            if isinstance(entry, dict)
+        ],
+        "teacher_rollouts": [
+            _compact_teacher_entry(entry)
+            for entry in (obj.get("teacher_rollouts") or [])
+            if isinstance(entry, dict)
+        ],
+    }
+    return compact
+
+
+def _write_audit_result(staging: Path, obj: dict[str, Any]) -> str:
+    audit_dir = staging / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    if AUDIT_RESULT_GZIP:
+        rel = "audit/result.json.gz"
+        with gzip.open(staging / rel, "wt", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, sort_keys=True, indent=2)
+    else:
+        rel = "audit/result.json"
+        write_json(staging / rel, obj)
+    return rel
+
+
 def publish(job_id: str, obj: dict[str, Any]) -> None:
     staging = RES / f"{job_id}.staging"
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
-    write_json(staging / "result.json", obj)
+    if COMPACT_SCORE_RESULT and obj.get("status") == "success":
+        _materialize_score_sidecars(obj, staging)
+        audit_file = _write_audit_result(staging, obj)
+        compact = _compact_result_for_training(obj)
+        compact["audit_result_file"] = audit_file
+        write_json(staging / "result.json", compact)
+    else:
+        write_json(staging / "result.json", obj)
     final = RES / job_id
     if final.exists():
         shutil.rmtree(final)
     os.rename(staging, final)
-    summary = summarize_result(obj, final)
+    summary_obj = read_json(final / "result.json")
+    summary = summarize_result(summary_obj, final)
     write_json(final / "summary.json", summary)
     append_index(summary)
     (final / ".done").write_text("", encoding="utf-8")

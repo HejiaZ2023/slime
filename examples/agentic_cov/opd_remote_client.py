@@ -32,6 +32,14 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _safe_relpath(path: str) -> str:
     rel = Path(path)
     if rel.is_absolute() or ".." in rel.parts:
@@ -274,7 +282,10 @@ class _SftpTreeTransport:
         local_dir.mkdir(parents=True, exist_ok=True)
         file_count = 0
         byte_count = 0
+        download_audit = os.environ.get("OPD_DOWNLOAD_AUDIT", "0") == "1"
         for entry in self.sftp.listdir_attr(remote_dir):
+            if entry.filename == "audit" and not download_audit:
+                continue
             remote_child = f"{remote_dir}/{entry.filename}"
             local_child = local_dir / entry.filename
             if entry.st_mode & 0o040000:
@@ -424,6 +435,50 @@ def build_round_files(
     return files
 
 
+def _load_teacher_topk_sidecar(result_dir: Path, sidecar: dict[str, Any]) -> tuple[list[list[float]], list[list[float]]]:
+    rel = _safe_relpath(str(sidecar.get("file") or ""))
+    path = result_dir / rel
+    if not path.exists():
+        raise FileNotFoundError(f"missing OPD teacher top-k sidecar: {path}")
+    expected_sha = str(sidecar.get("sha256") or "")
+    actual_sha = _sha256_file(path)
+    if expected_sha and actual_sha != expected_sha:
+        raise ValueError(f"bad OPD sidecar sha256 for {path}: {actual_sha} != {expected_sha}")
+    if sidecar.get("format") != "npz_v1":
+        raise ValueError(f"unsupported OPD sidecar format at {path}: {sidecar.get('format')!r}")
+
+    import numpy as np  # type: ignore[import-untyped]
+
+    with np.load(path, allow_pickle=False) as data:
+        log_probs = data["teacher_topk_log_probs"].astype("float32", copy=False)
+        masks = data["teacher_topk_logprob_masks"].astype("float32", copy=False)
+        shape = sidecar.get("shape")
+        if isinstance(shape, list) and len(shape) == 2:
+            expected = (int(shape[0]), int(shape[1]))
+            if tuple(log_probs.shape) != expected or tuple(masks.shape) != expected:
+                raise ValueError(
+                    f"bad OPD sidecar shape at {path}: log_probs={log_probs.shape} masks={masks.shape} expected={expected}"
+                )
+        return log_probs.tolist(), masks.tolist()
+
+
+def _hydrate_teacher_topk_sidecars(result: dict[str, Any], result_dir: Path) -> None:
+    for entry in result.get("student_rollouts") or []:
+        if not isinstance(entry, dict):
+            continue
+        for score in entry.get("teacher_scores") or []:
+            if not isinstance(score, dict):
+                continue
+            if score.get("teacher_topk_log_probs") and score.get("teacher_topk_logprob_masks"):
+                continue
+            sidecar = score.get("teacher_topk_sidecar")
+            if not isinstance(sidecar, dict):
+                continue
+            log_probs, masks = _load_teacher_topk_sidecar(result_dir, sidecar)
+            score["teacher_topk_log_probs"] = log_probs
+            score["teacher_topk_logprob_masks"] = masks
+
+
 def load_result_tree(result_dir: str | Path) -> dict[str, Any]:
     """Load and validate an OPD relay result directory."""
     result_dir = Path(result_dir)
@@ -437,4 +492,5 @@ def load_result_tree(result_dir: str | Path) -> dict[str, Any]:
     status = result.get("status", "success")
     if status != "success":
         raise RuntimeError(f"OPD relay job failed: {result.get('error') or result}")
+    _hydrate_teacher_topk_sidecars(result, result_dir)
     return result
