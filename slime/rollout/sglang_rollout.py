@@ -115,10 +115,13 @@ def _extract_output_top_logprobs(meta: dict[str, Any], expected_len: int) -> tup
         return [], []
     idx_rows = meta.get("output_top_logprobs_idx") or meta.get("output_top_logprobs_token_ids")
     val_rows = meta.get("output_top_logprobs_val") or meta.get("output_top_logprobs_logprobs")
-    if isinstance(idx_rows, list) and isinstance(val_rows, list):
+    if isinstance(idx_rows, list):
         token_ids = [[int(x) for x in row] for row in idx_rows[-expected_len:] if isinstance(row, list)]
-        log_probs = [[float(x) for x in row] for row in val_rows[-expected_len:] if isinstance(row, list)]
-        if len(token_ids) == expected_len and len(log_probs) == expected_len:
+        if isinstance(val_rows, list):
+            log_probs = [[float(x) for x in row] for row in val_rows[-expected_len:] if isinstance(row, list)]
+        else:
+            log_probs = []
+        if len(token_ids) == expected_len and (not log_probs or len(log_probs) == expected_len):
             return token_ids, log_probs
 
     rows = meta.get("output_top_logprobs") or meta.get("top_logprobs") or []
@@ -253,6 +256,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         # SGLang 0.5.x expects top_logprobs_num at the /generate payload level,
         # not inside sampling_params.
         payload["top_logprobs_num"] = opd_topk
+        # OPD teacher scoring only needs the exact student top-k token ids.
+        # Student top-k logprobs are recomputed by the Megatron loss from the
+        # rollout-provided ids, so avoid returning per-token top-k values here.
+        payload["top_logprobs_ids_only"] = True
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
@@ -306,10 +313,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     if new_topk_token_ids and len(new_topk_token_ids) == len(new_response_tokens):
         if sample.rollout_topk_token_ids is None:
             sample.rollout_topk_token_ids = []
-        if sample.rollout_topk_log_probs is None:
-            sample.rollout_topk_log_probs = []
         sample.rollout_topk_token_ids += new_topk_token_ids
-        sample.rollout_topk_log_probs += new_topk_log_probs
+        if new_topk_log_probs and len(new_topk_log_probs) == len(new_response_tokens):
+            if sample.rollout_topk_log_probs is None:
+                sample.rollout_topk_log_probs = []
+            sample.rollout_topk_log_probs += new_topk_log_probs
 
     if "routed_experts" in output["meta_info"]:
         sample.rollout_routed_experts = np.frombuffer(

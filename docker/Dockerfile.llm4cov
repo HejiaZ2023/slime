@@ -41,7 +41,8 @@ COPY . /root/slime
 # per-position requested token ids. This keeps teacher scoring responses at
 # [response_chunk_len, topk] instead of [response_chunk_len, union(topk)].
 RUN cd /sgl-workspace/sglang && \
-    git apply -p1 /root/slime/docker/patch/llm4cov/opd_topk_token_ids_sglang.patch
+    git apply -p1 /root/slime/docker/patch/llm4cov/opd_topk_token_ids_sglang.patch && \
+    git apply -p1 /root/slime/docker/patch/llm4cov/opd_topk_ids_only_sglang.patch
 
 # Integrity check: fail the build early if the vendored llm4cov_oss is the gutted
 # version (missing the sftp transport / local-parquet loader) instead of the
