@@ -325,6 +325,18 @@ def _set_train_loss_type(sample: Sample, loss_type: str, **extra: Any) -> None:
     sample.train_metadata = meta
 
 
+def _student_opd_eligibility(sample: Sample) -> tuple[bool, str]:
+    if sample.status == Sample.Status.TRUNCATED:
+        return False, "student_truncated"
+    if int(sample.response_length or 0) <= 0:
+        return False, "student_empty_response"
+    eda_log = (sample.metadata or {}).get("_eda_log") or {}
+    eda_status = str(eda_log.get("status") or "")
+    if eda_status != "success":
+        return False, f"student_eda_status={eda_status or 'missing'}"
+    return True, "ok"
+
+
 def _prompt_to_text(
     prompt: str | list[dict[str, str]],
     tokenizer: Any,
@@ -936,6 +948,7 @@ async def _score_group_with_opd_relay(
         sample.metadata["opd_job_id"] = job_id
         sample.metadata["opd_best_student_reward"] = best_student_reward
         sample.metadata["opd_best_teacher_reward"] = best_teacher_reward
+        sample.metadata["opd_group_gate_pass"] = bool(gate_pass)
         sample.metadata["opd_gate_pass"] = bool(gate_pass)
 
     logger.info(
@@ -996,6 +1009,34 @@ async def _score_group_with_opd_relay(
         requested_topk = int(getattr(args, "opd_topk", 0) or 0)
         require_topk = requested_topk > 1
 
+        eligible_samples: list[Sample] = []
+        ineligible_reasons: dict[str, int] = {}
+        for sample in group:
+            eligible, reason = _student_opd_eligibility(sample)
+            if eligible:
+                eligible_samples.append(sample)
+                continue
+            sample.metadata["opd_gate_pass"] = False
+            sample.metadata["opd_gate_reason"] = reason
+            _set_train_loss_type(sample, "rl")
+            ineligible_reasons[reason] = ineligible_reasons.get(reason, 0) + 1
+
+        if ineligible_reasons:
+            logger.info(
+                "OPD_STUDENT_ELIGIBILITY step=%d dataset_id=%s round=%d job=%s "
+                "eligible=%d ineligible=%d reasons=%s",
+                rollout_id,
+                dataset_id,
+                round_idx + 1,
+                job_id,
+                len(eligible_samples),
+                len(group) - len(eligible_samples),
+                ",".join(f"{key}:{ineligible_reasons[key]}" for key in sorted(ineligible_reasons)),
+            )
+        if not eligible_samples:
+            _log_score_timing("gate_pass_but_no_eligible_student")
+            return group, group
+
         def _entry_for_sample(sample: Sample) -> dict[str, Any] | None:
             sid = str(sample.metadata.get("_opd_student_id", ""))
             return student_entries_by_id.get(sid)
@@ -1043,7 +1084,7 @@ async def _score_group_with_opd_relay(
         topk_by_index = {}
         topk_valid = bool(best_teacher_name) and require_topk
         if require_topk:
-            for sample in group:
+            for sample in eligible_samples:
                 expected = int(sample.response_length or 0)
                 width = requested_topk
                 packed = _student_teacher_topk(sample)
@@ -1077,12 +1118,13 @@ async def _score_group_with_opd_relay(
                 topk_by_index[int(sample.index)] = (topk_ids, student_topk, teacher_topk, teacher_masks)
 
         if topk_valid:
-            for sample in group:
+            for sample in eligible_samples:
                 topk_ids, student_topk, teacher_topk, teacher_masks = topk_by_index[int(sample.index)]
                 sample.rollout_topk_token_ids = topk_ids
                 sample.rollout_topk_log_probs = student_topk
                 sample.teacher_topk_log_probs = teacher_topk
                 sample.teacher_topk_logprob_masks = teacher_masks
+                sample.metadata["opd_gate_pass"] = True
                 sample.metadata["opd_teacher_logprob_teacher"] = best_teacher_name
                 sample.metadata["opd_topk"] = requested_topk
                 sample.metadata["opd_topk_teacher_coverage"] = (
@@ -1103,7 +1145,7 @@ async def _score_group_with_opd_relay(
         if not require_topk:
             valid_opd = bool(best_teacher_name)
             teacher_log_probs_by_index: dict[int, list[float]] = {}
-            for sample in group:
+            for sample in eligible_samples:
                 teacher_log_probs = _student_teacher_log_probs(sample)
                 expected = int(sample.response_length or 0)
                 if teacher_log_probs is None or len(teacher_log_probs) != expected:
@@ -1116,9 +1158,10 @@ async def _score_group_with_opd_relay(
                 teacher_log_probs_by_index[int(sample.index)] = teacher_log_probs
 
             if valid_opd:
-                for sample in group:
+                for sample in eligible_samples:
                     teacher_log_probs = teacher_log_probs_by_index[int(sample.index)]
                     sample.teacher_log_probs = teacher_log_probs
+                    sample.metadata["opd_gate_pass"] = True
                     sample.metadata["opd_teacher_logprob_teacher"] = best_teacher_name
                     sample.metadata["opd_teacher_logprob_tokens"] = len(teacher_log_probs)
                     _set_train_loss_type(
@@ -1132,7 +1175,7 @@ async def _score_group_with_opd_relay(
                 _log_score_timing("opd_logprob")
                 return group, group
 
-        for sample in group:
+        for sample in eligible_samples:
             sample.metadata["opd_gate_pass"] = False
             sample.metadata.setdefault(
                 "opd_gate_reason",
