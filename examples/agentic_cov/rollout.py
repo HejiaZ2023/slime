@@ -33,7 +33,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import os
 import re
+import threading
 import time
 import uuid
 from argparse import Namespace
@@ -323,6 +325,37 @@ def _set_train_loss_type(sample: Sample, loss_type: str, **extra: Any) -> None:
     meta["loss_type"] = loss_type
     meta.update(extra)
     sample.train_metadata = meta
+
+
+_FAKE_STUDENT_EDA_FAIL_COUNT = int(os.environ.get("OPD_FAKE_STUDENT_EDA_FAIL_COUNT", "0") or 0)
+_FAKE_STUDENT_EDA_FAIL_APPLIED = 0
+_FAKE_STUDENT_EDA_FAIL_LOCK = threading.Lock()
+
+
+def _maybe_fake_student_eda_fail(sample: Sample) -> bool:
+    """Smoke-test hook: mark a few student EDA results as failed before OPD gating."""
+    global _FAKE_STUDENT_EDA_FAIL_APPLIED
+    if _FAKE_STUDENT_EDA_FAIL_COUNT <= 0:
+        return False
+    meta = dict(sample.metadata or {})
+    if meta.get("opd_fake_student_eda_fail"):
+        return False
+    with _FAKE_STUDENT_EDA_FAIL_LOCK:
+        if _FAKE_STUDENT_EDA_FAIL_APPLIED >= _FAKE_STUDENT_EDA_FAIL_COUNT:
+            return False
+        _FAKE_STUDENT_EDA_FAIL_APPLIED += 1
+
+    eda_log = dict(meta.get("_eda_log") or {})
+    eda_log["fake_original_status"] = eda_log.get("status")
+    eda_log["status"] = "fake_fail"
+    eda_log["has_coverage"] = False
+    eda_log["overall_coverage"] = 0.0
+    eda_log["is_pass_targets"] = False
+    eda_log["err_msg"] = "OPD smoke injected fake student EDA fail"
+    meta["_eda_log"] = eda_log
+    meta["opd_fake_student_eda_fail"] = True
+    sample.metadata = meta
+    return True
 
 
 def _student_opd_eligibility(sample: Sample) -> tuple[bool, str]:
@@ -1012,10 +1045,20 @@ async def _score_group_with_opd_relay(
         eligible_samples: list[Sample] = []
         ineligible_reasons: dict[str, int] = {}
         for sample in group:
+            if _maybe_fake_student_eda_fail(sample):
+                logger.info(
+                    "OPD_FAKE_STUDENT_EDA_FAIL step=%d dataset_id=%s round=%d job=%s sample_id=%s",
+                    rollout_id,
+                    dataset_id,
+                    round_idx + 1,
+                    job_id,
+                    (sample.metadata or {}).get("_opd_student_id", ""),
+                )
             eligible, reason = _student_opd_eligibility(sample)
             if eligible:
                 eligible_samples.append(sample)
                 continue
+            sample.metadata = dict(sample.metadata or {})
             sample.metadata["opd_gate_pass"] = False
             sample.metadata["opd_gate_reason"] = reason
             _set_train_loss_type(sample, "rl")
