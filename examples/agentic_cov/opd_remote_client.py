@@ -9,9 +9,11 @@ jobs separate while still using the same mounted SFTP paths.
 
 from __future__ import annotations
 
-import contextlib
 import base64
+import contextlib
+import gzip
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -25,6 +27,11 @@ import urllib.request
 
 
 SCHEMA_VERSION = "opd_exchange_v1"
+COMPACT_STUDENT_REQUEST = os.environ.get("OPD_COMPACT_STUDENT_REQUEST", "1") != "0"
+STUDENT_REQUEST_ARRAY_DTYPES = {
+    "input_token_ids": "int32",
+    "topk_token_ids": "int32",
+}
 
 
 def _json_dumps(obj: Any) -> str:
@@ -60,6 +67,43 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(obj, dict):
         raise ValueError(f"expected JSON object at {path}")
     return obj
+
+
+def _attach_student_tensor_sidecar(files: dict[str, bytes], base: str, meta: dict[str, Any]) -> None:
+    """Move large student scoring arrays out of JSON into a compact npz sidecar."""
+    if not COMPACT_STUDENT_REQUEST:
+        return
+
+    import numpy as np  # type: ignore[import-untyped]
+
+    arrays: dict[str, Any] = {}
+    array_meta: dict[str, dict[str, Any]] = {}
+    for key, dtype in STUDENT_REQUEST_ARRAY_DTYPES.items():
+        if key not in meta:
+            continue
+        value = meta.get(key)
+        if value is None or (isinstance(value, (list, tuple)) and len(value) == 0):
+            continue
+        arr = np.asarray(value, dtype=dtype)
+        if arr.size == 0:
+            continue
+        arrays[key] = arr
+        array_meta[key] = {"dtype": str(arr.dtype), "shape": [int(dim) for dim in arr.shape]}
+        meta.pop(key, None)
+
+    if not arrays:
+        return
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **arrays)
+    data = buf.getvalue()
+    rel = f"{base}/student_tensors.npz"
+    files[rel] = data
+    meta["student_tensor_sidecar"] = {
+        "format": "student_npz_v1",
+        "file": rel,
+        "sha256": _sha256_bytes(data),
+        "arrays": array_meta,
+    }
 
 
 @dataclass(frozen=True)
@@ -315,6 +359,10 @@ class _HttpTransport:
             self.base_url = f"http://{self.base_url}"
         self.namespace = namespace
         self.token = token
+        self.gzip_requests = os.environ.get("OPD_HTTP_GZIP", "1") != "0"
+        self._last_request_wire_bytes = 0
+        self._last_request_uncompressed_bytes = 0
+        self._last_response_wire_bytes = 0
         self.last_timing: dict[str, Any] = {}
         started = time.monotonic()
         self._request_json("GET", "/healthz", timeout=10)
@@ -325,23 +373,35 @@ class _HttpTransport:
         }
 
     def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "Accept-Encoding": "gzip"}
         if self.token:
             headers["X-OPD-Token"] = self.token
         return headers
 
     def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None, timeout: float = 30) -> dict[str, Any]:
         body = None
+        headers = self._headers()
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            self._last_request_uncompressed_bytes = len(body)
+            if self.gzip_requests:
+                body = gzip.compress(body)
+                headers["Content-Encoding"] = "gzip"
+        else:
+            self._last_request_uncompressed_bytes = 0
+        self._last_request_wire_bytes = len(body or b"")
         req = urllib.request.Request(
             f"{self.base_url}{path}",
             data=body,
-            headers=self._headers(),
+            headers=headers,
             method=method,
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = resp.read()
+            encoding = resp.headers.get("Content-Encoding", "")
+        self._last_response_wire_bytes = len(data)
+        if "gzip" in encoding.lower():
+            data = gzip.decompress(data)
         if not data:
             return {}
         obj = json.loads(data.decode("utf-8"))
@@ -356,7 +416,9 @@ class _HttpTransport:
             for rel, data in files.items()
         }
         payload = {"schema": SCHEMA_VERSION, "files": encoded}
-        wire_bytes = len(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        wire_uncompressed_bytes = len(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
         upload_started = time.monotonic()
         obj = self._request_json("POST", f"/jobs/{self.namespace}/{job_id}", payload, timeout=120)
         upload_seconds = time.monotonic() - upload_started
@@ -367,7 +429,9 @@ class _HttpTransport:
             "upload_seconds": upload_seconds,
             "file_count": len(files),
             "payload_bytes": sum(len(data) for data in files.values()),
-            "wire_bytes": wire_bytes,
+            "wire_bytes": self._last_request_wire_bytes,
+            "wire_uncompressed_bytes": wire_uncompressed_bytes,
+            "compression": "gzip" if self.gzip_requests else "none",
             "transport": "http",
         }
 
@@ -404,7 +468,8 @@ class _HttpTransport:
                     "download_request_seconds": request_seconds,
                     "download_files": download_files,
                     "download_bytes": download_bytes,
-                    "wire_bytes": int(obj.get("payload_bytes") or 0),
+                    "wire_bytes": self._last_response_wire_bytes,
+                    "result_payload_bytes": int(obj.get("payload_bytes") or 0),
                     "polls": polls,
                     "result_path": str(local),
                     "transport": "http",
@@ -451,7 +516,7 @@ class OpdRelayClient:
     def submit(self, job_id: str, files: dict[str, bytes]) -> None:
         self.transport.submit(job_id, files)
 
-    def wait_result(self, job_id: str, *, timeout_s: float, poll_s: float = 2.0) -> Path:
+    def wait_result(self, job_id: str, *, timeout_s: float, poll_s: float = 1.0) -> Path:
         return self.transport.wait_result(job_id, timeout_s=timeout_s, poll_s=poll_s)
 
     def submit_and_wait(
@@ -460,7 +525,7 @@ class OpdRelayClient:
         files: dict[str, bytes],
         *,
         timeout_s: float,
-        poll_s: float = 2.0,
+        poll_s: float = 1.0,
     ) -> Path:
         self.submit(job_id, files)
         return self.wait_result(job_id, timeout_s=timeout_s, poll_s=poll_s)
@@ -521,6 +586,7 @@ def build_round_files(
             }
         }
         files[f"{base}/assistant_response.txt"] = _encode_text(response)
+        _attach_student_tensor_sidecar(files, base, meta)
         files[f"{base}/meta.json"] = _encode_text(_json_dumps(meta))
         if rollout.get("testbench") is not None:
             files[f"{base}/testbench.sv"] = _encode_text(str(rollout["testbench"]))

@@ -199,7 +199,7 @@ def add_agentic_args(parser):
     parser.add_argument(
         "--opd-poll",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Polling interval in seconds while waiting for OPD relay results.",
     )
     parser.add_argument(

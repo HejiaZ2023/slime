@@ -87,6 +87,8 @@ DIV_LAM=""
 SKIP_EVAL_BEFORE_TRAIN=0
 OVERRIDE_OPT_PARAM_SCHEDULER=${OVERRIDE_OPT_PARAM_SCHEDULER:-0}
 OPD_ARGS=()
+OPD_POLL=${OPD_POLL:-1}
+OPD_POLL_SPECIFIED=0
 NO_FINAL_SAVE=${NO_FINAL_SAVE:-auto}
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -128,14 +130,19 @@ while [ $# -gt 0 ]; do
                                   N_STUDENT="${1#*=}" ;;
         --use-opd-relay|--opd-score-student-rollouts)
                                   OPD_ARGS+=("$1") ;;
-        --opd-teachers|--opd-lambda|--opd-topk|--opd-gate-eps|--opd-timeout|--opd-poll|--opd-namespace|--opd-server|--opd-transport|--opd-http-url|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
+        --opd-poll)               OPD_POLL="${2:?--opd-poll requires a value}"; OPD_POLL_SPECIFIED=1; OPD_ARGS+=("$1" "${OPD_POLL}"); shift ;;
+        --opd-poll=*)             OPD_POLL="${1#--opd-poll=}"; OPD_POLL_SPECIFIED=1; OPD_ARGS+=("$1") ;;
+        --opd-teachers|--opd-lambda|--opd-topk|--opd-gate-eps|--opd-timeout|--opd-namespace|--opd-server|--opd-transport|--opd-http-url|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
                                   OPD_ARGS+=("$1" "${2:?$1 requires a value}"); shift ;;
-        --opd-teachers=*|--opd-lambda=*|--opd-topk=*|--opd-gate-eps=*|--opd-timeout=*|--opd-poll=*|--opd-namespace=*|--opd-server=*|--opd-transport=*|--opd-http-url=*|--opd-xfer-dir=*|--opd-sftp-host=*|--opd-sftp-port=*|--opd-sftp-user=*|--opd-sftp-key=*)
+        --opd-teachers=*|--opd-lambda=*|--opd-topk=*|--opd-gate-eps=*|--opd-timeout=*|--opd-namespace=*|--opd-server=*|--opd-transport=*|--opd-http-url=*|--opd-xfer-dir=*|--opd-sftp-host=*|--opd-sftp-port=*|--opd-sftp-user=*|--opd-sftp-key=*)
                                   OPD_ARGS+=("$1") ;;
         *) echo "[run] Unknown argument: $1" >&2; exit 1 ;;
     esac
     shift
 done
+if [ "${#OPD_ARGS[@]}" -gt 0 ] && [ "${OPD_POLL_SPECIFIED}" = "0" ]; then
+    OPD_ARGS+=(--opd-poll "${OPD_POLL}")
+fi
 
 # clean up stale ray / sglang / python from prior runs
 pkill -9 sglang 2>/dev/null || true

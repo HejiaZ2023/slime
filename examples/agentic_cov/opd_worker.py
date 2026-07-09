@@ -51,7 +51,7 @@ IN = XFER / "incoming" / NAMESPACE
 RES = XFER / "results" / NAMESPACE
 WORK = XFER / ".work" / NAMESPACE
 STATE = XFER / ".state" / NAMESPACE
-POLL_SEC = float(os.environ.get("OPD_POLL_SEC", "2"))
+POLL_SEC = float(os.environ.get("OPD_POLL_SEC", "1"))
 JOB_TTL = int(os.environ.get("OPD_JOB_TTL", "0"))  # 0 keeps OPD audit artifacts indefinitely
 QUEUE_CLAIM_TTL = float(os.environ.get("OPD_QUEUE_CLAIM_TTL", "7200"))
 WORKER_ID = re.sub(
@@ -485,8 +485,15 @@ class HttpOpdQueue(LocalOpdQueue):
 
             def _json_response(self, status: int, obj: dict[str, Any]) -> None:
                 body = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                if "gzip" in self.headers.get("Accept-Encoding", "").lower():
+                    body = gzip.compress(body)
+                    encoding = "gzip"
+                else:
+                    encoding = ""
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                if encoding:
+                    self.send_header("Content-Encoding", encoding)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -555,7 +562,14 @@ class HttpOpdQueue(LocalOpdQueue):
                     if length <= 0 or length > queue.max_body_bytes:
                         self._json_response(413, {"ok": False, "job_id": job_id, "error": "request_too_large"})
                         return
-                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    raw_body = self.rfile.read(length)
+                    wire_bytes = len(raw_body)
+                    if "gzip" in self.headers.get("Content-Encoding", "").lower():
+                        raw_body = gzip.decompress(raw_body)
+                    if len(raw_body) > queue.max_body_bytes:
+                        self._json_response(413, {"ok": False, "job_id": job_id, "error": "request_too_large"})
+                        return
+                    payload = json.loads(raw_body.decode("utf-8"))
                     raw_files = payload.get("files") if isinstance(payload, dict) else None
                     if not isinstance(raw_files, dict):
                         raise ValueError("missing files object")
@@ -569,6 +583,8 @@ class HttpOpdQueue(LocalOpdQueue):
                         job_id,
                         f"files={file_count}",
                         f"bytes={byte_count}",
+                        f"wire_bytes={wire_bytes}",
+                        f"json_bytes={len(raw_body)}",
                         f"seconds={time.monotonic() - started:.3f}",
                     )
                     self._json_response(
@@ -578,6 +594,8 @@ class HttpOpdQueue(LocalOpdQueue):
                             "job_id": job_id,
                             "file_count": file_count,
                             "payload_bytes": byte_count,
+                            "wire_bytes": wire_bytes,
+                            "json_bytes": len(raw_body),
                             "seconds": time.monotonic() - started,
                         },
                     )
@@ -1382,10 +1400,47 @@ def score_teacher_on_student(
     return result
 
 
+def _hydrate_student_tensor_sidecar(job: Path, base: Path, meta: dict[str, Any]) -> None:
+    sidecar = meta.get("student_tensor_sidecar") or meta.get("tensor_sidecar")
+    if not isinstance(sidecar, dict):
+        return
+    rel = _safe_relpath(str(sidecar.get("file") or ""))
+    path = job / rel
+    if not path.exists():
+        path = base / rel
+    if not path.exists():
+        raise FileNotFoundError(f"missing OPD student tensor sidecar: {rel}")
+    expected_sha = str(sidecar.get("sha256") or "")
+    if expected_sha:
+        actual_sha = _sha256_file(path)
+        if actual_sha != expected_sha:
+            raise ValueError(f"bad OPD student sidecar sha256 for {path}: {actual_sha} != {expected_sha}")
+    if sidecar.get("format") != "student_npz_v1":
+        raise ValueError(f"unsupported OPD student sidecar format at {path}: {sidecar.get('format')!r}")
+
+    import numpy as np  # type: ignore[import-untyped]
+
+    allowed = {"input_token_ids", "response_token_ids", "rollout_log_probs", "topk_token_ids", "topk_student_log_probs"}
+    specs = sidecar.get("arrays") if isinstance(sidecar.get("arrays"), dict) else {}
+    with np.load(path, allow_pickle=False) as data:
+        for key in data.files:
+            if key not in allowed:
+                continue
+            arr = data[key]
+            spec = specs.get(key) if isinstance(specs, dict) else None
+            expected_shape = spec.get("shape") if isinstance(spec, dict) else None
+            if isinstance(expected_shape, list):
+                shape = tuple(int(dim) for dim in expected_shape)
+                if tuple(arr.shape) != shape:
+                    raise ValueError(f"bad OPD student sidecar shape for {key}: {arr.shape} != {shape}")
+            meta[key] = arr.tolist()
+
+
 def score_student(job: Path, entry: dict[str, Any], context: SimpleNamespace, want_detail: bool) -> dict[str, Any]:
     sid = str(entry.get("id"))
     base = job / str(entry.get("path", f"student/{sid}"))
     meta = read_json(base / "meta.json") if (base / "meta.json").exists() else {}
+    _hydrate_student_tensor_sidecar(job, base, meta)
     response = (base / "assistant_response.txt").read_text(encoding="utf-8")
     filename = meta.get("filename") or extract_filename(response) or f"{sid}.sv"
     if (base / "testbench.sv").exists():

@@ -752,7 +752,7 @@ def _run_opd_teacher_round_sync(
         result_dir = client.wait_result(
             job_id,
             timeout_s=float(getattr(args, "opd_timeout", 1800.0) or 1800.0),
-            poll_s=float(getattr(args, "opd_poll", 2.0) or 2.0),
+            poll_s=float(getattr(args, "opd_poll", 1.0) or 1.0),
         )
         load_started = time.monotonic()
         result = load_result_tree(result_dir)
@@ -826,7 +826,7 @@ def _run_opd_relay_round_sync(
             job_id,
             files,
             timeout_s=float(getattr(args, "opd_timeout", 1800.0) or 1800.0),
-            poll_s=float(getattr(args, "opd_poll", 2.0) or 2.0),
+            poll_s=float(getattr(args, "opd_poll", 1.0) or 1.0),
         )
         load_started = time.monotonic()
         result = load_result_tree(result_dir)
@@ -904,7 +904,7 @@ def _run_opd_score_round_sync(
             score_job_id,
             files,
             timeout_s=float(getattr(args, "opd_timeout", 1800.0) or 1800.0),
-            poll_s=float(getattr(args, "opd_poll", 2.0) or 2.0),
+            poll_s=float(getattr(args, "opd_poll", 1.0) or 1.0),
         )
         load_started = time.monotonic()
         result = load_result_tree(result_dir)
