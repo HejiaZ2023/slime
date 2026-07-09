@@ -85,6 +85,7 @@ USE_UNCOVERED_LOG=0
 USE_UNCOVERED_REWARD=0
 DIV_LAM=""
 SKIP_EVAL_BEFORE_TRAIN=0
+OVERRIDE_OPT_PARAM_SCHEDULER=${OVERRIDE_OPT_PARAM_SCHEDULER:-0}
 OPD_ARGS=()
 NO_FINAL_SAVE=${NO_FINAL_SAVE:-auto}
 while [ $# -gt 0 ]; do
@@ -97,6 +98,8 @@ while [ $# -gt 0 ]; do
         --div-lam)                DIV_LAM="${2:?--div-lam requires a value}"; shift ;;
         --div-lam=*)              DIV_LAM="${1#--div-lam=}" ;;
         --skip-eval-before-train|--skip-eval) SKIP_EVAL_BEFORE_TRAIN=1 ;;
+        --override-opt-param-scheduler|--override-optimizer-scheduler)
+                                  OVERRIDE_OPT_PARAM_SCHEDULER=1 ;;
         --interval)               CKPT_INTERVAL="${2:?--interval requires a value}"; shift ;;
         --interval=*)             CKPT_INTERVAL="${1#--interval=}" ;;
         --steps)                  NUM_ROLLOUT="${2:?--steps requires a value}"; shift ;;
@@ -515,6 +518,10 @@ MISC_ARGS=(
    --optimizer-cpu-offload
    --use-precision-aware-optimizer
 )
+if [ "${OVERRIDE_OPT_PARAM_SCHEDULER}" = "1" ]; then
+   MISC_ARGS+=(--override-opt-param-scheduler)
+   echo "[run] override-opt-param-scheduler enabled: current run scheduler config overrides checkpoint scheduler metadata" | tee -a "${LOCAL_LOG}"
+fi
 
 WANDB_ARGS=(
    --use-wandb
