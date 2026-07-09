@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """OPD teacher/EDA relay worker for llm4cov.
 
-Runs on paladin next to the existing xfer watcher.  Slime publishes jobs under
+Runs either on Paladin next to the existing xfer watcher or on a remote
+teacher GPU host with OPD_QUEUE_TRANSPORT=sftp. Slime publishes jobs under
 incoming/<namespace>/<job_id>; this worker generates teacher rollouts, evaluates
 student and teacher testbenches through the existing EDA xfer watcher, and
 publishes results under results/<namespace>/<job_id>.
@@ -36,7 +37,11 @@ if LLM4COV_SRC.exists():
 
 from llm4cov.eda_client.xfer_client import submit_cov_job  # noqa: E402
 
-XFER = Path(os.environ.get("OPD_XFER_DIR", "/mnt/raid0_ssd/eda/xfer"))
+QUEUE_TRANSPORT = os.environ.get("OPD_QUEUE_TRANSPORT", "local").strip().lower()
+if QUEUE_TRANSPORT == "sftp":
+    XFER = Path(os.environ.get("OPD_LOCAL_XFER_DIR", "/tmp/llm4cov_opd_worker_xfer"))
+else:
+    XFER = Path(os.environ.get("OPD_XFER_DIR", "/mnt/raid0_ssd/eda/xfer"))
 NAMESPACE = os.environ.get("OPD_NAMESPACE", "opd")
 IN = XFER / "incoming" / NAMESPACE
 RES = XFER / "results" / NAMESPACE
@@ -44,6 +49,12 @@ WORK = XFER / ".work" / NAMESPACE
 STATE = XFER / ".state" / NAMESPACE
 POLL_SEC = float(os.environ.get("OPD_POLL_SEC", "2"))
 JOB_TTL = int(os.environ.get("OPD_JOB_TTL", "0"))  # 0 keeps OPD audit artifacts indefinitely
+QUEUE_CLAIM_TTL = float(os.environ.get("OPD_QUEUE_CLAIM_TTL", "7200"))
+WORKER_ID = re.sub(
+    r"[^A-Za-z0-9_.-]",
+    "_",
+    os.environ.get("OPD_WORKER_ID", f"{os.uname().nodename}-{os.getpid()}"),
+)
 MAX_CONCURRENT_JOBS = int(os.environ.get("OPD_MAX_CONCURRENT_JOBS", "4"))
 MAX_JOB_WORKERS = int(os.environ.get("OPD_MAX_JOB_WORKERS", "4"))
 TEACHER_TIMEOUT = float(os.environ.get("OPD_TEACHER_TIMEOUT", "900"))
@@ -65,6 +76,7 @@ MOCK = os.environ.get("OPD_MOCK", "0") == "1"
 _JOB_SEM = threading.Semaphore(MAX_CONCURRENT_JOBS)
 _LOCK = threading.Lock()
 _INFLIGHT: set[str] = set()
+QUEUE_BACKEND: Any | None = None
 
 _CODE_RE = re.compile(r"```(?:verilog|systemverilog|sv)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _MODULE_RE = re.compile(r"(module\s+[\s\S]*?endmodule)", re.IGNORECASE)
@@ -112,6 +124,13 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _safe_relpath(path: str) -> str:
+    rel = Path(path)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError(f"unsafe relative path: {path!r}")
+    return rel.as_posix()
+
+
 def _summary_count(obj: dict[str, Any], key: str) -> int:
     value = obj.get(key)
     return len(value) if isinstance(value, list) else 0
@@ -142,6 +161,231 @@ def append_index(summary: dict[str, Any]) -> None:
     with _LOCK:
         with index.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+
+
+class LocalOpdQueue:
+    def prepare(self) -> None:
+        for d in (IN, RES, WORK, STATE):
+            d.mkdir(parents=True, exist_ok=True)
+
+    def poll_jobs(self) -> list[Path]:
+        jobs: list[Path] = []
+        with contextlib.suppress(Exception):
+            os.utime(IN, None)
+            os.utime(RES, None)
+        for job in sorted(IN.iterdir()) if IN.exists() else []:
+            if not job.is_dir() or job.name.endswith(".staging"):
+                continue
+            if not (job / "manifest.json").exists():
+                continue
+            if (STATE / f"{job.name}.processed").exists():
+                continue
+            with _LOCK:
+                if job.name in _INFLIGHT:
+                    continue
+                _INFLIGHT.add(job.name)
+            jobs.append(job)
+        return jobs
+
+    def publish_result(self, job_id: str, final_dir: Path, summary: dict[str, Any]) -> None:
+        return None
+
+    def finish_job(self, job_id: str) -> None:
+        return None
+
+
+class SftpOpdQueue:
+    def __init__(self) -> None:
+        import paramiko  # type: ignore[import-untyped]
+
+        host = os.environ.get("OPD_QUEUE_SFTP_HOST") or os.environ.get("OPD_SFTP_HOST") or "100.124.95.10"
+        port = int(os.environ.get("OPD_QUEUE_SFTP_PORT") or os.environ.get("OPD_SFTP_PORT") or "2222")
+        user = os.environ.get("OPD_QUEUE_SFTP_USER") or os.environ.get("OPD_SFTP_USER") or "gpujobs"
+        key = os.environ.get("OPD_QUEUE_SFTP_KEY") or os.environ.get("OPD_SFTP_KEY") or os.path.expanduser("~/.ssh/brev_eda_sftp")
+        started = time.monotonic()
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.client.connect(
+            host,
+            port=port,
+            username=user,
+            key_filename=key,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=20,
+        )
+        self.sftp = self.client.open_sftp()
+        self.remote_in = f"incoming/{NAMESPACE}"
+        self.remote_res = f"results/{NAMESPACE}"
+        self.remote_claims = f".state/{NAMESPACE}/claims"
+        log("OPD_QUEUE_SFTP_CONNECTED", f"host={host}", f"port={port}", f"user={user}", f"seconds={time.monotonic() - started:.3f}")
+
+    def prepare(self) -> None:
+        for d in (IN, RES, WORK, STATE):
+            d.mkdir(parents=True, exist_ok=True)
+        for remote in (self.remote_in, self.remote_res, self.remote_claims):
+            self._mkdirs(remote)
+
+    def _mkdirs(self, path: str) -> None:
+        cur = ""
+        for part in path.strip("/").split("/"):
+            if not part:
+                continue
+            cur = f"{cur}/{part}" if cur else part
+            with contextlib.suppress(OSError):
+                self.sftp.mkdir(cur)
+
+    def _exists(self, path: str) -> bool:
+        try:
+            self.sftp.stat(path)
+            return True
+        except OSError:
+            return False
+
+    def _is_dir_attr(self, attr: Any) -> bool:
+        return bool(getattr(attr, "st_mode", 0) & 0o040000)
+
+    def _rmtree(self, path: str) -> None:
+        try:
+            entries = self.sftp.listdir_attr(path)
+        except OSError:
+            return
+        for entry in entries:
+            child = f"{path}/{entry.filename}"
+            if self._is_dir_attr(entry):
+                self._rmtree(child)
+            else:
+                with contextlib.suppress(OSError):
+                    self.sftp.remove(child)
+        with contextlib.suppress(OSError):
+            self.sftp.rmdir(path)
+
+    def _download_tree(self, remote_dir: str, local_dir: Path) -> tuple[int, int]:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        file_count = 0
+        byte_count = 0
+        for entry in self.sftp.listdir_attr(remote_dir):
+            remote_child = f"{remote_dir}/{entry.filename}"
+            local_child = local_dir / entry.filename
+            if self._is_dir_attr(entry):
+                child_files, child_bytes = self._download_tree(remote_child, local_child)
+                file_count += child_files
+                byte_count += child_bytes
+            else:
+                local_child.parent.mkdir(parents=True, exist_ok=True)
+                self.sftp.get(remote_child, str(local_child))
+                file_count += 1
+                byte_count += int(getattr(entry, "st_size", 0) or 0)
+        return file_count, byte_count
+
+    def _upload_tree(self, local_dir: Path, remote_dir: str) -> tuple[int, int]:
+        file_count = 0
+        byte_count = 0
+        self._mkdirs(remote_dir)
+        for path in sorted(local_dir.rglob("*")):
+            if path.is_dir():
+                continue
+            rel = _safe_relpath(path.relative_to(local_dir).as_posix())
+            remote_path = f"{remote_dir}/{rel}"
+            self._mkdirs(str(Path(remote_path).parent).replace("\\", "/"))
+            self.sftp.put(str(path), remote_path)
+            file_count += 1
+            byte_count += path.stat().st_size
+        return file_count, byte_count
+
+    def _claim_job(self, job_id: str) -> bool:
+        if self._exists(f"{self.remote_res}/{job_id}/.done"):
+            return False
+        claim_dir = f"{self.remote_claims}/{job_id}"
+        try:
+            self.sftp.mkdir(claim_dir)
+        except OSError:
+            try:
+                age = time.time() - float(self.sftp.stat(claim_dir).st_mtime)
+            except OSError:
+                age = 0.0
+            if QUEUE_CLAIM_TTL > 0 and age > QUEUE_CLAIM_TTL:
+                log("OPD_QUEUE_STALE_CLAIM", job_id, f"age={age:.1f}")
+                self._rmtree(claim_dir)
+                try:
+                    self.sftp.mkdir(claim_dir)
+                except OSError:
+                    return False
+            else:
+                return False
+        meta = {
+            "worker_id": WORKER_ID,
+            "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "claimed_at_unix": time.time(),
+        }
+        with self.sftp.open(f"{claim_dir}/worker.json", "w") as f:
+            f.write(json.dumps(meta, ensure_ascii=False, sort_keys=True))
+        return True
+
+    def _release_claim(self, job_id: str) -> None:
+        self._rmtree(f"{self.remote_claims}/{job_id}")
+
+    def poll_jobs(self) -> list[Path]:
+        jobs: list[Path] = []
+        try:
+            entries = self.sftp.listdir_attr(self.remote_in)
+        except OSError:
+            return jobs
+        for entry in sorted(entries, key=lambda item: item.filename):
+            job_id = entry.filename
+            if not self._is_dir_attr(entry) or job_id.endswith(".staging"):
+                continue
+            if self._exists(f"{self.remote_res}/{job_id}/.done"):
+                continue
+            if not self._exists(f"{self.remote_in}/{job_id}/manifest.json"):
+                continue
+            with _LOCK:
+                if job_id in _INFLIGHT:
+                    continue
+                _INFLIGHT.add(job_id)
+            if not self._claim_job(job_id):
+                with _LOCK:
+                    _INFLIGHT.discard(job_id)
+                continue
+            local_job = IN / job_id
+            try:
+                if local_job.exists():
+                    shutil.rmtree(local_job)
+                started = time.monotonic()
+                files, bytes_ = self._download_tree(f"{self.remote_in}/{job_id}", local_job)
+                log("OPD_QUEUE_DOWNLOAD", job_id, f"files={files}", f"bytes={bytes_}", f"seconds={time.monotonic() - started:.3f}")
+                jobs.append(local_job)
+            except Exception as exc:
+                log("OPD_QUEUE_DOWNLOAD_FAIL", job_id, exc)
+                self._release_claim(job_id)
+                with _LOCK:
+                    _INFLIGHT.discard(job_id)
+        return jobs
+
+    def publish_result(self, job_id: str, final_dir: Path, summary: dict[str, Any]) -> None:
+        staging = f"{self.remote_res}/{job_id}.staging.{WORKER_ID}"
+        final = f"{self.remote_res}/{job_id}"
+        started = time.monotonic()
+        self._rmtree(staging)
+        self._mkdirs(staging)
+        files, bytes_ = self._upload_tree(final_dir, staging)
+        self._rmtree(final)
+        self.sftp.posix_rename(staging, final)
+        with contextlib.suppress(Exception):
+            with self.sftp.open(f"{self.remote_res}/index.jsonl", "a") as f:
+                f.write(json.dumps(summary, ensure_ascii=False, sort_keys=True) + "\n")
+        log("OPD_QUEUE_UPLOAD", job_id, f"files={files}", f"bytes={bytes_}", f"seconds={time.monotonic() - started:.3f}")
+
+    def finish_job(self, job_id: str) -> None:
+        self._release_claim(job_id)
+
+
+def build_queue_backend() -> Any:
+    if QUEUE_TRANSPORT == "local":
+        return LocalOpdQueue()
+    if QUEUE_TRANSPORT == "sftp":
+        return SftpOpdQueue()
+    raise ValueError(f"unknown OPD_QUEUE_TRANSPORT={QUEUE_TRANSPORT!r}")
 
 
 def safe_filename(name: str | None, default: str = "tb_generated.sv") -> str:
@@ -1131,9 +1375,16 @@ def publish(job_id: str, obj: dict[str, Any]) -> None:
     os.rename(staging, final)
     summary_obj = read_json(final / "result.json")
     summary = summarize_result(summary_obj, final)
+    summary["worker_id"] = WORKER_ID
+    summary["queue_transport"] = QUEUE_TRANSPORT
+    if QUEUE_TRANSPORT == "sftp":
+        summary["remote_result_dir"] = f"results/{NAMESPACE}/{job_id}"
+        summary["remote_result_file"] = f"results/{NAMESPACE}/{job_id}/result.json"
     write_json(final / "summary.json", summary)
     append_index(summary)
     (final / ".done").write_text("", encoding="utf-8")
+    if QUEUE_BACKEND is not None:
+        QUEUE_BACKEND.publish_result(job_id, final, summary)
 
 
 def process(job: Path) -> None:
@@ -1278,6 +1529,10 @@ def process(job: Path) -> None:
                 "selection": sel,
                 "elapsed_s": time.time() - started_wall,
                 "timing": timing,
+                "teacher_worker": {
+                    "id": WORKER_ID,
+                    "queue_transport": QUEUE_TRANSPORT,
+                },
             }
             publish_started = time.monotonic()
             publish(job_id, result)
@@ -1303,12 +1558,19 @@ def process(job: Path) -> None:
                 "traceback": traceback.format_exc(),
                 "elapsed_s": time.time() - started_wall,
                 "timing": {**timing, "worker_total_before_failure_seconds": time.monotonic() - started},
+                "teacher_worker": {
+                    "id": WORKER_ID,
+                    "queue_transport": QUEUE_TRANSPORT,
+                },
             }
             publish(job_id, result)
             log("FAIL", job_id, exc)
         finally:
             STATE.mkdir(parents=True, exist_ok=True)
             (STATE / f"{job_id}.processed").write_text(str(time.time()), encoding="utf-8")
+            if QUEUE_BACKEND is not None:
+                with contextlib.suppress(Exception):
+                    QUEUE_BACKEND.finish_job(job_id)
             with _LOCK:
                 _INFLIGHT.discard(job_id)
 
@@ -1329,26 +1591,17 @@ def gc() -> None:
 
 
 def main() -> None:
-    for d in (IN, RES, WORK, STATE):
-        d.mkdir(parents=True, exist_ok=True)
-    log(f"opd worker start XFER={XFER} namespace={NAMESPACE} mock={MOCK} max_jobs={MAX_CONCURRENT_JOBS}")
+    global QUEUE_BACKEND
+    QUEUE_BACKEND = build_queue_backend()
+    QUEUE_BACKEND.prepare()
+    log(
+        f"opd worker start XFER={XFER} namespace={NAMESPACE} mock={MOCK} "
+        f"max_jobs={MAX_CONCURRENT_JOBS} queue={QUEUE_TRANSPORT} worker_id={WORKER_ID}"
+    )
     last_gc = 0.0
     while True:
         now = time.time()
-        with contextlib.suppress(Exception):
-            os.utime(IN, None)
-            os.utime(RES, None)
-        for job in sorted(IN.iterdir()) if IN.exists() else []:
-            if not job.is_dir() or job.name.endswith(".staging"):
-                continue
-            if not (job / "manifest.json").exists():
-                continue
-            if (STATE / f"{job.name}.processed").exists():
-                continue
-            with _LOCK:
-                if job.name in _INFLIGHT:
-                    continue
-                _INFLIGHT.add(job.name)
+        for job in QUEUE_BACKEND.poll_jobs():
             threading.Thread(target=process, args=(job,), daemon=True).start()
         if now - last_gc > 300:
             gc()
