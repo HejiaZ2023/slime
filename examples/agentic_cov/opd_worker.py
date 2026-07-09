@@ -1631,7 +1631,9 @@ def process(job: Path) -> None:
     started_wall = time.time()
     started = time.monotonic()
     timing: dict[str, Any] = {}
+    sem_wait_started = time.monotonic()
     with _JOB_SEM:
+        timing["job_semaphore_wait_seconds"] = time.monotonic() - sem_wait_started
         try:
             phase_started = time.monotonic()
             manifest = read_json(job / "manifest.json")
@@ -1878,7 +1880,25 @@ def process(job: Path) -> None:
                         ):
                             entry.pop(key, None)
 
-            timing["worker_total_before_publish_seconds"] = time.monotonic() - started
+            worker_before_publish = time.monotonic() - started
+            accounted_before_publish = sum(
+                float(timing.get(key, 0.0) or 0.0)
+                for key in (
+                    "job_semaphore_wait_seconds",
+                    "load_request_seconds",
+                    "student_eda_seconds",
+                    "parse_teacher_request_seconds",
+                    "load_teacher_rollouts_seconds",
+                    "teacher_pipeline_seconds",
+                    "selection_seconds",
+                    "teacher_score_student_seconds",
+                )
+            )
+            timing["worker_total_before_publish_seconds"] = worker_before_publish
+            timing["worker_accounted_before_publish_seconds"] = accounted_before_publish
+            timing["worker_unaccounted_before_publish_seconds"] = max(
+                0.0, worker_before_publish - accounted_before_publish
+            )
             result = {
                 "version": SCHEMA_VERSION,
                 "status": "success",
@@ -1905,6 +1925,7 @@ def process(job: Path) -> None:
             log(
                 "OPD_WORKER_TIMING",
                 job_id,
+                f"sem_wait={timing.get('job_semaphore_wait_seconds', 0.0):.3f}",
                 f"load={timing.get('load_request_seconds', 0.0):.3f}",
                 f"student_eda={timing.get('student_eda_seconds', 0.0):.3f}",
                 f"teacher_generate={timing.get('teacher_generate_seconds', 0.0):.3f}",
@@ -1913,6 +1934,7 @@ def process(job: Path) -> None:
                 f"teacher_overlap_saved={timing.get('teacher_pipeline_overlap_saved_seconds', 0.0):.3f}",
                 f"teacher_score={timing.get('teacher_score_student_seconds', 0.0):.3f}",
                 f"publish={publish_seconds:.3f}",
+                f"unaccounted={timing.get('worker_unaccounted_before_publish_seconds', 0.0):.3f}",
                 f"total={time.monotonic() - started:.3f}",
             )
             log("done", job_id, f"students={len(student_entries)}", f"teachers={len(teacher_entries)}")
