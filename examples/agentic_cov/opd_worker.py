@@ -365,17 +365,32 @@ class SftpOpdQueue:
         return jobs
 
     def publish_result(self, job_id: str, final_dir: Path, summary: dict[str, Any]) -> None:
-        staging = f"{self.remote_res}/{job_id}.staging.{WORKER_ID}"
         final = f"{self.remote_res}/{job_id}"
         started = time.monotonic()
-        self._rmtree(staging)
-        self._mkdirs(staging)
-        files, bytes_ = self._upload_tree(final_dir, staging)
         self._rmtree(final)
-        self.sftp.posix_rename(staging, final)
+        self._mkdirs(final)
+        files = 0
+        bytes_ = 0
+        done_file = None
+        for path in sorted(final_dir.rglob("*")):
+            if path.is_dir():
+                continue
+            rel = _safe_relpath(path.relative_to(final_dir).as_posix())
+            if rel == ".done":
+                done_file = path
+                continue
+            remote_path = f"{final}/{rel}"
+            self._mkdirs(str(Path(remote_path).parent).replace("\\", "/"))
+            self.sftp.put(str(path), remote_path)
+            files += 1
+            bytes_ += path.stat().st_size
         with contextlib.suppress(Exception):
             with self.sftp.open(f"{self.remote_res}/index.jsonl", "a") as f:
                 f.write(json.dumps(summary, ensure_ascii=False, sort_keys=True) + "\n")
+        if done_file is not None:
+            self.sftp.put(str(done_file), f"{final}/.done")
+            files += 1
+            bytes_ += done_file.stat().st_size
         log("OPD_QUEUE_UPLOAD", job_id, f"files={files}", f"bytes={bytes_}", f"seconds={time.monotonic() - started:.3f}")
 
     def finish_job(self, job_id: str) -> None:
