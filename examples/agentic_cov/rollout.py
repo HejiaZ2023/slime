@@ -107,7 +107,11 @@ def _log_opd_client_timing(
         "OPD_CLIENT_TIMING stage=%s step=%d dataset_id=%s round=%d job=%s "
         "build=%.3f client_init=%.3f connect=%.3f submit=%.3f upload=%.3f "
         "wait=%.3f download=%.3f load_json=%.3f total=%.3f worker_elapsed=%.3f "
-        "payload_bytes=%d submit_files=%d download_bytes=%d download_files=%d polls=%d",
+        "worker_load=%.3f worker_student_eda=%.3f worker_teacher_pipeline=%.3f "
+        "worker_teacher_generate=%.3f worker_teacher_eda=%.3f worker_teacher_score=%.3f "
+        "worker_selection=%.3f worker_before_publish=%.3f "
+        "payload_bytes=%d submit_files=%d submit_wire_bytes=%d download_bytes=%d "
+        "download_wire_bytes=%d download_files=%d polls=%d",
         stage,
         rollout_id,
         dataset_id,
@@ -123,9 +127,19 @@ def _log_opd_client_timing(
         load_seconds,
         total_seconds,
         float(result.get("elapsed_s", 0.0) or 0.0),
+        _result_timing(result, "load_request_seconds"),
+        _result_timing(result, "student_eda_seconds"),
+        _result_timing(result, "teacher_pipeline_seconds"),
+        _result_timing(result, "teacher_generate_seconds"),
+        _result_timing(result, "teacher_eda_seconds"),
+        _result_timing(result, "teacher_score_student_seconds"),
+        _result_timing(result, "selection_seconds"),
+        _result_timing(result, "worker_total_before_publish_seconds"),
         payload_bytes,
         int(submit.get("file_count", 0) or 0),
+        int(submit.get("wire_bytes", 0) or 0),
         int(wait.get("download_bytes", 0) or 0),
+        int(wait.get("wire_bytes", 0) or 0),
         int(wait.get("download_files", 0) or 0),
         int(wait.get("polls", 0) or 0),
     )

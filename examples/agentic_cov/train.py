@@ -218,8 +218,14 @@ def add_agentic_args(parser):
         "--opd-transport",
         type=str,
         default="",
-        choices=["", "local", "sftp"],
+        choices=["", "local", "sftp", "http"],
         help="OPD relay transport. Empty auto-selects local for paladin/local, else sftp.",
+    )
+    parser.add_argument(
+        "--opd-http-url",
+        type=str,
+        default="",
+        help="HTTP OPD worker base URL for direct Tailscale student-to-teacher transfer.",
     )
     parser.add_argument(
         "--opd-xfer-dir",

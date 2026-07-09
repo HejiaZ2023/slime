@@ -11,8 +11,11 @@ publishes results under results/<namespace>/<job_id>.
 from __future__ import annotations
 
 import contextlib
+import base64
 import gzip
 import hashlib
+import http.server
+import ipaddress
 import json
 import os
 import re
@@ -27,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 SCHEMA_VERSION = "opd_exchange_v1"
 
@@ -38,7 +42,7 @@ if LLM4COV_SRC.exists():
 from llm4cov.eda_client.xfer_client import submit_cov_job  # noqa: E402
 
 QUEUE_TRANSPORT = os.environ.get("OPD_QUEUE_TRANSPORT", "local").strip().lower()
-if QUEUE_TRANSPORT == "sftp":
+if QUEUE_TRANSPORT in {"sftp", "http"}:
     XFER = Path(os.environ.get("OPD_LOCAL_XFER_DIR", "/tmp/llm4cov_opd_worker_xfer"))
 else:
     XFER = Path(os.environ.get("OPD_XFER_DIR", "/mnt/raid0_ssd/eda/xfer"))
@@ -62,6 +66,7 @@ TEACHER_CONTEXT_LENGTH = int(os.environ.get("OPD_TEACHER_CONTEXT_LENGTH", "32768
 TEACHER_TOKEN_BUDGET_MARGIN = int(os.environ.get("OPD_TEACHER_TOKEN_BUDGET_MARGIN", "256"))
 TEACHER_MIN_NEW_TOKENS = int(os.environ.get("OPD_TEACHER_MIN_NEW_TOKENS", "16"))
 TEACHER_SCORE_CHUNK_TOKENS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_TOKENS", "1024"))
+TEACHER_SCORE_CHUNK_WORKERS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_WORKERS", "1"))
 TEACHER_SCORE_CONTEXT_MARGIN = int(os.environ.get("OPD_TEACHER_SCORE_CONTEXT_MARGIN", "16"))
 TEACHER_SCORE_POSITION_TOPK = os.environ.get("OPD_TEACHER_SCORE_POSITION_TOPK", "1") != "0"
 TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sheng/final_ckpts")
@@ -90,6 +95,18 @@ _FILENAME_PATTERNS = [
 
 def log(*items: Any) -> None:
     print(time.strftime("%H:%M:%S"), *items, flush=True)
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _timing(obj: dict[str, Any], key: str, default: float = 0.0) -> float:
+    value = obj.get(key) if isinstance(obj, dict) else default
+    return _as_float(value, default)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -401,11 +418,185 @@ class SftpOpdQueue:
             self._release_claim(job_id)
 
 
+def _write_job_files(job_id: str, files: dict[str, bytes]) -> tuple[Path, int, int]:
+    IN.mkdir(parents=True, exist_ok=True)
+    staging = IN / f"{job_id}.staging"
+    final = IN / job_id
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    file_count = 0
+    byte_count = 0
+    for rel, data in files.items():
+        rel = _safe_relpath(rel)
+        path = staging / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        file_count += 1
+        byte_count += len(data)
+    if final.exists():
+        shutil.rmtree(final)
+    os.rename(staging, final)
+    return final, file_count, byte_count
+
+
+def _collect_result_files(result_dir: Path, *, include_audit: bool = False) -> tuple[dict[str, str], int, int]:
+    files: dict[str, str] = {}
+    file_count = 0
+    byte_count = 0
+    for path in sorted(result_dir.rglob("*")):
+        if path.is_dir():
+            continue
+        rel = _safe_relpath(path.relative_to(result_dir).as_posix())
+        if rel.startswith("audit/") and not include_audit:
+            continue
+        data = path.read_bytes()
+        files[rel] = base64.b64encode(data).decode("ascii")
+        file_count += 1
+        byte_count += len(data)
+    return files, file_count, byte_count
+
+
+class HttpOpdQueue(LocalOpdQueue):
+    def __init__(self) -> None:
+        self.bind = os.environ.get("OPD_HTTP_BIND", "127.0.0.1")
+        self.port = int(os.environ.get("OPD_HTTP_PORT", "19090"))
+        self.token = os.environ.get("OPD_HTTP_TOKEN", "")
+        self.max_body_bytes = int(os.environ.get("OPD_HTTP_MAX_BODY_BYTES", str(256 * 1024 * 1024)))
+        allow_any = os.environ.get("OPD_HTTP_ALLOW_NON_TAILSCALE", "0") == "1"
+        bind_ip = ipaddress.ip_address(self.bind)
+        tailscale_net = ipaddress.ip_network("100.64.0.0/10")
+        if not allow_any and not (bind_ip.is_loopback or bind_ip in tailscale_net):
+            raise ValueError(
+                f"refusing OPD_HTTP_BIND={self.bind!r}; bind loopback or a Tailscale 100.64.0.0/10 address, "
+                "or set OPD_HTTP_ALLOW_NON_TAILSCALE=1 explicitly"
+            )
+        self.httpd: http.server.ThreadingHTTPServer | None = None
+
+    def prepare(self) -> None:
+        super().prepare()
+        queue = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            server_version = "llm4cov-opd-http/1.0"
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                log("OPD_HTTP_ACCESS", self.address_string(), fmt % args)
+
+            def _json_response(self, status: int, obj: dict[str, Any]) -> None:
+                body = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _authorized(self) -> bool:
+                if not queue.token:
+                    return True
+                return self.headers.get("X-OPD-Token", "") == queue.token
+
+            def _path_parts(self) -> tuple[str, str, str] | None:
+                parsed = urlparse(self.path)
+                parts = [part for part in parsed.path.strip("/").split("/") if part]
+                if len(parts) != 3:
+                    return None
+                kind, namespace, job_id = parts
+                if namespace != NAMESPACE:
+                    return None
+                if not re.fullmatch(r"[A-Za-z0-9_.-]+", job_id):
+                    return None
+                return kind, namespace, job_id
+
+            def do_GET(self) -> None:
+                if self.path == "/healthz":
+                    self._json_response(200, {"ok": True, "namespace": NAMESPACE, "worker_id": WORKER_ID})
+                    return
+                if not self._authorized():
+                    self._json_response(403, {"ok": False, "error": "forbidden"})
+                    return
+                parts = self._path_parts()
+                if not parts or parts[0] != "results":
+                    self._json_response(404, {"ok": False, "error": "not_found"})
+                    return
+                parsed = urlparse(self.path)
+                include_audit = parse_qs(parsed.query).get("audit", ["0"])[0] == "1"
+                job_id = parts[2]
+                result_dir = RES / job_id
+                if not (result_dir / ".done").exists():
+                    self._json_response(202, {"ok": False, "status": "pending", "job_id": job_id})
+                    return
+                started = time.monotonic()
+                files, file_count, byte_count = _collect_result_files(result_dir, include_audit=include_audit)
+                self._json_response(
+                    200,
+                    {
+                        "ok": True,
+                        "job_id": job_id,
+                        "files": files,
+                        "file_count": file_count,
+                        "payload_bytes": byte_count,
+                        "seconds": time.monotonic() - started,
+                    },
+                )
+
+            def do_POST(self) -> None:
+                if not self._authorized():
+                    self._json_response(403, {"ok": False, "error": "forbidden"})
+                    return
+                parts = self._path_parts()
+                if not parts or parts[0] != "jobs":
+                    self._json_response(404, {"ok": False, "error": "not_found"})
+                    return
+                job_id = parts[2]
+                started = time.monotonic()
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                    if length <= 0 or length > queue.max_body_bytes:
+                        self._json_response(413, {"ok": False, "job_id": job_id, "error": "request_too_large"})
+                        return
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    raw_files = payload.get("files") if isinstance(payload, dict) else None
+                    if not isinstance(raw_files, dict):
+                        raise ValueError("missing files object")
+                    files = {
+                        _safe_relpath(str(rel)): base64.b64decode(str(data).encode("ascii"))
+                        for rel, data in raw_files.items()
+                    }
+                    _path, file_count, byte_count = _write_job_files(job_id, files)
+                    log(
+                        "OPD_HTTP_JOB_RECEIVED",
+                        job_id,
+                        f"files={file_count}",
+                        f"bytes={byte_count}",
+                        f"seconds={time.monotonic() - started:.3f}",
+                    )
+                    self._json_response(
+                        200,
+                        {
+                            "ok": True,
+                            "job_id": job_id,
+                            "file_count": file_count,
+                            "payload_bytes": byte_count,
+                            "seconds": time.monotonic() - started,
+                        },
+                    )
+                except Exception as exc:
+                    log("OPD_HTTP_JOB_FAIL", job_id, exc)
+                    self._json_response(400, {"ok": False, "job_id": job_id, "error": str(exc)})
+
+        self.httpd = http.server.ThreadingHTTPServer((self.bind, self.port), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        log("OPD_QUEUE_HTTP_LISTEN", f"bind={self.bind}", f"port={self.port}", f"namespace={NAMESPACE}")
+
+
 def build_queue_backend() -> Any:
     if QUEUE_TRANSPORT == "local":
         return LocalOpdQueue()
     if QUEUE_TRANSPORT == "sftp":
         return SftpOpdQueue()
+    if QUEUE_TRANSPORT == "http":
+        return HttpOpdQueue()
     raise ValueError(f"unknown OPD_QUEUE_TRANSPORT={QUEUE_TRANSPORT!r}")
 
 
@@ -1024,76 +1215,91 @@ def score_teacher_on_student(
         chunk_size = min(response_len, max(1, TEACHER_SCORE_CHUNK_TOKENS))
     score_context_len = max(0, TEACHER_CONTEXT_LENGTH - max(0, TEACHER_SCORE_CONTEXT_MARGIN))
 
+    offsets = list(range(0, response_len, chunk_size))
+    chunk_workers = max(1, min(max(1, TEACHER_SCORE_CHUNK_WORKERS), len(offsets) or 1))
+    chunk_wall_started = time.monotonic()
+
+    def _score_chunk(offset: int) -> tuple[int, list[float], list[list[float]] | None, list[list[float]] | None, dict[str, Any]]:
+        chunk_len = min(chunk_size, response_len - offset)
+        chunk_start = prompt_len + offset
+        chunk_end = chunk_start + chunk_len
+        window_start = 0
+        if score_context_len > 0:
+            window_start = max(0, chunk_end - score_context_len)
+        chunk_start_in_window = chunk_start - window_start
+        logprob_start_len = max(0, chunk_start_in_window - 1)
+        chunk_requested_topk = (
+            requested_topk[offset : offset + chunk_len] if requested_topk is not None else None
+        )
+        chunk_input_ids = input_ids_int[window_start:chunk_end]
+        payload = {
+            "input_ids": chunk_input_ids,
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 0,
+                "skip_special_tokens": False,
+            },
+            "return_logprob": True,
+            # Only response-token logprobs are consumed by OPD.  Keep a
+            # teacher-context-sized sliding window for long responses; SGLang
+            # returns a leading None row at logprob_start_len, so start one
+            # token before this chunk within the local window and keep the
+            # final chunk_len rows.
+            "logprob_start_len": logprob_start_len,
+        }
+        token_ids_logprob: list[int] = []
+        if chunk_requested_topk:
+            payload["topk_token_ids"] = chunk_requested_topk
+            payload["return_topk_logprobs"] = True
+            if not TEACHER_SCORE_POSITION_TOPK:
+                token_ids_logprob = sorted({int(token_id) for row in chunk_requested_topk for token_id in row})
+                # Fallback for old SGLang builds that only accept a
+                # request-level token_ids_logprob union.
+                payload["token_ids_logprob"] = token_ids_logprob
+        started = time.monotonic()
+        output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
+        meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
+        chunk_log_probs = extract_input_logprobs(meta, chunk_len)
+        chunk_topk, chunk_masks = _extract_requested_topk_logprobs(
+            output,
+            chunk_len,
+            chunk_requested_topk,
+        )
+        timing = {
+            "offset": offset,
+            "chunk_response_token_count": chunk_len,
+            "request_seconds": time.monotonic() - started,
+            "input_token_count": len(chunk_input_ids),
+            "window_start": window_start,
+            "window_end": chunk_end,
+            "chunk_start_in_window": chunk_start_in_window,
+            "truncated_prefix_token_count": window_start,
+            "prompt_token_count": prompt_len,
+            "teacher_context_length": score_context_len,
+            "logprob_start_len": logprob_start_len,
+            "input_logprob_rows": len(meta.get("input_token_logprobs") or []),
+            "input_token_ids_logprob_rows": len(meta.get("input_token_ids_logprobs") or []),
+            "input_requested_token_logprob_rows": len(meta.get("input_requested_token_logprobs") or []),
+            "position_topk_enabled": bool(TEACHER_SCORE_POSITION_TOPK),
+            "token_ids_logprob_count": len(token_ids_logprob),
+        }
+        return offset, chunk_log_probs, chunk_topk, chunk_masks, timing
+
     try:
-        for offset in range(0, response_len, chunk_size):
-            chunk_len = min(chunk_size, response_len - offset)
-            chunk_start = prompt_len + offset
-            chunk_end = chunk_start + chunk_len
-            window_start = 0
-            if score_context_len > 0:
-                window_start = max(0, chunk_end - score_context_len)
-            chunk_start_in_window = chunk_start - window_start
-            logprob_start_len = max(0, chunk_start_in_window - 1)
-            chunk_requested_topk = (
-                requested_topk[offset : offset + chunk_len] if requested_topk is not None else None
-            )
-            chunk_input_ids = input_ids_int[window_start:chunk_end]
-            payload = {
-                "input_ids": chunk_input_ids,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 0,
-                    "skip_special_tokens": False,
-                },
-                "return_logprob": True,
-                # Only response-token logprobs are consumed by OPD.  Keep a
-                # teacher-context-sized sliding window for long responses; SGLang
-                # returns a leading None row at logprob_start_len, so start one
-                # token before this chunk within the local window and keep the
-                # final chunk_len rows.
-                "logprob_start_len": logprob_start_len,
-            }
-            token_ids_logprob: list[int] = []
-            if chunk_requested_topk:
-                payload["topk_token_ids"] = chunk_requested_topk
-                payload["return_topk_logprobs"] = True
-                if not TEACHER_SCORE_POSITION_TOPK:
-                    token_ids_logprob = sorted({int(token_id) for row in chunk_requested_topk for token_id in row})
-                    # Fallback for old SGLang builds that only accept a
-                    # request-level token_ids_logprob union.
-                    payload["token_ids_logprob"] = token_ids_logprob
-            started = time.monotonic()
-            output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
-            meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
-            teacher_log_probs.extend(extract_input_logprobs(meta, chunk_len))
-            chunk_topk, chunk_masks = _extract_requested_topk_logprobs(
-                output,
-                chunk_len,
-                chunk_requested_topk,
-            )
+        if chunk_workers > 1 and len(offsets) > 1:
+            with ThreadPoolExecutor(max_workers=chunk_workers) as pool:
+                chunk_results = [future.result() for future in as_completed(pool.submit(_score_chunk, offset) for offset in offsets)]
+            chunk_results.sort(key=lambda item: item[0])
+        else:
+            chunk_results = [_score_chunk(offset) for offset in offsets]
+        for _offset, chunk_log_probs, chunk_topk, chunk_masks, timing in chunk_results:
+            teacher_log_probs.extend(chunk_log_probs)
             teacher_topk_parts.append(chunk_topk)
             teacher_mask_parts.append(chunk_masks)
-            timings.append(
-                {
-                    "offset": offset,
-                    "chunk_response_token_count": chunk_len,
-                    "request_seconds": time.monotonic() - started,
-                    "input_token_count": len(chunk_input_ids),
-                    "window_start": window_start,
-                    "window_end": chunk_end,
-                    "chunk_start_in_window": chunk_start_in_window,
-                    "truncated_prefix_token_count": window_start,
-                    "prompt_token_count": prompt_len,
-                    "teacher_context_length": score_context_len,
-                    "logprob_start_len": logprob_start_len,
-                    "input_logprob_rows": len(meta.get("input_token_logprobs") or []),
-                    "input_token_ids_logprob_rows": len(meta.get("input_token_ids_logprobs") or []),
-                    "input_requested_token_logprob_rows": len(meta.get("input_requested_token_logprobs") or []),
-                    "position_topk_enabled": bool(TEACHER_SCORE_POSITION_TOPK),
-                    "token_ids_logprob_count": len(token_ids_logprob),
-                }
-            )
+            timings.append(timing)
     except Exception as exc:
+        chunk_wall_seconds = time.monotonic() - chunk_wall_started
+        timings.sort(key=lambda item: int(item.get("offset") or 0))
         return {
             "student_id": sid,
             "teacher": name,
@@ -1109,6 +1315,11 @@ def score_teacher_on_student(
                 "prompt_token_count": prompt_len,
                 "response_token_count": response_len,
                 "chunk_size": chunk_size,
+                "chunk_count": len(offsets),
+                "chunk_workers": chunk_workers,
+                "chunk_request_wall_seconds": chunk_wall_seconds,
+                "chunk_request_sum_seconds": sum(_timing(t, "request_seconds") for t in timings),
+                "chunk_request_max_seconds": max((_timing(t, "request_seconds") for t in timings), default=0.0),
                 "teacher_context_length": score_context_len,
                 "max_request_input_token_count": max(
                     (int(t.get("input_token_count") or 0) for t in timings),
@@ -1118,6 +1329,8 @@ def score_teacher_on_student(
             },
         }
 
+    chunk_wall_seconds = time.monotonic() - chunk_wall_started
+    timings.sort(key=lambda item: int(item.get("offset") or 0))
     status = "success" if len(teacher_log_probs) == response_len else "length_mismatch"
     teacher_topk = None
     teacher_topk_masks = None
@@ -1150,6 +1363,11 @@ def score_teacher_on_student(
             "prompt_token_count": prompt_len,
             "response_token_count": response_len,
             "chunk_size": chunk_size,
+            "chunk_count": len(offsets),
+            "chunk_workers": chunk_workers,
+            "chunk_request_wall_seconds": chunk_wall_seconds,
+            "chunk_request_sum_seconds": sum(_timing(t, "request_seconds") for t in timings),
+            "chunk_request_max_seconds": max((_timing(t, "request_seconds") for t in timings), default=0.0),
             "teacher_context_length": score_context_len,
             "max_request_input_token_count": max(
                 (int(t.get("input_token_count") or 0) for t in timings),
@@ -1439,6 +1657,26 @@ def process(job: Path) -> None:
                 ),
                 default=0.0,
             )
+            timing["student_eda_sum_seconds"] = sum(
+                float((entry.get("eda_timing") or {}).get("total_seconds", 0.0) or 0.0)
+                for entry in student_entries
+                if isinstance(entry, dict)
+            )
+            for entry in student_entries:
+                eda_timing = entry.get("eda_timing") if isinstance(entry.get("eda_timing"), dict) else {}
+                eda_log = entry.get("eda_log") if isinstance(entry.get("eda_log"), dict) else {}
+                eda_summary = entry.get("eda_summary") if isinstance(entry.get("eda_summary"), dict) else {}
+                log(
+                    "OPD_STUDENT_EDA_TIMING",
+                    job_id,
+                    f"student={entry.get('id')}",
+                    f"status={eda_log.get('status', entry.get('status', ''))}",
+                    f"reward={_as_float(entry.get('reward')):.4f}",
+                    f"total={_timing(eda_timing, 'total_seconds'):.3f}",
+                    f"submit={_timing(eda_timing, 'submit_cov_job_seconds'):.3f}",
+                    f"coverage={_as_float(eda_summary.get('overall_coverage', 0.0)):.4f}",
+                    f"response_tokens={int(entry.get('response_token_count') or 0)}",
+                )
 
             phase_started = time.monotonic()
             teacher_specs = manifest.get("teachers") if isinstance(manifest.get("teachers"), list) else []
@@ -1461,14 +1699,70 @@ def process(job: Path) -> None:
                     teacher_entries = [e for e in provided if isinstance(e, dict)]
             timing["load_teacher_rollouts_seconds"] = time.monotonic() - phase_started
             if teacher_jobs and teacher_request.get("generate_teacher_rollouts", True):
-                phase_started = time.monotonic()
-                with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(teacher_jobs)))) as pool:
-                    futures = [
-                        pool.submit(generate_teacher_rollout, name, slot, prompt, sampling_params, teacher_cfg)
+                pipeline_started = time.monotonic()
+                generated: list[dict[str, Any]] = []
+                gen_workers = max(1, min(MAX_JOB_WORKERS, len(teacher_jobs)))
+                eda_workers = max(1, min(MAX_JOB_WORKERS, len(teacher_jobs)))
+                first_eda_submit: float | None = None
+                generation_done = pipeline_started
+                eda_done = pipeline_started
+                with ThreadPoolExecutor(max_workers=gen_workers) as gen_pool, ThreadPoolExecutor(max_workers=eda_workers) as eda_pool:
+                    gen_futures = {
+                        gen_pool.submit(generate_teacher_rollout, name, slot, prompt, sampling_params, teacher_cfg): (name, slot)
                         for name, slot in teacher_jobs
-                    ]
-                    generated = [future.result() for future in as_completed(futures)]
-                timing["teacher_generate_seconds"] = time.monotonic() - phase_started
+                    }
+                    eda_futures: dict[Any, dict[str, Any]] = {}
+                    for future in as_completed(gen_futures):
+                        name, slot = gen_futures[future]
+                        entry = future.result()
+                        generated.append(entry)
+                        generation_done = time.monotonic()
+                        gen_timing = entry.get("teacher_generation_timing") if isinstance(entry.get("teacher_generation_timing"), dict) else {}
+                        budget = entry.get("teacher_generation_budget") if isinstance(entry.get("teacher_generation_budget"), dict) else {}
+                        log(
+                            "OPD_TEACHER_GENERATE_TIMING",
+                            job_id,
+                            f"teacher={name}",
+                            f"slot={slot}",
+                            f"status={entry.get('teacher_generation_status', '')}",
+                            f"total={_timing(gen_timing, 'total_seconds'):.3f}",
+                            f"request={_timing(gen_timing, 'request_seconds'):.3f}",
+                            f"budget={_timing(budget, 'budget_seconds'):.3f}",
+                            f"tokenize={_timing(budget, 'tokenize_seconds'):.3f}",
+                            f"prompt_tokens={int(budget.get('prompt_token_count') or 0)}",
+                            f"generated_tokens={int(gen_timing.get('generated_token_count') or 0)}",
+                            f"chars={int(gen_timing.get('response_chars') or 0)}",
+                        )
+                        if first_eda_submit is None:
+                            first_eda_submit = time.monotonic()
+                        eda_futures[eda_pool.submit(score_teacher, entry, context, want_detail)] = entry
+                    timing["teacher_generate_seconds"] = generation_done - pipeline_started
+                    for eda_future in as_completed(eda_futures):
+                        scored = eda_future.result()
+                        teacher_entries.append(scored)
+                        eda_done = time.monotonic()
+                        eda_timing = scored.get("eda_timing") if isinstance(scored.get("eda_timing"), dict) else {}
+                        eda_log = scored.get("eda_log") if isinstance(scored.get("eda_log"), dict) else {}
+                        eda_summary = scored.get("eda_summary") if isinstance(scored.get("eda_summary"), dict) else {}
+                        log(
+                            "OPD_TEACHER_EDA_TIMING",
+                            job_id,
+                            f"teacher={scored.get('teacher', scored.get('teacher_name', ''))}",
+                            f"id={scored.get('id', '')}",
+                            f"status={eda_log.get('status', scored.get('status', ''))}",
+                            f"reward={_as_float(scored.get('reward')):.4f}",
+                            f"total={_timing(eda_timing, 'total_seconds'):.3f}",
+                            f"submit={_timing(eda_timing, 'submit_cov_job_seconds'):.3f}",
+                            f"coverage={_as_float(eda_summary.get('overall_coverage', 0.0)):.4f}",
+                        )
+                timing["teacher_eda_seconds"] = eda_done - (first_eda_submit or eda_done)
+                timing["teacher_pipeline_seconds"] = eda_done - pipeline_started
+                timing["teacher_pipeline_overlap_saved_seconds"] = max(
+                    0.0,
+                    timing["teacher_generate_seconds"] + timing["teacher_eda_seconds"] - timing["teacher_pipeline_seconds"],
+                )
+                timing["teacher_generate_workers"] = gen_workers
+                timing["teacher_eda_workers"] = eda_workers
                 timing["teacher_generate_max_seconds"] = max(
                     (
                         float((entry.get("teacher_generation_timing") or {}).get("total_seconds", 0.0) or 0.0)
@@ -1477,10 +1771,11 @@ def process(job: Path) -> None:
                     ),
                     default=0.0,
                 )
-                phase_started = time.monotonic()
-                with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(generated)))) as pool:
-                    teacher_entries.extend(pool.map(lambda e: score_teacher(e, context, want_detail), generated))
-                timing["teacher_eda_seconds"] = time.monotonic() - phase_started
+                timing["teacher_generate_sum_seconds"] = sum(
+                    float((entry.get("teacher_generation_timing") or {}).get("total_seconds", 0.0) or 0.0)
+                    for entry in generated
+                    if isinstance(entry, dict)
+                )
                 timing["teacher_eda_max_seconds"] = max(
                     (
                         float((entry.get("eda_timing") or {}).get("total_seconds", 0.0) or 0.0)
@@ -1489,11 +1784,20 @@ def process(job: Path) -> None:
                     ),
                     default=0.0,
                 )
+                timing["teacher_eda_sum_seconds"] = sum(
+                    float((entry.get("eda_timing") or {}).get("total_seconds", 0.0) or 0.0)
+                    for entry in teacher_entries
+                    if isinstance(entry, dict)
+                )
             else:
                 timing.setdefault("teacher_generate_seconds", 0.0)
                 timing.setdefault("teacher_generate_max_seconds", 0.0)
+                timing.setdefault("teacher_generate_sum_seconds", 0.0)
                 timing.setdefault("teacher_eda_seconds", 0.0)
                 timing.setdefault("teacher_eda_max_seconds", 0.0)
+                timing.setdefault("teacher_eda_sum_seconds", 0.0)
+                timing.setdefault("teacher_pipeline_seconds", 0.0)
+                timing.setdefault("teacher_pipeline_overlap_saved_seconds", 0.0)
 
             phase_started = time.monotonic()
             sel = selection(student_entries, teacher_entries)
@@ -1517,6 +1821,44 @@ def process(job: Path) -> None:
                         ),
                         default=0.0,
                     )
+                    timing["teacher_score_student_sum_seconds"] = sum(
+                        float((score.get("teacher_score_timing") or {}).get("request_seconds", 0.0) or 0.0)
+                        for score in scores
+                        if isinstance(score, dict)
+                    )
+                    for score in scores:
+                        score_timing = score.get("teacher_score_timing") if isinstance(score.get("teacher_score_timing"), dict) else {}
+                        log(
+                            "OPD_TEACHER_SCORE_TIMING",
+                            job_id,
+                            f"student={score.get('student_id')}",
+                            f"teacher={score.get('teacher')}",
+                            f"status={score.get('status')}",
+                            f"total={_timing(score_timing, 'request_seconds'):.3f}",
+                            f"chunk_wall={_timing(score_timing, 'chunk_request_wall_seconds'):.3f}",
+                            f"chunk_sum={_timing(score_timing, 'chunk_request_sum_seconds'):.3f}",
+                            f"chunk_max={_timing(score_timing, 'chunk_request_max_seconds'):.3f}",
+                            f"chunks={int(score_timing.get('chunk_count') or 0)}",
+                            f"chunk_workers={int(score_timing.get('chunk_workers') or 0)}",
+                            f"prompt_tokens={int(score_timing.get('prompt_token_count') or 0)}",
+                            f"response_tokens={int(score_timing.get('response_token_count') or 0)}",
+                            f"max_input={int(score_timing.get('max_request_input_token_count') or 0)}",
+                        )
+                        for chunk in score_timing.get("chunks") or []:
+                            if not isinstance(chunk, dict):
+                                continue
+                            log(
+                                "OPD_TEACHER_SCORE_CHUNK_TIMING",
+                                job_id,
+                                f"student={score.get('student_id')}",
+                                f"teacher={score.get('teacher')}",
+                                f"offset={int(chunk.get('offset') or 0)}",
+                                f"response_tokens={int(chunk.get('chunk_response_token_count') or 0)}",
+                                f"input_tokens={int(chunk.get('input_token_count') or 0)}",
+                                f"request={_timing(chunk, 'request_seconds'):.3f}",
+                                f"window_start={int(chunk.get('window_start') or 0)}",
+                                f"logprob_start={int(chunk.get('logprob_start_len') or 0)}",
+                            )
                     for entry, score in zip(student_entries, scores, strict=False):
                         entry.setdefault("teacher_scores", []).append(score)
                         if score.get("status") in {"success", "topk_success", "partial_topk"}:
@@ -1558,6 +1900,8 @@ def process(job: Path) -> None:
             publish_started = time.monotonic()
             publish(job_id, result)
             publish_seconds = time.monotonic() - publish_started
+            timing["publish_seconds"] = publish_seconds
+            timing["worker_total_seconds"] = time.monotonic() - started
             log(
                 "OPD_WORKER_TIMING",
                 job_id,
@@ -1565,6 +1909,8 @@ def process(job: Path) -> None:
                 f"student_eda={timing.get('student_eda_seconds', 0.0):.3f}",
                 f"teacher_generate={timing.get('teacher_generate_seconds', 0.0):.3f}",
                 f"teacher_eda={timing.get('teacher_eda_seconds', 0.0):.3f}",
+                f"teacher_pipeline={timing.get('teacher_pipeline_seconds', 0.0):.3f}",
+                f"teacher_overlap_saved={timing.get('teacher_pipeline_overlap_saved_seconds', 0.0):.3f}",
                 f"teacher_score={timing.get('teacher_score_student_seconds', 0.0):.3f}",
                 f"publish={publish_seconds:.3f}",
                 f"total={time.monotonic() - started:.3f}",

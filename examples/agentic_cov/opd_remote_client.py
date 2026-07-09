@@ -10,6 +10,7 @@ jobs separate while still using the same mounted SFTP paths.
 from __future__ import annotations
 
 import contextlib
+import base64
 import hashlib
 import json
 import os
@@ -19,6 +20,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import urllib.error
+import urllib.request
 
 
 SCHEMA_VERSION = "opd_exchange_v1"
@@ -305,6 +308,117 @@ class _SftpTreeTransport:
             self.client.close()
 
 
+class _HttpTransport:
+    def __init__(self, base_url: str, namespace: str, token: str = "") -> None:
+        self.base_url = base_url.rstrip("/")
+        if not self.base_url.startswith(("http://", "https://")):
+            self.base_url = f"http://{self.base_url}"
+        self.namespace = namespace
+        self.token = token
+        self.last_timing: dict[str, Any] = {}
+        started = time.monotonic()
+        self._request_json("GET", "/healthz", timeout=10)
+        self.last_timing["connect"] = {
+            "seconds": time.monotonic() - started,
+            "transport": "http",
+            "base_url": self.base_url,
+        }
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["X-OPD-Token"] = self.token
+        return headers
+
+    def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None, timeout: float = 30) -> dict[str, Any]:
+        body = None
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=body,
+            headers=self._headers(),
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        if not data:
+            return {}
+        obj = json.loads(data.decode("utf-8"))
+        if not isinstance(obj, dict):
+            raise ValueError(f"bad OPD HTTP response for {path}: expected JSON object")
+        return obj
+
+    def submit(self, job_id: str, files: dict[str, bytes]) -> None:
+        started = time.monotonic()
+        encoded = {
+            _safe_relpath(rel): base64.b64encode(data).decode("ascii")
+            for rel, data in files.items()
+        }
+        payload = {"schema": SCHEMA_VERSION, "files": encoded}
+        wire_bytes = len(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        upload_started = time.monotonic()
+        obj = self._request_json("POST", f"/jobs/{self.namespace}/{job_id}", payload, timeout=120)
+        upload_seconds = time.monotonic() - upload_started
+        if not obj.get("ok"):
+            raise RuntimeError(f"OPD HTTP submit failed: {obj}")
+        self.last_timing["submit"] = {
+            "seconds": time.monotonic() - started,
+            "upload_seconds": upload_seconds,
+            "file_count": len(files),
+            "payload_bytes": sum(len(data) for data in files.values()),
+            "wire_bytes": wire_bytes,
+            "transport": "http",
+        }
+
+    def wait_result(self, job_id: str, timeout_s: float, poll_s: float) -> Path:
+        started = time.monotonic()
+        deadline = time.time() + timeout_s
+        polls = 0
+        last_status = "pending"
+        while time.time() < deadline:
+            request_started = time.monotonic()
+            obj = self._request_json("GET", f"/results/{self.namespace}/{job_id}", timeout=120)
+            request_seconds = time.monotonic() - request_started
+            if obj.get("ok"):
+                local = Path(os.environ.get("OPD_RESULT_TMP", "/tmp/llm4cov_opd_results")) / job_id
+                if local.exists():
+                    shutil.rmtree(local)
+                local.mkdir(parents=True)
+                download_started = time.monotonic()
+                raw_files = obj.get("files") if isinstance(obj.get("files"), dict) else {}
+                download_files = 0
+                download_bytes = 0
+                for rel, data in raw_files.items():
+                    rel = _safe_relpath(str(rel))
+                    decoded = base64.b64decode(str(data).encode("ascii"))
+                    dst = local / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(decoded)
+                    download_files += 1
+                    download_bytes += len(decoded)
+                download_seconds = time.monotonic() - download_started
+                self.last_timing["wait_result"] = {
+                    "wait_seconds": time.monotonic() - started,
+                    "download_seconds": download_seconds,
+                    "download_request_seconds": request_seconds,
+                    "download_files": download_files,
+                    "download_bytes": download_bytes,
+                    "wire_bytes": int(obj.get("payload_bytes") or 0),
+                    "polls": polls,
+                    "result_path": str(local),
+                    "transport": "http",
+                }
+                return local
+            last_status = str(obj.get("status") or "pending")
+            polls += 1
+            time.sleep(poll_s)
+        raise TimeoutError(f"OPD relay result timeout: {job_id} status={last_status}")
+
+    def close(self) -> None:
+        return None
+
+
 class OpdRelayClient:
     def __init__(self, args: Any) -> None:
         started = time.monotonic()
@@ -312,7 +426,7 @@ class OpdRelayClient:
         transport = getattr(args, "opd_transport", None) or os.environ.get("OPD_TRANSPORT", "")
         server = getattr(args, "opd_server", None) or os.environ.get("OPD_SERVER", "")
         if not transport:
-            transport = "local" if server in {"", "local", "paladin", "paladin_centos"} else "sftp"
+            transport = "http" if str(server).startswith(("http://", "https://")) else ("local" if server in {"", "local", "paladin", "paladin_centos"} else "sftp")
         if transport == "local":
             root = getattr(args, "opd_xfer_dir", None) or os.environ.get("OPD_XFER_DIR", "/mnt/raid0_ssd/eda/xfer")
             self.transport = _LocalTreeTransport(root, self.namespace)
@@ -324,6 +438,12 @@ class OpdRelayClient:
                 "OPD_SFTP_KEY", os.path.expanduser("~/.ssh/brev_eda_sftp")
             )
             self.transport = _SftpTreeTransport(host, port, user, key, self.namespace)
+        elif transport == "http":
+            base_url = getattr(args, "opd_http_url", None) or os.environ.get("OPD_HTTP_URL") or server
+            if not base_url:
+                raise ValueError("--opd-transport http requires --opd-http-url or --opd-server http://...")
+            token = os.environ.get("OPD_HTTP_TOKEN", "")
+            self.transport = _HttpTransport(base_url, self.namespace, token=token)
         else:
             raise ValueError(f"unknown OPD transport: {transport}")
         self.init_seconds = time.monotonic() - started
