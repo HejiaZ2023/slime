@@ -215,6 +215,7 @@ class SftpOpdQueue:
             timeout=20,
         )
         self.sftp = self.client.open_sftp()
+        self._sftp_lock = threading.Lock()
         self.remote_in = f"incoming/{NAMESPACE}"
         self.remote_res = f"results/{NAMESPACE}"
         # The eda_relay SFTP chroot exposes incoming/ and results/ only; .state is host-local.
@@ -328,73 +329,76 @@ class SftpOpdQueue:
         self._rmtree(f"{self.remote_claims}/{job_id}")
 
     def poll_jobs(self) -> list[Path]:
-        jobs: list[Path] = []
-        try:
-            entries = self.sftp.listdir_attr(self.remote_in)
-        except OSError:
-            return jobs
-        for entry in sorted(entries, key=lambda item: item.filename):
-            job_id = entry.filename
-            if not self._is_dir_attr(entry) or job_id.endswith(".staging"):
-                continue
-            if self._exists(f"{self.remote_res}/{job_id}/.done"):
-                continue
-            if not self._exists(f"{self.remote_in}/{job_id}/manifest.json"):
-                continue
-            with _LOCK:
-                if job_id in _INFLIGHT:
-                    continue
-                _INFLIGHT.add(job_id)
-            if not self._claim_job(job_id):
-                with _LOCK:
-                    _INFLIGHT.discard(job_id)
-                continue
-            local_job = IN / job_id
+        with self._sftp_lock:
+            jobs: list[Path] = []
             try:
-                if local_job.exists():
-                    shutil.rmtree(local_job)
-                started = time.monotonic()
-                files, bytes_ = self._download_tree(f"{self.remote_in}/{job_id}", local_job)
-                log("OPD_QUEUE_DOWNLOAD", job_id, f"files={files}", f"bytes={bytes_}", f"seconds={time.monotonic() - started:.3f}")
-                jobs.append(local_job)
-            except Exception as exc:
-                log("OPD_QUEUE_DOWNLOAD_FAIL", job_id, exc)
-                self._release_claim(job_id)
+                entries = self.sftp.listdir_attr(self.remote_in)
+            except OSError:
+                return jobs
+            for entry in sorted(entries, key=lambda item: item.filename):
+                job_id = entry.filename
+                if not self._is_dir_attr(entry) or job_id.endswith(".staging"):
+                    continue
+                if self._exists(f"{self.remote_res}/{job_id}/.done"):
+                    continue
+                if not self._exists(f"{self.remote_in}/{job_id}/manifest.json"):
+                    continue
                 with _LOCK:
-                    _INFLIGHT.discard(job_id)
-        return jobs
+                    if job_id in _INFLIGHT:
+                        continue
+                    _INFLIGHT.add(job_id)
+                if not self._claim_job(job_id):
+                    with _LOCK:
+                        _INFLIGHT.discard(job_id)
+                    continue
+                local_job = IN / job_id
+                try:
+                    if local_job.exists():
+                        shutil.rmtree(local_job)
+                    started = time.monotonic()
+                    files, bytes_ = self._download_tree(f"{self.remote_in}/{job_id}", local_job)
+                    log("OPD_QUEUE_DOWNLOAD", job_id, f"files={files}", f"bytes={bytes_}", f"seconds={time.monotonic() - started:.3f}")
+                    jobs.append(local_job)
+                except Exception as exc:
+                    log("OPD_QUEUE_DOWNLOAD_FAIL", job_id, exc)
+                    self._release_claim(job_id)
+                    with _LOCK:
+                        _INFLIGHT.discard(job_id)
+            return jobs
 
     def publish_result(self, job_id: str, final_dir: Path, summary: dict[str, Any]) -> None:
-        final = f"{self.remote_res}/{job_id}"
-        started = time.monotonic()
-        self._rmtree(final)
-        self._mkdirs(final)
-        files = 0
-        bytes_ = 0
-        done_file = None
-        for path in sorted(final_dir.rglob("*")):
-            if path.is_dir():
-                continue
-            rel = _safe_relpath(path.relative_to(final_dir).as_posix())
-            if rel == ".done":
-                done_file = path
-                continue
-            remote_path = f"{final}/{rel}"
-            self._mkdirs(str(Path(remote_path).parent).replace("\\", "/"))
-            self.sftp.put(str(path), remote_path)
-            files += 1
-            bytes_ += path.stat().st_size
-        with contextlib.suppress(Exception):
-            with self.sftp.open(f"{self.remote_res}/index.jsonl", "a") as f:
-                f.write(json.dumps(summary, ensure_ascii=False, sort_keys=True) + "\n")
-        if done_file is not None:
-            self.sftp.put(str(done_file), f"{final}/.done")
-            files += 1
-            bytes_ += done_file.stat().st_size
-        log("OPD_QUEUE_UPLOAD", job_id, f"files={files}", f"bytes={bytes_}", f"seconds={time.monotonic() - started:.3f}")
+        with self._sftp_lock:
+            final = f"{self.remote_res}/{job_id}"
+            started = time.monotonic()
+            self._rmtree(final)
+            self._mkdirs(final)
+            files = 0
+            bytes_ = 0
+            done_file = None
+            for path in sorted(final_dir.rglob("*")):
+                if path.is_dir():
+                    continue
+                rel = _safe_relpath(path.relative_to(final_dir).as_posix())
+                if rel == ".done":
+                    done_file = path
+                    continue
+                remote_path = f"{final}/{rel}"
+                self._mkdirs(str(Path(remote_path).parent).replace("\\", "/"))
+                self.sftp.put(str(path), remote_path)
+                files += 1
+                bytes_ += path.stat().st_size
+            with contextlib.suppress(Exception):
+                with self.sftp.open(f"{self.remote_res}/index.jsonl", "a") as f:
+                    f.write(json.dumps(summary, ensure_ascii=False, sort_keys=True) + "\n")
+            if done_file is not None:
+                self.sftp.put(str(done_file), f"{final}/.done")
+                files += 1
+                bytes_ += done_file.stat().st_size
+            log("OPD_QUEUE_UPLOAD", job_id, f"files={files}", f"bytes={bytes_}", f"seconds={time.monotonic() - started:.3f}")
 
     def finish_job(self, job_id: str) -> None:
-        self._release_claim(job_id)
+        with self._sftp_lock:
+            self._release_claim(job_id)
 
 
 def build_queue_backend() -> Any:
