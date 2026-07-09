@@ -217,7 +217,9 @@ class SftpOpdQueue:
         self.sftp = self.client.open_sftp()
         self.remote_in = f"incoming/{NAMESPACE}"
         self.remote_res = f"results/{NAMESPACE}"
-        self.remote_claims = f".state/{NAMESPACE}/claims"
+        # The eda_relay SFTP chroot exposes incoming/ and results/ only; .state is host-local.
+        claims_dir = os.environ.get("OPD_QUEUE_SFTP_CLAIMS_DIR")
+        self.remote_claims = claims_dir.strip("/") if claims_dir else f"results/{NAMESPACE}/.claims"
         log("OPD_QUEUE_SFTP_CONNECTED", f"host={host}", f"port={port}", f"user={user}", f"seconds={time.monotonic() - started:.3f}")
 
     def prepare(self) -> None:
