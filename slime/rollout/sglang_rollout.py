@@ -228,7 +228,6 @@ async def fetch_posthoc_opd_topk_ids(args: Namespace, sample: Sample) -> float:
         headers=headers,
     )
     sample.rollout_topk_token_ids = token_ids
-    sample.rollout_topk_log_probs = []
     if sample.metadata is None:
         sample.metadata = {}
     sample.metadata["opd_student_topk_mode"] = "posthoc"
