@@ -358,7 +358,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "return_logprob": True,
     }
     opd_topk = int(getattr(args, "opd_topk", 0) or 0)
-    opd_topk_mode = str(getattr(args, "opd_student_topk_mode", "decode") or "decode").lower()
+    opd_topk_mode = str(getattr(args, "opd_student_topk_mode", "posthoc") or "posthoc").lower()
     if bool(getattr(args, "use_opd_relay", False)) and opd_topk > 0:
         if opd_topk_mode == "decode":
             # SGLang 0.5.x expects top_logprobs_num at the /generate payload

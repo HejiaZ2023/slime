@@ -187,8 +187,8 @@ def add_agentic_args(parser):
     parser.add_argument(
         "--opd-student-topk-mode",
         choices=("decode", "posthoc"),
-        default="decode",
-        help="Recover student OPD top-k ids during decode or with an exact posthoc prefill.",
+        default="posthoc",
+        help="Recover student OPD top-k ids with an exact posthoc prefill or during decode.",
     )
     parser.add_argument(
         "--opd-gate-eps",
