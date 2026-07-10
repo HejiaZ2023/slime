@@ -35,6 +35,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -475,6 +476,14 @@ def _coerce_int_matrix(value: Any) -> list[list[int]] | None:
 
 def _matrix_has_shape(value: list[list[Any]] | None, rows: int, cols: int) -> bool:
     return value is not None and len(value) == rows and all(len(row) == cols for row in value)
+
+
+def _float_list_is_finite(value: list[float] | None) -> bool:
+    return value is not None and all(math.isfinite(item) for item in value)
+
+
+def _float_matrix_is_finite(value: list[list[float]] | None) -> bool:
+    return value is not None and all(math.isfinite(item) for row in value for item in row)
 
 
 def _entry_reward(entry: dict[str, Any]) -> float:
@@ -1136,6 +1145,8 @@ async def _score_group_with_opd_relay(
         best_teacher_name = str(best_teacher.get("teacher") or best_teacher.get("teacher_name") or "")
         requested_topk = int(getattr(args, "opd_topk", 0) or 0)
         require_topk = requested_topk > 1
+        opd_algorithm = str(getattr(args, "opd_algorithm", "vopd_topk") or "vopd_topk")
+        require_vopd_topk = opd_algorithm == "vopd_topk"
 
         eligible_samples: list[Sample] = []
         ineligible_reasons: dict[str, int] = {}
@@ -1242,6 +1253,7 @@ async def _score_group_with_opd_relay(
                     _matrix_has_shape(topk_ids, expected, width)
                     and _matrix_has_shape(teacher_topk, expected, width)
                     and _matrix_has_shape(teacher_masks, expected, width)
+                    and (not require_vopd_topk or _matrix_has_shape(student_topk, expected, width))
                 ):
                     topk_valid = False
                     sample.metadata["opd_gate_reason"] = (
@@ -1256,20 +1268,49 @@ async def _score_group_with_opd_relay(
                         f"teacher_topk_incomplete hit={mask_hit:.0f}/{mask_total}"
                     )
                     break
-                if student_topk is not None and not _matrix_has_shape(student_topk, expected, width):
-                    student_topk = None
-                topk_by_index[int(sample.index)] = (topk_ids, student_topk, teacher_topk, teacher_masks)
+                teacher_log_probs = _student_teacher_log_probs(sample)
+                if require_vopd_topk:
+                    if any(float(value) != 1.0 for row in teacher_masks for value in row):
+                        topk_valid = False
+                        sample.metadata["opd_gate_reason"] = "vopd_teacher_topk_mask_not_exact"
+                        break
+                    if teacher_log_probs is None or len(teacher_log_probs) != expected:
+                        topk_valid = False
+                        sample.metadata["opd_gate_reason"] = (
+                            f"vopd_teacher_logprob_len={len(teacher_log_probs) if teacher_log_probs is not None else 'missing'} "
+                            f"expected={expected}"
+                        )
+                        break
+                    if not (
+                        _float_list_is_finite(teacher_log_probs)
+                        and _float_matrix_is_finite(student_topk)
+                        and _float_matrix_is_finite(teacher_topk)
+                        and _float_matrix_is_finite(teacher_masks)
+                    ):
+                        topk_valid = False
+                        sample.metadata["opd_gate_reason"] = "vopd_nonfinite_teacher_or_topk_logprob"
+                        break
+                topk_by_index[int(sample.index)] = (
+                    topk_ids,
+                    student_topk,
+                    teacher_topk,
+                    teacher_masks,
+                    teacher_log_probs,
+                )
 
         if topk_valid:
             for sample in eligible_samples:
-                topk_ids, student_topk, teacher_topk, teacher_masks = topk_by_index[int(sample.index)]
+                topk_ids, student_topk, teacher_topk, teacher_masks, teacher_log_probs = topk_by_index[int(sample.index)]
                 sample.rollout_topk_token_ids = topk_ids
                 sample.rollout_topk_log_probs = student_topk
                 sample.teacher_topk_log_probs = teacher_topk
                 sample.teacher_topk_logprob_masks = teacher_masks
+                if require_vopd_topk:
+                    sample.teacher_log_probs = teacher_log_probs
                 sample.metadata["opd_gate_pass"] = True
                 sample.metadata["opd_teacher_logprob_teacher"] = best_teacher_name
                 sample.metadata["opd_topk"] = requested_topk
+                sample.metadata["opd_algorithm"] = opd_algorithm
                 sample.metadata["opd_topk_teacher_coverage"] = (
                     sum(sum(float(x) for x in row) for row in teacher_masks) / max(1, requested_topk * int(sample.response_length or 0))
                 )
@@ -1281,6 +1322,19 @@ async def _score_group_with_opd_relay(
                     best_teacher_reward=best_teacher_reward,
                     teacher=best_teacher_name,
                     opd_topk=requested_topk,
+                    opd_algorithm=opd_algorithm,
+                )
+            if require_vopd_topk:
+                logger.info(
+                    "OPD_VOPD step=%d dataset_id=%s round=%d job=%s teacher=%s "
+                    "samples=%d topk=%d sampled_teacher_logprobs=complete",
+                    rollout_id,
+                    dataset_id,
+                    round_idx + 1,
+                    job_id,
+                    best_teacher_name,
+                    len(eligible_samples),
+                    requested_topk,
                 )
             _log_score_timing("opd_topk")
             return group, group

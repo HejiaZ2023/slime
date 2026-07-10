@@ -162,7 +162,7 @@ def add_agentic_args(parser):
         help=(
             "Enable OPD relay training. Student rollouts are generated locally, "
             "student/teacher EDA is delegated to the paladin relay, and a gated "
-            "student top-k KL is used instead of RL loss for that prompt-round "
+            "sampled-token vOPD objective is used instead of RL loss for that prompt-round "
             "when the best teacher beats the best student."
         ),
     )
@@ -182,7 +182,17 @@ def add_agentic_args(parser):
         "--opd-topk",
         type=int,
         default=16,
-        help="Student top-k tokens per generated position used for OPD KL; <=1 uses sampled-token fallback.",
+        help="Student top-k tokens per generated position used by the vOPD control-variate baseline.",
+    )
+    parser.add_argument(
+        "--opd-algorithm",
+        choices=("vopd_topk", "legacy_topk_kl"),
+        default="vopd_topk",
+        help=(
+            "OPD objective. vopd_topk uses sampled-token OPD with a detached "
+            "support-normalized top-k control variate; legacy_topk_kl preserves "
+            "the old directly optimized raw truncated-KL behavior."
+        ),
     )
     parser.add_argument(
         "--opd-student-topk-mode",
@@ -285,6 +295,8 @@ if __name__ == "__main__":
     if getattr(args, "use_opd_relay", False):
         if not getattr(args, "opd_teachers", ""):
             raise ValueError("--use-opd-relay requires --opd-teachers")
+        if args.opd_algorithm == "vopd_topk" and int(args.opd_topk or 0) <= 1:
+            raise ValueError("--opd-algorithm vopd_topk requires --opd-topk >= 2")
 
     logger.info("=== llm4cov slime RL training config ===")
 

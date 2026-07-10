@@ -89,6 +89,8 @@ OVERRIDE_OPT_PARAM_SCHEDULER=${OVERRIDE_OPT_PARAM_SCHEDULER:-0}
 OPD_ARGS=()
 OPD_POLL=${OPD_POLL:-1}
 OPD_POLL_SPECIFIED=0
+OPD_ALGORITHM=${OPD_ALGORITHM:-vopd_topk}
+OPD_ALGORITHM_SPECIFIED=0
 NO_FINAL_SAVE=${NO_FINAL_SAVE:-auto}
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -130,6 +132,8 @@ while [ $# -gt 0 ]; do
                                   N_STUDENT="${1#*=}" ;;
         --use-opd-relay|--opd-score-student-rollouts)
                                   OPD_ARGS+=("$1") ;;
+        --opd-algorithm)          OPD_ALGORITHM="${2:?--opd-algorithm requires a value}"; OPD_ALGORITHM_SPECIFIED=1; OPD_ARGS+=("$1" "${OPD_ALGORITHM}"); shift ;;
+        --opd-algorithm=*)        OPD_ALGORITHM="${1#--opd-algorithm=}"; OPD_ALGORITHM_SPECIFIED=1; OPD_ARGS+=("$1") ;;
         --opd-poll)               OPD_POLL="${2:?--opd-poll requires a value}"; OPD_POLL_SPECIFIED=1; OPD_ARGS+=("$1" "${OPD_POLL}"); shift ;;
         --opd-poll=*)             OPD_POLL="${1#--opd-poll=}"; OPD_POLL_SPECIFIED=1; OPD_ARGS+=("$1") ;;
         --opd-teachers|--opd-lambda|--opd-topk|--opd-student-topk-mode|--opd-gate-eps|--opd-timeout|--opd-namespace|--opd-server|--opd-transport|--opd-http-url|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
@@ -142,6 +146,9 @@ while [ $# -gt 0 ]; do
 done
 if [ "${#OPD_ARGS[@]}" -gt 0 ] && [ "${OPD_POLL_SPECIFIED}" = "0" ]; then
     OPD_ARGS+=(--opd-poll "${OPD_POLL}")
+fi
+if [ "${#OPD_ARGS[@]}" -gt 0 ] && [ "${OPD_ALGORITHM_SPECIFIED}" = "0" ]; then
+    OPD_ARGS+=(--opd-algorithm "${OPD_ALGORITHM}")
 fi
 
 # clean up stale ray / sglang / python from prior runs
@@ -695,6 +702,9 @@ echo "[run] num_agentic_rounds=${NUM_AGENTIC_ROUNDS}  eval_num_agentic_rounds=3"
 echo "[run] offload=${OFFLOAD}  eda_log_feedback_train=${EDA_LOG_FEEDBACK_TRAIN}  eda_log_feedback_eval=${EDA_LOG_FEEDBACK_EVAL}  use_uncovered_log=${USE_UNCOVERED_LOG}  use_uncovered_reward=${USE_UNCOVERED_REWARD}  div_lam=${DIV_LAM:-unset}" | tee -a "${LOCAL_LOG}"
 echo "[run] max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}  no_final_save=${NO_FINAL_SAVE}" | tee -a "${LOCAL_LOG}"
 echo "[run] train_dataset=${LLM4COV_DATASET}  eval_dataset=${LLM4COV_EVAL_DATASET}" | tee -a "${LOCAL_LOG}"
+if [ "${#OPD_ARGS[@]}" -gt 0 ]; then
+    echo "[run] opd_algorithm=${OPD_ALGORITHM}  opd_poll=${OPD_POLL}" | tee -a "${LOCAL_LOG}"
+fi
 echo "[run] ROTARY_BASE=${ROTARY_BASE}" | tee -a "${LOCAL_LOG}"
 echo "[run] ─────────────────────────────────────────────────────────" | tee -a "${LOCAL_LOG}"
 

@@ -692,7 +692,9 @@ def build_student_score_files(
     return files
 
 
-def _load_teacher_topk_sidecar(result_dir: Path, sidecar: dict[str, Any]) -> tuple[list[list[float]], list[list[float]]]:
+def _load_teacher_topk_sidecar(
+    result_dir: Path, sidecar: dict[str, Any]
+) -> tuple[list[list[float]], list[list[float]], list[float] | None]:
     rel = _safe_relpath(str(sidecar.get("file") or ""))
     path = result_dir / rel
     if not path.exists():
@@ -701,7 +703,8 @@ def _load_teacher_topk_sidecar(result_dir: Path, sidecar: dict[str, Any]) -> tup
     actual_sha = _sha256_file(path)
     if expected_sha and actual_sha != expected_sha:
         raise ValueError(f"bad OPD sidecar sha256 for {path}: {actual_sha} != {expected_sha}")
-    if sidecar.get("format") != "npz_v1":
+    sidecar_format = sidecar.get("format")
+    if sidecar_format not in {"npz_v1", "npz_v2"}:
         raise ValueError(f"unsupported OPD sidecar format at {path}: {sidecar.get('format')!r}")
 
     import numpy as np  # type: ignore[import-untyped]
@@ -716,7 +719,22 @@ def _load_teacher_topk_sidecar(result_dir: Path, sidecar: dict[str, Any]) -> tup
                 raise ValueError(
                     f"bad OPD sidecar shape at {path}: log_probs={log_probs.shape} masks={masks.shape} expected={expected}"
                 )
-        return log_probs.tolist(), masks.tolist()
+        sampled_log_probs = None
+        if sidecar_format == "npz_v2":
+            if "teacher_log_probs" not in data:
+                raise ValueError(f"missing vOPD sampled log-prob vector at {path}")
+            sampled = data["teacher_log_probs"].astype("float32", copy=False)
+            expected_sampled_shape = sidecar.get("teacher_log_probs_shape")
+            if isinstance(expected_sampled_shape, list) and len(expected_sampled_shape) == 1:
+                expected_sampled = (int(expected_sampled_shape[0]),)
+            else:
+                expected_sampled = (int(log_probs.shape[0]),)
+            if tuple(sampled.shape) != expected_sampled:
+                raise ValueError(
+                    f"bad vOPD sampled-logprob shape at {path}: sampled={sampled.shape} expected={expected_sampled}"
+                )
+            sampled_log_probs = sampled.tolist()
+        return log_probs.tolist(), masks.tolist(), sampled_log_probs
 
 
 def _hydrate_teacher_topk_sidecars(result: dict[str, Any], result_dir: Path) -> None:
@@ -726,14 +744,19 @@ def _hydrate_teacher_topk_sidecars(result: dict[str, Any], result_dir: Path) -> 
         for score in entry.get("teacher_scores") or []:
             if not isinstance(score, dict):
                 continue
-            if score.get("teacher_topk_log_probs") and score.get("teacher_topk_logprob_masks"):
+            has_topk = bool(score.get("teacher_topk_log_probs") and score.get("teacher_topk_logprob_masks"))
+            has_sampled = bool(score.get("teacher_log_probs"))
+            if has_topk and has_sampled:
                 continue
             sidecar = score.get("teacher_topk_sidecar")
             if not isinstance(sidecar, dict):
                 continue
-            log_probs, masks = _load_teacher_topk_sidecar(result_dir, sidecar)
-            score["teacher_topk_log_probs"] = log_probs
-            score["teacher_topk_logprob_masks"] = masks
+            log_probs, masks, sampled_log_probs = _load_teacher_topk_sidecar(result_dir, sidecar)
+            if not has_topk:
+                score["teacher_topk_log_probs"] = log_probs
+                score["teacher_topk_logprob_masks"] = masks
+            if not has_sampled and sampled_log_probs is not None:
+                score["teacher_log_probs"] = sampled_log_probs
 
 
 def load_result_tree(result_dir: str | Path) -> dict[str, Any]:

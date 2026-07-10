@@ -624,10 +624,16 @@ def sync_actor_critic_data(
     (from actor) across PP ranks to align data dependencies.
 
     - Values are broadcast from src=1.
-    - Log-probs and ref-log-probs are broadcast from src=0 when KL is used.
+    - Log-probs are broadcast from src=0 when KL or vOPD needs a frozen
+      behavior-policy vector; ref-log-probs are broadcast only when KL is used.
     Updates `rollout_data` in place with the synchronized tensors.
     """
-    log_probs_key = "log_probs" if not args.use_rollout_logprobs else "rollout_log_probs"
+    uses_vopd_topk = (
+        bool(getattr(args, "use_opd_relay", False))
+        and str(getattr(args, "opd_algorithm", "vopd_topk") or "vopd_topk") == "vopd_topk"
+        and int(getattr(args, "opd_topk", 0) or 0) > 1
+    )
+    log_probs_key = "rollout_log_probs" if (args.use_rollout_logprobs or uses_vopd_topk) else "log_probs"
     values, log_probs, ref_log_probs = map(rollout_data.get, ("values", log_probs_key, "ref_log_probs"))
 
     # return when not the pp last stage
@@ -641,13 +647,18 @@ def sync_actor_critic_data(
     for value in values:
         handles.append(dist.broadcast(value, src=1, group=group, async_op=True))
 
-    if args.kl_coef != 0 or args.use_kl_loss:
+    needs_ref_log_probs = args.kl_coef != 0 or args.use_kl_loss
+    needs_log_probs = needs_ref_log_probs or uses_vopd_topk
+    if needs_log_probs:
         if not log_probs:
             log_probs = [torch.empty_like(value) for value in values]
+        for log_prob in log_probs:
+            handles.append(dist.broadcast(log_prob, src=0, group=group, async_op=True))
+
+    if needs_ref_log_probs:
         if not ref_log_probs:
             ref_log_probs = [torch.empty_like(value) for value in values]
-        for ref_log_prob, log_prob in zip(ref_log_probs, log_probs, strict=False):
-            handles.append(dist.broadcast(log_prob, src=0, group=group, async_op=True))
+        for ref_log_prob in ref_log_probs:
             handles.append(dist.broadcast(ref_log_prob, src=0, group=group, async_op=True))
 
     for handle in handles:

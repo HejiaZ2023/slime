@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from slime.utils.opd import vopd_topk_statistics
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -634,6 +635,88 @@ def apply_opd_kl_to_advantages(
     rollout_data["opd_reverse_kl"] = reverse_kls
 
 
+def _opd_algorithm(args: Namespace) -> str:
+    return str(getattr(args, "opd_algorithm", "vopd_topk") or "vopd_topk")
+
+
+@torch.no_grad()
+def apply_vopd_topk_to_advantages(
+    args: Namespace,
+    rollout_data: RolloutBatch,
+    advantages: list[torch.Tensor],
+) -> None:
+    """Apply sampled-token OPD with a detached normalized top-k baseline.
+
+    This is the vOPD estimator.  The sampled-token term supplies the unbiased
+    OPD policy-gradient signal; the support-normalized top-k KL is only a
+    control variate and never receives a policy gradient.
+    """
+
+    rollout_log_probs = rollout_data.get("rollout_log_probs")
+    teacher_log_probs = rollout_data.get("teacher_log_probs")
+    student_topk = rollout_data.get("opd_topk_student_log_probs")
+    teacher_topk = rollout_data.get("opd_topk_teacher_log_probs")
+    topk_masks = rollout_data.get("opd_topk_masks")
+    loss_types = rollout_data.get("loss_types") or []
+    if any(value is None for value in (rollout_log_probs, teacher_log_probs, student_topk, teacher_topk, topk_masks)):
+        raise ValueError("vOPD requires rollout sampled log-probs and complete student/teacher top-k tensors.")
+
+    teacher_masks = rollout_data.get("teacher_logprob_masks")
+    default_coef = float(getattr(args, "opd_lambda", getattr(args, "opd_kl_coef", 0.0)) or 0.0)
+    opd_weights = rollout_data.get("opd_weights") or [default_coef] * len(advantages)
+    sampled_kls: list[torch.Tensor] = []
+    baseline_kls: list[torch.Tensor] = []
+    centered_kls: list[torch.Tensor] = []
+
+    for i, advantage in enumerate(advantages):
+        if i >= len(loss_types) or loss_types[i] != "opd":
+            sampled_kls.append(torch.zeros_like(advantage, dtype=torch.float32))
+            baseline_kls.append(torch.zeros_like(advantage, dtype=torch.float32))
+            centered_kls.append(torch.zeros_like(advantage, dtype=torch.float32))
+            continue
+
+        rollout_lp = rollout_log_probs[i].to(device=advantage.device, dtype=torch.float32)
+        teacher_lp = teacher_log_probs[i].to(device=advantage.device, dtype=torch.float32)
+        if rollout_lp.shape != teacher_lp.shape or rollout_lp.shape != advantage.shape:
+            raise ValueError(
+                f"vOPD sampled log-prob shape mismatch sample={i}: "
+                f"rollout={tuple(rollout_lp.shape)} teacher={tuple(teacher_lp.shape)} "
+                f"advantage={tuple(advantage.shape)}"
+            )
+        if teacher_masks is None:
+            teacher_valid = torch.ones_like(rollout_lp, dtype=torch.bool)
+        else:
+            teacher_valid = teacher_masks[i].to(device=advantage.device, dtype=torch.bool)
+            if teacher_valid.shape != rollout_lp.shape:
+                raise ValueError(
+                    f"vOPD sampled mask shape mismatch sample={i}: "
+                    f"mask={tuple(teacher_valid.shape)} expected={tuple(rollout_lp.shape)}"
+                )
+        stats = vopd_topk_statistics(
+            student_topk[i].to(device=advantage.device),
+            teacher_topk[i].to(device=advantage.device),
+            topk_masks[i].to(device=advantage.device),
+            validate=False,
+        )
+        baseline_kl = stats["baseline_kl"]
+        if baseline_kl.shape != rollout_lp.shape:
+            raise ValueError(
+                f"vOPD baseline shape mismatch sample={i}: "
+                f"baseline={tuple(baseline_kl.shape)} expected={tuple(rollout_lp.shape)}"
+            )
+        sampled_kl = rollout_lp - teacher_lp
+        centered_kl = sampled_kl - baseline_kl
+        coef = float(opd_weights[i]) if i < len(opd_weights) else default_coef
+        advantages[i] = (advantage.to(dtype=torch.float32) - coef * centered_kl).to(dtype=advantage.dtype)
+        sampled_kls.append(sampled_kl)
+        baseline_kls.append(baseline_kl)
+        centered_kls.append(centered_kl)
+
+    rollout_data["opd_vopd_sampled_kl"] = sampled_kls
+    rollout_data["opd_vopd_baseline_kl"] = baseline_kls
+    rollout_data["opd_vopd_centered_kl"] = centered_kls
+
+
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
@@ -737,7 +820,14 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     has_topk_opd = rollout_data.get("opd_topk_token_ids") is not None and any(
         loss_type == "opd" for loss_type in loss_types
     )
-    if (args.use_opd or has_relay_opd) and not has_topk_opd:
+    has_vopd_topk = has_topk_opd and _opd_algorithm(args) == "vopd_topk"
+    if has_vopd_topk:
+        apply_vopd_topk_to_advantages(
+            args=args,
+            rollout_data=rollout_data,
+            advantages=advantages,
+        )
+    elif (args.use_opd or has_relay_opd) and not has_topk_opd:
         apply_opd_kl_to_advantages(
             args=args,
             rollout_data=rollout_data,
@@ -886,8 +976,6 @@ def policy_loss_function(
         are enabled.
     """
     advantages = torch.cat(batch["advantages"], dim=0)
-    old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
-
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
@@ -900,6 +988,11 @@ def policy_loss_function(
         and batch.get("opd_topk_token_ids") is not None
         and batch.get("opd_topk_teacher_log_probs") is not None
     )
+    has_vopd_topk = has_topk_opd and _opd_algorithm(args) == "vopd_topk"
+    has_legacy_topk_opd = has_topk_opd and _opd_algorithm(args) == "legacy_topk_kl"
+    if has_vopd_topk and batch.get("rollout_log_probs") is None:
+        raise ValueError("vOPD requires rollout_log_probs as the frozen behavior-policy log-probs.")
+    old_log_probs = batch["rollout_log_probs"] if (args.use_rollout_logprobs or has_vopd_topk) else batch["log_probs"]
     rl_loss_masks = [
         loss_mask if loss_type == "rl" else torch.zeros_like(loss_mask)
         for loss_mask, loss_type in zip(base_loss_masks, loss_types, strict=False)
@@ -939,9 +1032,10 @@ def policy_loss_function(
         max_seq_lens=max_seq_lens,
     )
 
-    log_probs = log_probs_and_entropy["log_probs"]
+    log_probs_by_sample = log_probs_and_entropy["log_probs"]
+    log_probs = log_probs_by_sample
     topk_log_probs = None
-    if has_topk_opd:
+    if has_legacy_topk_opd:
         topk_log_probs = get_topk_log_probs(
             logits,
             args=args,
@@ -1075,8 +1169,15 @@ def policy_loss_function(
     opd_topk_kl = None
     opd_topk_mass = None
     opd_topk_teacher_coverage = None
+    opd_vopd_sampled_kl = None
+    opd_vopd_baseline_kl = None
+    opd_vopd_centered_kl = None
+    opd_vopd_advantage = None
+    opd_student_support_mass = None
+    opd_teacher_support_mass = None
+    opd_vopd_support_coverage = None
     if has_opd_samples:
-        if has_topk_opd and topk_log_probs is not None:
+        if has_legacy_topk_opd and topk_log_probs is not None:
             default_opd_weight = float(getattr(args, "opd_lambda", 1.0) or 0.0)
             opd_weights = batch.get("opd_weights") or [default_opd_weight] * len(response_lengths)
             token_kls = []
@@ -1108,7 +1209,87 @@ def policy_loss_function(
         else:
             opd_loss = opd_sum_of_sample_mean(pg_loss_tokens)
 
-            if batch.get("teacher_log_probs") is not None:
+            if has_vopd_topk:
+                if (
+                    batch.get("rollout_log_probs") is None
+                    or batch.get("teacher_log_probs") is None
+                    or batch.get("opd_topk_student_log_probs") is None
+                    or batch.get("opd_topk_teacher_log_probs") is None
+                    or batch.get("opd_topk_masks") is None
+                ):
+                    raise ValueError("vOPD batch is missing frozen sampled or top-k teacher/student log-probs.")
+
+                sampled_values = []
+                baseline_values = []
+                centered_values = []
+                advantage_values = []
+                student_mass_values = []
+                teacher_mass_values = []
+                support_coverage_values = []
+                teacher_coverage_values = []
+                for i, loss_type in enumerate(loss_types):
+                    zeros = torch.zeros_like(per_sample_log_probs[i], dtype=torch.float32)
+                    if loss_type != "opd":
+                        sampled_values.append(zeros)
+                        baseline_values.append(zeros)
+                        centered_values.append(zeros)
+                        advantage_values.append(zeros)
+                        student_mass_values.append(zeros)
+                        teacher_mass_values.append(zeros)
+                        support_coverage_values.append(zeros)
+                        teacher_coverage_values.append(zeros)
+                        continue
+
+                    rollout_lp = batch["rollout_log_probs"][i].to(device=log_probs.device, dtype=torch.float32)
+                    teacher_lp = batch["teacher_log_probs"][i].to(device=log_probs.device, dtype=torch.float32)
+                    if rollout_lp.shape != teacher_lp.shape or rollout_lp.shape != per_sample_log_probs[i].shape:
+                        raise ValueError(
+                            f"vOPD sampled log-prob shape mismatch sample={i}: "
+                            f"rollout={tuple(rollout_lp.shape)} teacher={tuple(teacher_lp.shape)} "
+                            f"expected={tuple(per_sample_log_probs[i].shape)}"
+                        )
+                    if batch.get("teacher_logprob_masks") is None:
+                        teacher_valid = torch.ones_like(rollout_lp, dtype=torch.bool)
+                    else:
+                        teacher_valid = batch["teacher_logprob_masks"][i].to(device=log_probs.device, dtype=torch.bool)
+                    if teacher_valid.shape != rollout_lp.shape:
+                        raise ValueError(f"vOPD requires a complete sampled teacher log-prob mask for sample={i}")
+                    topk_stats = vopd_topk_statistics(
+                        batch["opd_topk_student_log_probs"][i].to(device=log_probs.device),
+                        batch["opd_topk_teacher_log_probs"][i].to(device=log_probs.device),
+                        batch["opd_topk_masks"][i].to(device=log_probs.device),
+                        validate=False,
+                    )
+                    if topk_stats["baseline_kl"].shape != rollout_lp.shape:
+                        raise ValueError(f"vOPD requires complete finite top-k support for sample={i}")
+
+                    sampled_kl = rollout_lp - teacher_lp
+                    baseline_kl = topk_stats["baseline_kl"]
+                    sampled_values.append(sampled_kl)
+                    baseline_values.append(baseline_kl)
+                    centered_values.append(sampled_kl - baseline_kl)
+                    advantage_values.append(batch["advantages"][i].to(device=log_probs.device, dtype=torch.float32))
+                    student_mass_values.append(topk_stats["student_support_mass"])
+                    teacher_mass_values.append(topk_stats["teacher_support_mass"])
+                    support_coverage_values.append(topk_stats["support_coverage"])
+                    teacher_coverage_values.append(teacher_valid.to(dtype=torch.float32))
+
+                opd_vopd_sampled_kl = opd_sum_of_sample_mean(torch.cat(sampled_values, dim=0))
+                opd_vopd_baseline_kl = opd_sum_of_sample_mean(torch.cat(baseline_values, dim=0))
+                opd_vopd_centered_kl = opd_sum_of_sample_mean(torch.cat(centered_values, dim=0))
+                opd_vopd_advantage = opd_sum_of_sample_mean(torch.cat(advantage_values, dim=0))
+                opd_student_support_mass = opd_sum_of_sample_mean(torch.cat(student_mass_values, dim=0))
+                opd_teacher_support_mass = opd_sum_of_sample_mean(torch.cat(teacher_mass_values, dim=0))
+                opd_vopd_support_coverage = opd_sum_of_sample_mean(torch.cat(support_coverage_values, dim=0))
+                opd_teacher_logprob_coverage = opd_sum_of_sample_mean(torch.cat(teacher_coverage_values, dim=0))
+
+                # Legacy names remain populated for existing dashboards.  In
+                # vOPD, opd_topk_kl is the detached control-variate baseline,
+                # never a directly optimized raw truncated KL loss.
+                opd_topk_kl = opd_vopd_baseline_kl
+                opd_topk_mass = opd_student_support_mass
+                opd_topk_teacher_coverage = opd_vopd_support_coverage
+            elif batch.get("teacher_log_probs") is not None:
                 teacher_log_probs = torch.cat(batch["teacher_log_probs"], dim=0).to(device=log_probs.device)
                 if batch.get("teacher_logprob_masks") is not None:
                     teacher_valid = torch.cat(batch["teacher_logprob_masks"], dim=0).to(
@@ -1162,6 +1343,20 @@ def policy_loss_function(
         reported_loss["opd_sampled_kl"] = opd_sampled_kl.clone().detach()
     if opd_teacher_logprob_coverage is not None:
         reported_loss["opd_teacher_logprob_coverage"] = opd_teacher_logprob_coverage.clone().detach()
+    if opd_vopd_sampled_kl is not None:
+        reported_loss["opd_vopd_sampled_kl"] = opd_vopd_sampled_kl.clone().detach()
+    if opd_vopd_baseline_kl is not None:
+        reported_loss["opd_vopd_baseline_kl"] = opd_vopd_baseline_kl.clone().detach()
+    if opd_vopd_centered_kl is not None:
+        reported_loss["opd_vopd_centered_kl"] = opd_vopd_centered_kl.clone().detach()
+    if opd_vopd_advantage is not None:
+        reported_loss["opd_vopd_advantage"] = opd_vopd_advantage.clone().detach()
+    if opd_student_support_mass is not None:
+        reported_loss["opd_student_support_mass"] = opd_student_support_mass.clone().detach()
+    if opd_teacher_support_mass is not None:
+        reported_loss["opd_teacher_support_mass"] = opd_teacher_support_mass.clone().detach()
+    if opd_vopd_support_coverage is not None:
+        reported_loss["opd_vopd_support_coverage"] = opd_vopd_support_coverage.clone().detach()
     if opd_topk_kl is not None:
         reported_loss["opd_topk_kl"] = opd_topk_kl.clone().detach()
     if opd_topk_mass is not None:
@@ -1179,6 +1374,17 @@ def policy_loss_function(
         reported_loss.setdefault("opd_topk_kl", zero_opd_topk_metric)
         reported_loss.setdefault("opd_topk_mass", zero_opd_topk_metric)
         reported_loss.setdefault("opd_topk_teacher_coverage", zero_opd_topk_metric)
+        if has_vopd_topk:
+            for key in (
+                "opd_vopd_sampled_kl",
+                "opd_vopd_baseline_kl",
+                "opd_vopd_centered_kl",
+                "opd_vopd_advantage",
+                "opd_student_support_mass",
+                "opd_teacher_support_mass",
+                "opd_vopd_support_coverage",
+            ):
+                reported_loss.setdefault(key, zero_opd_topk_metric)
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()

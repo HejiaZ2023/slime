@@ -1450,7 +1450,9 @@ def score_teacher_on_student(
         "teacher": name,
         "teacher_model_path": teacher_model_path(name, cfg),
         "status": status,
-        "teacher_log_probs": teacher_log_probs if requested_topk is None else [],
+        # The sampled-token scores come from the same forced-scoring request as
+        # the top-k rows.  vOPD uses them as its unbiased main estimator.
+        "teacher_log_probs": teacher_log_probs,
         "topk_token_ids_sha256": requested_topk_sha256,
         "response_token_count": response_len,
         "num_teacher_log_probs": len(teacher_log_probs),
@@ -1595,6 +1597,7 @@ def _write_teacher_topk_sidecar(
     score_idx: int,
     log_probs: Any,
     masks: Any,
+    sampled_log_probs: Any | None = None,
     token_ids_sha256: str | None = None,
 ) -> dict[str, Any]:
     import numpy as np  # type: ignore[import-untyped]
@@ -1614,13 +1617,26 @@ def _write_teacher_topk_sidecar(
             "bad teacher top-k sidecar shape "
             f"student={student_id} teacher={teacher} log_probs={log_probs_arr.shape} masks={masks_arr.shape}"
         )
-    np.savez_compressed(
-        path,
-        teacher_topk_log_probs=log_probs_arr,
-        teacher_topk_logprob_masks=masks_arr,
-    )
-    return {
-        "format": "npz_v1",
+    arrays: dict[str, Any] = {
+        "teacher_topk_log_probs": log_probs_arr,
+        "teacher_topk_logprob_masks": masks_arr,
+    }
+    sampled_arr = None
+    if sampled_log_probs is not None:
+        # This vector is tiny relative to the T x K matrix and drives the
+        # unbiased vOPD term, so keep it float32 even if the optional top-k
+        # sidecar compression is configured to use float16.
+        sampled_arr = np.asarray(sampled_log_probs, dtype=np.float32)
+        if sampled_arr.ndim != 1 or sampled_arr.shape[0] != log_probs_arr.shape[0]:
+            raise ValueError(
+                "bad teacher sampled-logprob sidecar shape "
+                f"student={student_id} teacher={teacher} sampled={sampled_arr.shape} "
+                f"expected=({log_probs_arr.shape[0]},)"
+            )
+        arrays["teacher_log_probs"] = sampled_arr
+    np.savez_compressed(path, **arrays)
+    descriptor = {
+        "format": "npz_v2" if sampled_arr is not None else "npz_v1",
         "file": rel,
         "sha256": _sha256_file(path),
         "shape": [int(log_probs_arr.shape[0]), int(log_probs_arr.shape[1])],
@@ -1629,6 +1645,10 @@ def _write_teacher_topk_sidecar(
         "aligned_to": "student_topk_token_ids_order",
         "topk_token_ids_sha256": token_ids_sha256 or "",
     }
+    if sampled_arr is not None:
+        descriptor["teacher_log_probs_shape"] = [int(sampled_arr.shape[0])]
+        descriptor["teacher_log_probs_dtype"] = str(sampled_arr.dtype)
+    return descriptor
 
 
 def _materialize_score_sidecars(obj: dict[str, Any], staging: Path) -> None:
@@ -1642,6 +1662,9 @@ def _materialize_score_sidecars(obj: dict[str, Any], staging: Path) -> None:
             masks = score.pop("teacher_topk_logprob_masks", None)
             if not log_probs or not masks:
                 continue
+            sampled_log_probs = score.get("teacher_log_probs")
+            if not isinstance(sampled_log_probs, list) or len(sampled_log_probs) != len(log_probs):
+                sampled_log_probs = None
             score["teacher_topk_sidecar"] = _write_teacher_topk_sidecar(
                 staging,
                 student_id=str(entry.get("id") or score.get("student_id") or "student"),
@@ -1649,8 +1672,11 @@ def _materialize_score_sidecars(obj: dict[str, Any], staging: Path) -> None:
                 score_idx=score_idx,
                 log_probs=log_probs,
                 masks=masks,
+                sampled_log_probs=sampled_log_probs,
                 token_ids_sha256=str(score.get("topk_token_ids_sha256") or ""),
             )
+            if sampled_log_probs is not None:
+                score.pop("teacher_log_probs", None)
 
 
 def _compact_score(score: dict[str, Any]) -> dict[str, Any]:
