@@ -1,8 +1,11 @@
 import dataclasses
 import gc
+import json
 import logging
 import math
 import os
+import shutil
+import time
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from functools import partial
@@ -31,6 +34,44 @@ from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 logger = logging.getLogger(__name__)
+
+
+def _distributed_barrier() -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _is_global_rank_zero() -> bool:
+    return not (torch.distributed.is_available() and torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+
+
+def _broadcast_rank_zero_bool(value: bool, model: Sequence[DDP]) -> bool:
+    """Broadcast a rank-zero filesystem outcome without exposing partial saves."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return value
+    device = next(model[0].parameters()).device
+    flag = torch.tensor([int(value if _is_global_rank_zero() else False)], device=device, dtype=torch.int32)
+    torch.distributed.broadcast(flag, src=0)
+    return bool(int(flag.item()))
+
+
+def _write_checkpoint_complete_marker(path: Path, *, kind: str, iteration: int) -> None:
+    """Publish an atomic, size-manifested completion marker for sync clients."""
+    files = [
+        {"path": item.relative_to(path).as_posix(), "bytes": item.stat().st_size}
+        for item in sorted(path.rglob("*"))
+        if item.is_file() and item.name != ".complete.json"
+    ]
+    marker = {
+        "version": 1,
+        "kind": kind,
+        "iteration": int(iteration),
+        "created_at_unix": time.time(),
+        "files": files,
+    }
+    temporary = path / ".complete.json.tmp"
+    temporary.write_text(json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path / ".complete.json")
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -719,6 +760,21 @@ def save(
         train_data_iterator=None,
         preprocess_common_state_dict_fn=None,
     )
+    if getattr(args, "async_save", False):
+        # A completion marker must never race an asynchronous distcp writer.
+        # The current OPD recipe leaves async save disabled, but preserve the
+        # marker contract for callers that enable it later.
+        from megatron.training.async_utils import maybe_finalize_async_save
+
+        maybe_finalize_async_save(blocking=True)
+    _distributed_barrier()
+    if _is_global_rank_zero():
+        native_path = Path(args.save) / f"iter_{iteration:07d}"
+        if native_path.is_dir():
+            _write_checkpoint_complete_marker(native_path, kind="torch_dist", iteration=iteration)
+        else:
+            logger.warning("Native checkpoint completion marker skipped; missing directory %s", native_path)
+    _distributed_barrier()
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
 
@@ -733,6 +789,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
     should_log = (
         mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
     )
+    is_root = _is_global_rank_zero()
 
     try:
         from megatron.bridge import AutoBridge
@@ -740,25 +797,52 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         from slime.utils.megatron_bridge_utils import patch_megatron_model
 
         path = Path(args.save_hf.format(rollout_id=rollout_id))
+        staging = path.with_name(f".{path.name}.staging")
 
         if should_log:
-            logger.info(f"Saving model in HuggingFace format to {path}")
+            logger.info(f"Saving model in HuggingFace format to {path} via {staging}")
+
+        can_publish = True
+        if is_root:
+            if path.exists():
+                logger.error("Refusing to overwrite an existing HF checkpoint: %s", path)
+                can_publish = False
+            else:
+                if staging.exists():
+                    shutil.rmtree(staging)
+                staging.mkdir(parents=True, exist_ok=True)
+        if not _broadcast_rank_zero_bool(can_publish, model):
+            raise RuntimeError(f"HF checkpoint destination already exists: {path}")
+        _distributed_barrier()
 
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-
-        path.mkdir(parents=True, exist_ok=True)
 
         with patch_megatron_model(model):
             bridge.save_hf_pretrained(
                 model,
-                path=path,
+                path=staging,
             )
+
+        # Megatron Bridge is collective and returns after its own final barrier.
+        # Only publish the final name after every shard is present.
+        publish_ok = True
+        if is_root:
+            try:
+                os.replace(staging, path)
+                _write_checkpoint_complete_marker(path, kind="huggingface", iteration=rollout_id)
+            except Exception:
+                logger.exception("Failed to publish completed HF checkpoint %s", path)
+                publish_ok = False
+        if not _broadcast_rank_zero_bool(publish_ok, model):
+            raise RuntimeError(f"HF checkpoint publish failed: {path}")
+        _distributed_barrier()
 
         if should_log:
             logger.info(f"Successfully saved HuggingFace model to {path}")
-    except Exception as e:
+    except Exception:
         if should_log:
-            logger.error(f"Failed to save HuggingFace format: {e}")
+            logger.exception("Failed to save HuggingFace format")
+        raise
 
 
 def initialize_model_and_optimizer(

@@ -818,10 +818,16 @@ class RolloutManager:
                 sample.rollout_topk_token_ids if sample.rollout_topk_token_ids is not None else _blank_int(sample.response_length)
                 for sample in samples
             ]
-            train_data["opd_topk_student_log_probs"] = [
-                sample.rollout_topk_log_probs if sample.rollout_topk_log_probs is not None else _blank_float(sample.response_length)
-                for sample in samples
-            ]
+            # vOPD reconstructs its detached student baseline from the actor
+            # forward. Avoid packing an all-zero [response, topk] tensor when
+            # rollout intentionally used the SGLang IDs-only fast path.
+            if any(sample.rollout_topk_log_probs is not None for sample in samples):
+                train_data["opd_topk_student_log_probs"] = [
+                    sample.rollout_topk_log_probs
+                    if sample.rollout_topk_log_probs is not None
+                    else _blank_float(sample.response_length)
+                    for sample in samples
+                ]
             train_data["opd_topk_teacher_log_probs"] = [
                 sample.teacher_topk_log_probs if sample.teacher_topk_log_probs is not None else _blank_float(sample.response_length)
                 for sample in samples

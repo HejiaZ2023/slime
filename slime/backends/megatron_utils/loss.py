@@ -644,6 +644,7 @@ def apply_vopd_topk_to_advantages(
     args: Namespace,
     rollout_data: RolloutBatch,
     advantages: list[torch.Tensor],
+    student_topk_log_probs: list[torch.Tensor] | None = None,
 ) -> None:
     """Apply sampled-token OPD with a detached normalized top-k baseline.
 
@@ -654,7 +655,12 @@ def apply_vopd_topk_to_advantages(
 
     rollout_log_probs = rollout_data.get("rollout_log_probs")
     teacher_log_probs = rollout_data.get("teacher_log_probs")
-    student_topk = rollout_data.get("opd_topk_student_log_probs")
+    # Keep rollout SGLang on its IDs-only fast path. vOPD obtains the student
+    # probabilities from the already-required actor forward below, where they
+    # are detached before becoming a control-variate baseline.
+    student_topk = student_topk_log_probs
+    if student_topk is None:
+        student_topk = rollout_data.get("opd_topk_student_log_probs")
     teacher_topk = rollout_data.get("opd_topk_teacher_log_probs")
     topk_masks = rollout_data.get("opd_topk_masks")
     loss_types = rollout_data.get("loss_types") or []
@@ -822,11 +828,10 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     )
     has_vopd_topk = has_topk_opd and _opd_algorithm(args) == "vopd_topk"
     if has_vopd_topk:
-        apply_vopd_topk_to_advantages(
-            args=args,
-            rollout_data=rollout_data,
-            advantages=advantages,
-        )
+        # The vOPD baseline depends on current student top-k probabilities.
+        # Those are computed from the actor forward in policy_loss_function,
+        # so no rollout-time top-k values need to be requested from SGLang.
+        pass
     elif (args.use_opd or has_relay_opd) and not has_topk_opd:
         apply_opd_kl_to_advantages(
             args=args,
@@ -975,7 +980,6 @@ def policy_loss_function(
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
     """
-    advantages = torch.cat(batch["advantages"], dim=0)
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
@@ -1035,7 +1039,32 @@ def policy_loss_function(
     log_probs_by_sample = log_probs_and_entropy["log_probs"]
     log_probs = log_probs_by_sample
     topk_log_probs = None
-    if has_legacy_topk_opd:
+    vopd_advantages: list[torch.Tensor] | None = None
+    if has_vopd_topk:
+        # This is a detached control variate, never a vocabulary-level loss.
+        # The helper uses one logsumexp + gather over the rollout-provided
+        # support, preserving the IDs-only SGLang rollout optimization.
+        with torch.no_grad():
+            topk_log_probs = get_topk_log_probs(
+                logits,
+                args=args,
+                unconcat_tokens=batch["unconcat_tokens"],
+                total_lengths=total_lengths,
+                response_lengths=response_lengths,
+                topk_token_ids=batch["opd_topk_token_ids"],
+                max_seq_lens=max_seq_lens,
+            )
+        # policy_loss_function can run repeatedly for PPO minibatches/epochs.
+        # Never mutate the stored rollout advantages here, or the same control
+        # variate would be cumulatively applied on later passes.
+        vopd_advantages = [advantage.clone() for advantage in batch["advantages"]]
+        apply_vopd_topk_to_advantages(
+            args=args,
+            rollout_data=batch,
+            advantages=vopd_advantages,
+            student_topk_log_probs=topk_log_probs,
+        )
+    elif has_legacy_topk_opd:
         topk_log_probs = get_topk_log_probs(
             logits,
             args=args,
@@ -1071,7 +1100,7 @@ def policy_loss_function(
             args=args,
             full_log_probs=full_log_probs,
             full_old_log_probs=full_old_log_probs,
-            advantages=batch["advantages"],
+            advantages=vopd_advantages if vopd_advantages is not None else batch["advantages"],
             loss_masks=rl_loss_masks if has_opd_samples else batch["loss_masks"],
         )
 
@@ -1090,6 +1119,8 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
+    advantages_by_sample = vopd_advantages if vopd_advantages is not None else batch["advantages"]
+    advantages = torch.cat(advantages_by_sample, dim=0)
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
     if args.use_opsm:
@@ -1213,11 +1244,11 @@ def policy_loss_function(
                 if (
                     batch.get("rollout_log_probs") is None
                     or batch.get("teacher_log_probs") is None
-                    or batch.get("opd_topk_student_log_probs") is None
                     or batch.get("opd_topk_teacher_log_probs") is None
                     or batch.get("opd_topk_masks") is None
+                    or topk_log_probs is None
                 ):
-                    raise ValueError("vOPD batch is missing frozen sampled or top-k teacher/student log-probs.")
+                    raise ValueError("vOPD batch is missing frozen sampled or top-k teacher log-probs.")
 
                 sampled_values = []
                 baseline_values = []
@@ -1255,7 +1286,7 @@ def policy_loss_function(
                     if teacher_valid.shape != rollout_lp.shape:
                         raise ValueError(f"vOPD requires a complete sampled teacher log-prob mask for sample={i}")
                     topk_stats = vopd_topk_statistics(
-                        batch["opd_topk_student_log_probs"][i].to(device=log_probs.device),
+                        topk_log_probs[i].to(device=log_probs.device),
                         batch["opd_topk_teacher_log_probs"][i].to(device=log_probs.device),
                         batch["opd_topk_masks"][i].to(device=log_probs.device),
                         validate=False,
@@ -1268,7 +1299,7 @@ def policy_loss_function(
                     sampled_values.append(sampled_kl)
                     baseline_values.append(baseline_kl)
                     centered_values.append(sampled_kl - baseline_kl)
-                    advantage_values.append(batch["advantages"][i].to(device=log_probs.device, dtype=torch.float32))
+                    advantage_values.append(advantages_by_sample[i].to(device=log_probs.device, dtype=torch.float32))
                     student_mass_values.append(topk_stats["student_support_mass"])
                     teacher_mass_values.append(topk_stats["teacher_support_mass"])
                     support_coverage_values.append(topk_stats["support_coverage"])

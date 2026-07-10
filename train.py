@@ -1,5 +1,9 @@
+import hashlib
+import json
 import logging
+import os
 import time
+from pathlib import Path
 
 import ray
 
@@ -9,6 +13,56 @@ from slime.utils.logging_utils import configure_logger, finish_tracking, init_tr
 from slime.utils.misc import should_run_periodic_action
 
 logger = logging.getLogger(__name__)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def publish_resume_ready_marker(args, rollout_id: int) -> None:
+    """Mark a native checkpoint resumable only after the rollout state is durable."""
+    if not args.save:
+        return
+    save_dir = Path(args.save)
+    native_dir = save_dir / f"iter_{rollout_id:07d}"
+    native_marker = native_dir / ".complete.json"
+    if not native_marker.is_file():
+        raise RuntimeError(f"native checkpoint completion marker is missing: {native_marker}")
+
+    rollout_state = None
+    if args.rollout_global_dataset:
+        rollout_state = save_dir / "rollout" / f"global_dataset_state_dict_{rollout_id}.pt"
+        if not rollout_state.is_file():
+            raise RuntimeError(f"rollout dataset state is missing: {rollout_state}")
+
+    ready = {
+        "version": 1,
+        "kind": "slime_resume_bundle",
+        "iteration": int(rollout_id),
+        "created_at_unix": time.time(),
+        "native_checkpoint": {
+            "path": native_dir.name,
+            "complete_marker_sha256": _file_sha256(native_marker),
+        },
+        "rollout_state": (
+            {
+                "path": rollout_state.relative_to(save_dir).as_posix(),
+                "bytes": rollout_state.stat().st_size,
+                "sha256": _file_sha256(rollout_state),
+            }
+            if rollout_state is not None
+            else None
+        ),
+    }
+    marker = save_dir / f"resume_ready_step_{rollout_id}.json"
+    staging = marker.with_suffix(".json.tmp")
+    staging.write_text(json.dumps(ready, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(staging, marker)
+    logger.info("Published complete resume bundle marker: %s", marker)
 
 
 def train(args):
@@ -96,11 +150,13 @@ def train(args):
                 actor_model.clear_memory()
 
     def save(rollout_id):
+        actor_saved = False
         if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps and not args.critic_train_only):
             actor_model.save_model(
                 rollout_id,
                 force_sync=rollout_id == args.num_rollout - 1,
             )
+            actor_saved = True
         if args.use_critic:
             critic_model.save_model(
                 rollout_id,
@@ -108,6 +164,8 @@ def train(args):
             )
         if args.rollout_global_dataset:
             ray.get(rollout_manager.save.remote(rollout_id))
+        if actor_saved:
+            publish_resume_ready_marker(args, rollout_id)
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).

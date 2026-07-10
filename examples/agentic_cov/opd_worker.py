@@ -95,7 +95,7 @@ TEACHER_SCORE_MAX_INFLIGHT = max(
 TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sheng/final_ckpts")
 EDA_SERVER = os.environ.get("OPD_EDA_SERVER", "local")
 EDA_REPO_DIR = os.environ.get("OPD_EDA_REPO_DIR", "/workspace/llm4cov_eda")
-EDA_TIMEOUT = int(os.environ.get("OPD_EDA_TIMEOUT", "30"))
+EDA_TIMEOUT = int(os.environ.get("OPD_EDA_TIMEOUT", "1200"))
 COMPACT_SCORE_RESULT = os.environ.get("OPD_COMPACT_SCORE_RESULT", "1") != "0"
 AUDIT_RESULT_GZIP = os.environ.get("OPD_AUDIT_RESULT_GZIP", "1") != "0"
 SCORE_TENSOR_DTYPE = os.environ.get("OPD_SCORE_TENSOR_DTYPE", "float32")
@@ -848,6 +848,8 @@ def run_eda(context: SimpleNamespace, filename: str | None, body: str | None, wa
             timeout=EDA_TIMEOUT,
         )
         submit_seconds = time.monotonic() - submit_started
+        xfer_timing = raw.get("xfer_timing") if isinstance(raw.get("xfer_timing"), dict) else {}
+        relay_timing = raw.get("relay_timing") if isinstance(raw.get("relay_timing"), dict) else {}
         eval_log = evaluate_cov(context, raw)
         eda_log = {
             "status": eval_log["status"],
@@ -865,7 +867,21 @@ def run_eda(context: SimpleNamespace, filename: str | None, body: str | None, wa
             "eda_log": eda_log,
             "eda_timing": {
                 "total_seconds": time.monotonic() - started,
+                # Retained for old log parsers; this is the whole client-side
+                # transaction, not only the SFTP publish phase.
                 "submit_cov_job_seconds": submit_seconds,
+                "configured_timeout_seconds": float(EDA_TIMEOUT),
+                "transport_connect_seconds": _timing(xfer_timing, "transport_connect_seconds"),
+                "submit_seconds": _timing(xfer_timing, "submit_seconds"),
+                "wait_result_seconds": _timing(xfer_timing, "wait_result_seconds"),
+                "cleanup_seconds": _timing(xfer_timing, "cleanup_seconds"),
+                "xfer_total_seconds": _timing(xfer_timing, "total_seconds", submit_seconds),
+                "relay_submit_to_watcher_seconds": _timing(relay_timing, "submit_to_watcher_seconds"),
+                "relay_prepare_seconds": _timing(relay_timing, "watcher_prepare_seconds"),
+                "relay_queue_wait_seconds": _timing(relay_timing, "queue_wait_seconds"),
+                "relay_execution_seconds": _timing(relay_timing, "execution_seconds"),
+                "relay_publish_seconds": _timing(relay_timing, "result_publish_seconds"),
+                "relay_total_seconds": _timing(relay_timing, "watcher_total_seconds"),
             },
         })
     except Exception as exc:
@@ -1305,6 +1321,43 @@ def score_teacher_on_student(
     if requested_topk and TEACHER_SCORE_CHUNK_TOKENS > 0:
         chunk_size = min(response_len, max(1, TEACHER_SCORE_CHUNK_TOKENS))
     score_context_len = max(0, TEACHER_CONTEXT_LENGTH - max(0, TEACHER_SCORE_CONTEXT_MARGIN))
+    full_input_token_count = len(input_ids_int)
+    if score_context_len <= 0 or full_input_token_count > score_context_len:
+        # A sliding window changes the teacher conditional distribution. Do not
+        # train OPD against a score whose prompt prefix was silently removed.
+        return {
+            "student_id": sid,
+            "teacher": name,
+            "teacher_model_path": teacher_model_path(name, cfg),
+            "status": "context_overflow",
+            "error": (
+                "teacher forced-score requires the complete original context "
+                f"input_tokens={full_input_token_count} limit={score_context_len}"
+            ),
+            "teacher_log_probs": [],
+            "topk_token_ids_sha256": requested_topk_sha256,
+            "response_token_count": response_len,
+            "num_teacher_log_probs": 0,
+            "teacher_score_timing": {
+                "request_seconds": time.monotonic() - total_started,
+                "full_input_token_count": full_input_token_count,
+                "prompt_token_count": prompt_len,
+                "response_token_count": response_len,
+                "chunk_size": chunk_size,
+                "chunk_count": 0,
+                "chunk_workers": 0,
+                "chunk_request_wall_seconds": 0.0,
+                "chunk_request_sum_seconds": 0.0,
+                "chunk_request_max_seconds": 0.0,
+                "endpoint_wait_sum_seconds": 0.0,
+                "endpoint_wait_max_seconds": 0.0,
+                "teacher_context_length": score_context_len,
+                "max_request_input_token_count": 0,
+                "truncated_prefix_token_count": 0,
+                "context_overflow": True,
+                "chunks": [],
+            },
+        }
 
     offsets = list(range(0, response_len, chunk_size))
     chunk_workers = max(1, min(max(1, TEACHER_SCORE_CHUNK_WORKERS), len(offsets) or 1))
@@ -1314,9 +1367,9 @@ def score_teacher_on_student(
         chunk_len = min(chunk_size, response_len - offset)
         chunk_start = prompt_len + offset
         chunk_end = chunk_start + chunk_len
+        # The full prefix is required for mathematically valid teacher scores.
+        # The guard above guarantees this request fits without truncation.
         window_start = 0
-        if score_context_len > 0:
-            window_start = max(0, chunk_end - score_context_len)
         chunk_start_in_window = chunk_start - window_start
         logprob_start_len = max(0, chunk_start_in_window - 1)
         chunk_requested_topk = (
@@ -1331,11 +1384,9 @@ def score_teacher_on_student(
                 "skip_special_tokens": False,
             },
             "return_logprob": True,
-            # Only response-token logprobs are consumed by OPD.  Keep a
-            # teacher-context-sized sliding window for long responses; SGLang
-            # returns a leading None row at logprob_start_len, so start one
-            # token before this chunk within the local window and keep the
-            # final chunk_len rows.
+            # Only response-token logprobs are consumed by OPD. SGLang emits a
+            # leading None row at logprob_start_len, so score from one token
+            # before this response chunk while retaining the original prefix.
             "logprob_start_len": logprob_start_len,
         }
         token_ids_logprob: list[int] = []
@@ -1418,6 +1469,7 @@ def score_teacher_on_student(
                 "endpoint_wait_sum_seconds": sum(_timing(t, "endpoint_wait_seconds") for t in timings),
                 "endpoint_wait_max_seconds": max((_timing(t, "endpoint_wait_seconds") for t in timings), default=0.0),
                 "teacher_context_length": score_context_len,
+                "context_overflow": False,
                 "max_request_input_token_count": max(
                     (int(t.get("input_token_count") or 0) for t in timings),
                     default=0,
@@ -1470,6 +1522,7 @@ def score_teacher_on_student(
             "endpoint_wait_sum_seconds": sum(_timing(t, "endpoint_wait_seconds") for t in timings),
             "endpoint_wait_max_seconds": max((_timing(t, "endpoint_wait_seconds") for t in timings), default=0.0),
             "teacher_context_length": score_context_len,
+            "context_overflow": False,
             "max_request_input_token_count": max(
                 (int(t.get("input_token_count") or 0) for t in timings),
                 default=0,
@@ -1833,7 +1886,9 @@ def _log_teacher_score_timing(job_id: str, score: dict[str, Any]) -> None:
         f"chunk_workers={int(score_timing.get('chunk_workers') or 0)}",
         f"prompt_tokens={int(score_timing.get('prompt_token_count') or 0)}",
         f"response_tokens={int(score_timing.get('response_token_count') or 0)}",
+        f"full_input={int(score_timing.get('full_input_token_count') or 0)}",
         f"max_input={int(score_timing.get('max_request_input_token_count') or 0)}",
+        f"context_overflow={bool(score_timing.get('context_overflow', False))}",
     )
     for chunk in score_timing.get("chunks") or []:
         if not isinstance(chunk, dict):
@@ -2035,7 +2090,13 @@ def process(job: Path) -> None:
                     f"status={eda_log.get('status', entry.get('status', ''))}",
                     f"reward={_as_float(entry.get('reward')):.4f}",
                     f"total={_timing(eda_timing, 'total_seconds'):.3f}",
-                    f"submit={_timing(eda_timing, 'submit_cov_job_seconds'):.3f}",
+                    f"client_total={_timing(eda_timing, 'xfer_total_seconds'):.3f}",
+                    f"connect={_timing(eda_timing, 'transport_connect_seconds'):.3f}",
+                    f"submit={_timing(eda_timing, 'submit_seconds'):.3f}",
+                    f"wait={_timing(eda_timing, 'wait_result_seconds'):.3f}",
+                    f"relay_queue={_timing(eda_timing, 'relay_queue_wait_seconds'):.3f}",
+                    f"relay_exec={_timing(eda_timing, 'relay_execution_seconds'):.3f}",
+                    f"relay_publish={_timing(eda_timing, 'relay_publish_seconds'):.3f}",
                     f"coverage={_as_float(eda_summary.get('overall_coverage', 0.0)):.4f}",
                     f"response_tokens={int(entry.get('response_token_count') or 0)}",
                 )
@@ -2114,7 +2175,13 @@ def process(job: Path) -> None:
                             f"status={eda_log.get('status', scored.get('status', ''))}",
                             f"reward={_as_float(scored.get('reward')):.4f}",
                             f"total={_timing(eda_timing, 'total_seconds'):.3f}",
-                            f"submit={_timing(eda_timing, 'submit_cov_job_seconds'):.3f}",
+                            f"client_total={_timing(eda_timing, 'xfer_total_seconds'):.3f}",
+                            f"connect={_timing(eda_timing, 'transport_connect_seconds'):.3f}",
+                            f"submit={_timing(eda_timing, 'submit_seconds'):.3f}",
+                            f"wait={_timing(eda_timing, 'wait_result_seconds'):.3f}",
+                            f"relay_queue={_timing(eda_timing, 'relay_queue_wait_seconds'):.3f}",
+                            f"relay_exec={_timing(eda_timing, 'relay_execution_seconds'):.3f}",
+                            f"relay_publish={_timing(eda_timing, 'relay_publish_seconds'):.3f}",
                             f"coverage={_as_float(eda_summary.get('overall_coverage', 0.0)):.4f}",
                         )
                 timing["teacher_eda_seconds"] = eda_done - (first_eda_submit or eda_done)

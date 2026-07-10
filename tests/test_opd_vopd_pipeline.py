@@ -41,6 +41,32 @@ def test_vopd_adjusts_zeroed_opd_advantage_with_sampled_term_minus_baseline():
     assert torch.allclose(rollout_data["opd_vopd_baseline_kl"][0], baseline, atol=1e-6)
 
 
+def test_vopd_accepts_actor_forward_topk_without_rollout_values():
+    actor_forward_topk = _log([[0.5, 0.3, 0.2]])
+    teacher_topk = _log([[0.2, 0.6, 0.2]])
+    baseline = vopd_topk_statistics(actor_forward_topk, teacher_topk)["baseline_kl"]
+    advantages = [torch.zeros(1)]
+    rollout_data = {
+        "rollout_log_probs": [torch.tensor([-0.7])],
+        "teacher_log_probs": [torch.tensor([-1.0])],
+        "teacher_logprob_masks": [torch.ones(1)],
+        "opd_topk_teacher_log_probs": [teacher_topk],
+        "opd_topk_masks": [torch.ones_like(actor_forward_topk)],
+        "loss_types": ["opd"],
+        "opd_weights": [2.0],
+    }
+
+    apply_vopd_topk_to_advantages(
+        Namespace(opd_lambda=1.0, opd_kl_coef=0.0),
+        rollout_data,
+        advantages,
+        student_topk_log_probs=[actor_forward_topk],
+    )
+
+    expected = -2.0 * ((-0.7 - -1.0) - baseline)
+    assert torch.allclose(advantages[0], expected, atol=1e-6)
+
+
 def test_vopd_sidecar_v2_round_trip_preserves_sampled_vector(tmp_path):
     descriptor = _write_teacher_topk_sidecar(
         tmp_path,

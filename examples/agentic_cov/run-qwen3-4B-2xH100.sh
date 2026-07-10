@@ -10,8 +10,8 @@
 #   --eval-prompt-data pair below only exists to satisfy slime's
 #   eval_datasets validation — the path is unused by eval_rollout.
 # - No KL, no weight decay.
-# - 40k total context: rollout response 32k, max packed train tokens 24k/GPU.
-# - HF checkpoints and training log are rsynced to REMOTE_SYNC_BASE under a
+# - Rollout responses are capped at 16k tokens; packed training uses 24k tokens/GPU.
+# - Completed HF/native checkpoints and stable training logs are synced under a
 #   per-run timestamped subdirectory after each checkpoint save.
 #
 # Run from the slime repo root (e.g. /root/slime in the docker image):
@@ -91,12 +91,15 @@ OPD_POLL=${OPD_POLL:-1}
 OPD_POLL_SPECIFIED=0
 OPD_ALGORITHM=${OPD_ALGORITHM:-vopd_topk}
 OPD_ALGORITHM_SPECIFIED=0
+SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION=${SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION:-16384}
+SGLANG_SCHEDULE_CONSERVATIVENESS=${SGLANG_SCHEDULE_CONSERVATIVENESS:-1.3}
+export SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION
 NO_FINAL_SAVE=${NO_FINAL_SAVE:-auto}
 while [ $# -gt 0 ]; do
     case "$1" in
         --offload)                OFFLOAD=1 ;;
-        --eda-log-feedback-train|--elft) EDA_LOG_FEEDBACK_TRAIN=${EDA_LOG_FEEDBACK_TRAIN:-1} ;;
-        --eda-log-feedback-eval|--elfe)  EDA_LOG_FEEDBACK_EVAL=${EDA_LOG_FEEDBACK_EVAL:-1} ;;
+        --eda-log-feedback-train|--elft) EDA_LOG_FEEDBACK_TRAIN=1 ;;
+        --eda-log-feedback-eval|--elfe)  EDA_LOG_FEEDBACK_EVAL=1 ;;
         --use-uncovered-log|--uul)       USE_UNCOVERED_LOG=1 ;;
         --use-uncovered-reward|--uur)    USE_UNCOVERED_REWARD=1 ;;
         --div-lam)                DIV_LAM="${2:?--div-lam requires a value}"; shift ;;
@@ -439,10 +442,8 @@ if [ "${SKIP_EVAL_BEFORE_TRAIN}" = "1" ]; then
 fi
 
 # -------------------- parallelism / memory --------------------
-# 4 GPUs split as TP=2 x CP=2 x PP=1. With CP=2 a 40k sequence is sharded
-# to ~20k tokens per CP rank; --max-tokens-per-gpu 24576 leaves headroom for
-# packing a few short sequences alongside one long one. Same setting as
-# H200 — H200 is not full at 24k, so 80 GB H100 should still fit.
+# Two H100s use TP=2 x CP=1 x PP=1. The 24k packed-token cap is independent
+# of the 16k per-response generation cap and leaves training-time headroom.
 MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-24576}
 PERF_ARGS=(
    --tensor-model-parallel-size  2
@@ -489,6 +490,7 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static  0.35
+   --sglang-schedule-conservativeness "${SGLANG_SCHEDULE_CONSERVATIVENESS}"
 )
 
 # -------------------- offload (optional) --------------------
@@ -550,11 +552,10 @@ WANDB_ARGS=(
 )
 
 # -------------------- sync daemon --------------------
-# Polls every 60 minutes (checkpoints are saved ~every 70 min); rsyncs all
-# step_* HF checkpoint dirs that have appeared since the last poll, plus the
-# training log.  Only files newer than the destination copy are transferred
-# (--update).  A final sync runs on EXIT so the last checkpoint is always
-# captured.
+# A checkpoint is syncable only after both save paths have published their
+# .complete.json marker: HF weights at RUN_DIR/step_N and the matching native
+# continuation state at SAVE_DIR/iter_000000N. This prevents an uploader from
+# reading a checkpoint while a rank is still writing it.
 
 _rsync_to_remote() {
     local src="$1" dst="$2"
@@ -567,31 +568,276 @@ _rsync_to_remote() {
     fi
 }
 
-# Upload RUN_DIR to a private HF repo via upload_folder: ONE commit per call, no
-# concurrency, incremental (only changed files are re-uploaded). Single attempt —
-# on any failure we log and GIVE UP (no retry); the next daemon cycle (3600 s later)
-# just tries again. This replaces upload_large_folder, whose 8 workers + unbounded
-# resumable retry spiked the 256-commits/hour limit and self-inflicted a 429 storm
-# (27426 retries). Token from env HF_SYNC_TOKEN (separate from HF_TOKEN for download).
-_hf_upload_once() {
-    set +x   # xtrace OFF: 防 HF_SYNC_TOKEN 被 set -ex 的 trace 打进日志 (2026-06 泄露事件)
-    python - "$HF_SYNC_REPO" "$RUN_DIR" <<'PYEOF'   # token 由 python 从环境继承, 不在命令行出现
-import os, sys
+# HF sync is deliberately serialized, and the resume bundle completion marker
+# is published last. This replaces upload_large_folder, whose concurrent
+# retries previously created a Hugging Face 429 storm.
+_hf_upload_completed_artifacts() {
+    set +x   # Keep HF_SYNC_TOKEN out of xtrace; it is inherited, never an argv value.
+    _rc=0
+    python - "$HF_SYNC_REPO" "$RUN_DIR" "$SAVE_DIR" <<'PYEOF' || _rc=$?
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
 from huggingface_hub import HfApi
-repo, folder = sys.argv[1], sys.argv[2]
+
+repo, run_dir_raw, save_dir_raw = sys.argv[1:4]
+run_dir = Path(run_dir_raw)
+save_dir = Path(save_dir_raw)
+state_path = run_dir / ".hf_sync_state.json"
+
+
+def load_state() -> dict:
+    try:
+        loaded = json.loads(state_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"version": 2, "artifacts": {}, "logs": {}}
+    if not isinstance(loaded, dict):
+        return {"version": 2, "artifacts": {}, "logs": {}}
+    loaded["version"] = 2
+    if not isinstance(loaded.get("artifacts"), dict):
+        loaded["artifacts"] = {}
+    if not isinstance(loaded.get("logs"), dict):
+        loaded["logs"] = {}
+    return loaded
+
+
+def save_state(state: dict) -> None:
+    temporary = state_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, state_path)
+
+
+def completed_marker(path: Path, expected_kind: str, expected_iteration: int) -> tuple[dict, str] | None:
+    marker_path = path / ".complete.json"
+    try:
+        marker_raw = marker_path.read_bytes()
+        marker = json.loads(marker_raw)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if (
+        marker.get("version") != 1
+        or marker.get("kind") != expected_kind
+        or marker.get("iteration") != expected_iteration
+        or not isinstance(marker.get("files"), list)
+    ):
+        return None
+    for item in marker["files"]:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not isinstance(item.get("bytes"), int):
+            return None
+        candidate = path / item["path"]
+        try:
+            if not candidate.is_file() or candidate.stat().st_size != item["bytes"]:
+                return None
+        except OSError:
+            return None
+    return marker, hashlib.sha256(marker_raw).hexdigest()
+
+
+def resume_ready_bundle(
+    iteration: int,
+    native_dir: Path,
+    native_marker_digest: str,
+) -> tuple[dict, str, Path | None, Path | None] | None:
+    """Validate the driver-published marker for a self-contained native resume."""
+    marker_path = save_dir / f"resume_ready_step_{iteration}.json"
+    try:
+        marker_raw = marker_path.read_bytes()
+        marker = json.loads(marker_raw)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    native = marker.get("native_checkpoint")
+    if (
+        marker.get("version") != 1
+        or marker.get("kind") != "slime_resume_bundle"
+        or marker.get("iteration") != iteration
+        or not isinstance(native, dict)
+        or native.get("path") != native_dir.name
+        or native.get("complete_marker_sha256") != native_marker_digest
+    ):
+        return None
+
+    state = marker.get("rollout_state")
+    if state is None:
+        return marker, hashlib.sha256(marker_raw).hexdigest(), None, None
+    if not isinstance(state, dict) or not isinstance(state.get("path"), str):
+        return None
+    relative = Path(state["path"])
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    state_path = save_dir / relative
+    try:
+        if (
+            not state_path.is_file()
+            or state_path.stat().st_size != state.get("bytes")
+            or _file_sha256(state_path) != state.get("sha256")
+        ):
+            return None
+    except OSError:
+        return None
+    return marker, hashlib.sha256(marker_raw).hexdigest(), state_path, relative
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def digest_file(path: Path) -> str:
+    return _file_sha256(path)
+
+
 api = HfApi(token=os.environ["HF_SYNC_TOKEN"])
-try:
-    api.create_repo(repo_id=repo, repo_type="model", private=True, exist_ok=True)
-    api.upload_folder(repo_id=repo, folder_path=folder, repo_type="model",
-                      commit_message="sync run dir")
-    print("[sync] upload_folder OK (single commit)")
-except Exception as e:
-    print(f"[sync] upload_folder FAILED — no retry, next cycle will retry: {repr(e)[:300]}")
-    sys.exit(1)
+state = load_state()
+state_changed = False
+had_failure = False
+api.create_repo(repo_id=repo, repo_type="model", private=True, exist_ok=True)
+
+for hf_dir in sorted(run_dir.glob("step_*"), key=lambda p: int(p.name.split("_", 1)[1]) if re.fullmatch(r"step_\d+", p.name) else -1):
+    match = re.fullmatch(r"step_(\d+)", hf_dir.name)
+    if match is None or not hf_dir.is_dir():
+        continue
+    iteration = int(match.group(1))
+    hf_complete = completed_marker(hf_dir, "huggingface", iteration)
+    native_dir = save_dir / f"iter_{iteration:07d}"
+    native_complete = completed_marker(native_dir, "torch_dist", iteration)
+    if hf_complete is None:
+        print(f"[sync] HF model step_{iteration} is not complete")
+        continue
+
+    hf_remote_path = f"step_{iteration}"
+    if state["artifacts"].get(hf_remote_path) != hf_complete[1]:
+        try:
+            api.upload_folder(
+                repo_id=repo,
+                repo_type="model",
+                folder_path=str(hf_dir),
+                path_in_repo=hf_remote_path,
+                commit_message=f"sync completed step_{iteration} HF model",
+            )
+            state["artifacts"][hf_remote_path] = hf_complete[1]
+            state_changed = True
+            print(f"[sync] uploaded completed step_{iteration} HF model")
+        except Exception as exc:
+            had_failure = True
+            print(f"[sync] FAILED step_{iteration} HF model: {repr(exc)[:300]}")
+
+    if native_complete is None:
+        print(f"[sync] native resume step_{iteration} is not complete")
+        continue
+    ready = resume_ready_bundle(iteration, native_dir, native_complete[1])
+    if ready is None:
+        print(f"[sync] native resume step_{iteration} is waiting for resume_ready marker")
+        continue
+    resume_marker, resume_digest, rollout_state_path, rollout_state_relative = ready
+    resume_root = f"slime_resume_step_{iteration}"
+    if state["artifacts"].get(resume_root) == resume_digest:
+        continue
+    try:
+        api.upload_folder(
+            repo_id=repo,
+            repo_type="model",
+            folder_path=str(native_dir),
+            path_in_repo=f"{resume_root}/{native_dir.name}",
+            commit_message=f"sync step_{iteration} native distcp",
+        )
+        api.upload_file(
+            repo_id=repo,
+            repo_type="model",
+            path_or_fileobj=f"{iteration}\n".encode("utf-8"),
+            path_in_repo=f"{resume_root}/latest_checkpointed_iteration.txt",
+            commit_message=f"sync step_{iteration} resume tracker",
+        )
+        if rollout_state_path is not None and rollout_state_relative is not None:
+            api.upload_file(
+                repo_id=repo,
+                repo_type="model",
+                path_or_fileobj=str(rollout_state_path),
+                path_in_repo=f"{resume_root}/{rollout_state_relative.as_posix()}",
+                commit_message=f"sync step_{iteration} rollout dataset state",
+            )
+        resume_info = {
+            "version": 1,
+            "iteration": iteration,
+            "source_resume_ready_marker": resume_marker,
+            "restore_layout": "copy the contents of this directory to SAVE_DIR before SAVE_DIR_ON_EXIST=resume",
+        }
+        api.upload_file(
+            repo_id=repo,
+            repo_type="model",
+            path_or_fileobj=(json.dumps(resume_info, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+            path_in_repo=f"{resume_root}/RESUME_INFO.json",
+            commit_message=f"sync step_{iteration} resume metadata",
+        )
+        completion = {
+            "version": 1,
+            "kind": "slime_resume_bundle",
+            "iteration": iteration,
+            "resume_ready_marker_sha256": resume_digest,
+            "native_checkpoint_marker_sha256": native_complete[1],
+            "rollout_state": resume_marker.get("rollout_state"),
+        }
+        api.upload_file(
+            repo_id=repo,
+            repo_type="model",
+            path_or_fileobj=(json.dumps(completion, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+            path_in_repo=f"{resume_root}/.complete.json",
+            commit_message=f"publish completed step_{iteration} resume bundle",
+        )
+        state["artifacts"][resume_root] = resume_digest
+        state_changed = True
+        print(f"[sync] uploaded completed step_{iteration} native resume bundle")
+    except Exception as exc:
+        had_failure = True
+        print(f"[sync] FAILED step_{iteration} native resume bundle: {repr(exc)[:300]}")
+
+log_paths = [run_dir / name for name in ("main.log", "gpu_memory.csv", "gpu_memory_summary.txt")]
+for log_path in sorted(run_dir.glob("train_step_*-*.log")):
+    match = re.fullmatch(r"train_step_(\d+)-(\d+)\.log", log_path.name)
+    if match is None:
+        continue
+    end_iteration = int(match.group(2))
+    if not (
+        state["artifacts"].get(f"step_{end_iteration}")
+        and state["artifacts"].get(f"slime_resume_step_{end_iteration}")
+    ):
+        continue
+    log_paths.append(log_path)
+
+for log_path in log_paths:
+    log_name = log_path.name
+    if not log_path.is_file():
+        continue
+    log_digest = digest_file(log_path)
+    if state["logs"].get(log_name) == log_digest:
+        continue
+    try:
+        api.upload_file(
+            repo_id=repo,
+            repo_type="model",
+            path_or_fileobj=str(log_path),
+            path_in_repo=log_name,
+            commit_message=f"sync {log_name}",
+        )
+        state["logs"][log_name] = log_digest
+        state_changed = True
+        print(f"[sync] uploaded changed {log_name}")
+    except Exception as exc:
+        had_failure = True
+        print(f"[sync] FAILED {log_name}: {repr(exc)[:300]}")
+
+if state_changed:
+    save_state(state)
+sys.exit(1 if had_failure else 0)
 PYEOF
-    _rc=$?
-    set -x   # xtrace 恢复
-    return $_rc
+    set -x
+    return "$_rc"
 }
 
 _sync_once() {
@@ -599,9 +845,9 @@ _sync_once() {
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     [ -d "${RUN_DIR}" ] || return 0
     if [ "${REMOTE_SYNC_TARGET}" = "hf" ]; then
-        echo "[sync] ${ts} uploading run dir → HF ${HF_SYNC_REPO} (private)" \
+        echo "[sync] ${ts} uploading completed checkpoint pairs → HF ${HF_SYNC_REPO} (private)" \
             | tee -a "${LOCAL_LOG}"
-        _hf_upload_once 2>&1 | tee -a "${LOCAL_LOG}" || true
+        _hf_upload_completed_artifacts 2>&1 | tee -a "${LOCAL_LOG}" || true
     else
         echo "[sync] ${ts} syncing run dir → ${REMOTE_SYNC_BASE}/${RUN_SUBDIR}/" \
             | tee -a "${LOCAL_LOG}"
@@ -701,6 +947,7 @@ echo "[run] prompt_batch_size=${PROMPT_BATCH_SIZE}  num_agentic_rounds=${NUM_AGE
 echo "[run] num_agentic_rounds=${NUM_AGENTIC_ROUNDS}  eval_num_agentic_rounds=3" | tee -a "${LOCAL_LOG}"
 echo "[run] offload=${OFFLOAD}  eda_log_feedback_train=${EDA_LOG_FEEDBACK_TRAIN}  eda_log_feedback_eval=${EDA_LOG_FEEDBACK_EVAL}  use_uncovered_log=${USE_UNCOVERED_LOG}  use_uncovered_reward=${USE_UNCOVERED_REWARD}  div_lam=${DIV_LAM:-unset}" | tee -a "${LOCAL_LOG}"
 echo "[run] max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}  no_final_save=${NO_FINAL_SAVE}" | tee -a "${LOCAL_LOG}"
+echo "[run] sglang_clip_max_new_tokens_estimation=${SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION}  sglang_schedule_conservativeness=${SGLANG_SCHEDULE_CONSERVATIVENESS}" | tee -a "${LOCAL_LOG}"
 echo "[run] train_dataset=${LLM4COV_DATASET}  eval_dataset=${LLM4COV_EVAL_DATASET}" | tee -a "${LOCAL_LOG}"
 if [ "${#OPD_ARGS[@]}" -gt 0 ]; then
     echo "[run] opd_algorithm=${OPD_ALGORITHM}  opd_poll=${OPD_POLL}" | tee -a "${LOCAL_LOG}"
@@ -738,7 +985,8 @@ RUNTIME_ENV_JSON="{
     \"PYTHONPATH\": \"/root/Megatron-LM/:/root/slime\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-    \"PYTORCH_ALLOC_CONF\": \"expandable_segments:True\"
+    \"PYTORCH_ALLOC_CONF\": \"expandable_segments:True\",
+    \"SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION\": \"${SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION}\"
   }
 }"
 

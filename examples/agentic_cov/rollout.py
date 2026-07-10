@@ -1235,12 +1235,29 @@ async def _score_group_with_opd_relay(
                     return topk_ids, student_topk, teacher_topk, teacher_masks
             return None
 
+        def _teacher_score_context_overflow(sample: Sample) -> bool:
+            entry = _entry_for_sample(sample)
+            if entry is None:
+                return False
+            for score in entry.get("teacher_scores") or []:
+                if not isinstance(score, dict):
+                    continue
+                if best_teacher_name and str(score.get("teacher") or "") != best_teacher_name:
+                    continue
+                if score.get("status") == "context_overflow":
+                    return True
+            return False
+
         topk_by_index = {}
         topk_valid = bool(best_teacher_name) and require_topk
         if require_topk:
             for sample in eligible_samples:
                 expected = int(sample.response_length or 0)
                 width = requested_topk
+                if _teacher_score_context_overflow(sample):
+                    topk_valid = False
+                    sample.metadata["opd_gate_reason"] = "teacher_score_context_overflow"
+                    break
                 packed = _student_teacher_topk(sample)
                 if packed is None:
                     topk_valid = False
@@ -1253,7 +1270,6 @@ async def _score_group_with_opd_relay(
                     _matrix_has_shape(topk_ids, expected, width)
                     and _matrix_has_shape(teacher_topk, expected, width)
                     and _matrix_has_shape(teacher_masks, expected, width)
-                    and (not require_vopd_topk or _matrix_has_shape(student_topk, expected, width))
                 ):
                     topk_valid = False
                     sample.metadata["opd_gate_reason"] = (
@@ -1283,7 +1299,6 @@ async def _score_group_with_opd_relay(
                         break
                     if not (
                         _float_list_is_finite(teacher_log_probs)
-                        and _float_matrix_is_finite(student_topk)
                         and _float_matrix_is_finite(teacher_topk)
                         and _float_matrix_is_finite(teacher_masks)
                     ):
@@ -1307,6 +1322,7 @@ async def _score_group_with_opd_relay(
                 sample.teacher_topk_logprob_masks = teacher_masks
                 if require_vopd_topk:
                     sample.teacher_log_probs = teacher_log_probs
+                    sample.metadata["opd_student_topk_source"] = "actor_forward_detached"
                 sample.metadata["opd_gate_pass"] = True
                 sample.metadata["opd_teacher_logprob_teacher"] = best_teacher_name
                 sample.metadata["opd_topk"] = requested_topk

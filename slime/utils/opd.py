@@ -14,10 +14,10 @@ def vopd_topk_statistics(
 ) -> dict[str, torch.Tensor]:
     """Compute the detached top-k control-variate statistics for vOPD.
 
-    The saved values are full-vocabulary log-probabilities evaluated on the
-    student's top-k support.  ``log_softmax`` therefore renormalizes only over
-    that common support, which is the vOPD control-variate baseline rather than
-    the biased raw truncated-KL objective.
+    The inputs are full-vocabulary log-probabilities evaluated on the student's
+    top-k support. ``log_softmax`` therefore renormalizes only over that common
+    support, which is the vOPD control-variate baseline rather than the biased
+    raw truncated-KL objective.
     """
 
     if student_topk_log_probs.ndim != 2 or teacher_topk_log_probs.ndim != 2:
