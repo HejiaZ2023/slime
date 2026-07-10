@@ -78,6 +78,20 @@ TEACHER_SCORE_CHUNK_WORKERS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_WORKER
 TEACHER_SCORE_CONTEXT_MARGIN = int(os.environ.get("OPD_TEACHER_SCORE_CONTEXT_MARGIN", "16"))
 TEACHER_SCORE_POSITION_TOPK = os.environ.get("OPD_TEACHER_SCORE_POSITION_TOPK", "1") != "0"
 TEACHER_ENDPOINT_MAX_INFLIGHT = max(1, int(os.environ.get("OPD_TEACHER_ENDPOINT_MAX_INFLIGHT", "2")))
+TEACHER_GENERATE_MAX_INFLIGHT = max(
+    1,
+    min(
+        TEACHER_ENDPOINT_MAX_INFLIGHT,
+        int(os.environ.get("OPD_TEACHER_GENERATE_MAX_INFLIGHT", "2")),
+    ),
+)
+TEACHER_SCORE_MAX_INFLIGHT = max(
+    1,
+    min(
+        TEACHER_ENDPOINT_MAX_INFLIGHT,
+        int(os.environ.get("OPD_TEACHER_SCORE_MAX_INFLIGHT", "2")),
+    ),
+)
 TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sheng/final_ckpts")
 EDA_SERVER = os.environ.get("OPD_EDA_SERVER", "local")
 EDA_REPO_DIR = os.environ.get("OPD_EDA_REPO_DIR", "/workspace/llm4cov_eda")
@@ -93,24 +107,45 @@ _LOCK = threading.Lock()
 _INFLIGHT: set[str] = set()
 QUEUE_BACKEND: Any | None = None
 _TEACHER_ENDPOINT_LOCK = threading.Lock()
-_TEACHER_ENDPOINT_SLOTS: dict[str, threading.BoundedSemaphore] = {}
+_TEACHER_ENDPOINT_TOTAL_SLOTS: dict[str, threading.BoundedSemaphore] = {}
+_TEACHER_ENDPOINT_KIND_SLOTS: dict[tuple[str, str], threading.BoundedSemaphore] = {}
 
 
 @contextlib.contextmanager
-def teacher_endpoint_slot(name: str):
-    """Bound in-flight requests per teacher while keeping teachers independent."""
+def teacher_endpoint_slot(name: str, *, kind: str):
+    """Bound total and per-kind in-flight requests for one teacher endpoint.
+
+    A long rollout for an unrelated prompt must not consume every slot needed
+    by an already-ready forced score. The shared total cap still keeps the
+    combined load bounded for the teacher server.
+    """
+    if kind not in {"generate", "score"}:
+        raise ValueError(f"unknown teacher endpoint request kind: {kind}")
+    kind_capacity = (
+        TEACHER_GENERATE_MAX_INFLIGHT if kind == "generate" else TEACHER_SCORE_MAX_INFLIGHT
+    )
     with _TEACHER_ENDPOINT_LOCK:
-        slot = _TEACHER_ENDPOINT_SLOTS.get(name)
-        if slot is None:
-            slot = threading.BoundedSemaphore(TEACHER_ENDPOINT_MAX_INFLIGHT)
-            _TEACHER_ENDPOINT_SLOTS[name] = slot
+        total_slot = _TEACHER_ENDPOINT_TOTAL_SLOTS.get(name)
+        if total_slot is None:
+            total_slot = threading.BoundedSemaphore(TEACHER_ENDPOINT_MAX_INFLIGHT)
+            _TEACHER_ENDPOINT_TOTAL_SLOTS[name] = total_slot
+        kind_key = (name, kind)
+        kind_slot = _TEACHER_ENDPOINT_KIND_SLOTS.get(kind_key)
+        if kind_slot is None:
+            kind_slot = threading.BoundedSemaphore(kind_capacity)
+            _TEACHER_ENDPOINT_KIND_SLOTS[kind_key] = kind_slot
     queued_at = time.monotonic()
-    slot.acquire()
-    wait_seconds = time.monotonic() - queued_at
+    kind_slot.acquire()
+    total_acquired = False
     try:
+        total_slot.acquire()
+        total_acquired = True
+        wait_seconds = time.monotonic() - queued_at
         yield wait_seconds
     finally:
-        slot.release()
+        if total_acquired:
+            total_slot.release()
+        kind_slot.release()
 
 _CODE_RE = re.compile(r"```(?:verilog|systemverilog|sv)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _MODULE_RE = re.compile(r"(module\s+[\s\S]*?endmodule)", re.IGNORECASE)
@@ -1027,7 +1062,7 @@ def generate_teacher_rollout(name: str, slot: int, prompt: str, sampling_params:
     endpoint_wait_seconds = 0.0
     request_seconds = 0.0
     try:
-        with teacher_endpoint_slot(name) as endpoint_wait_seconds:
+        with teacher_endpoint_slot(name, kind="generate") as endpoint_wait_seconds:
             request_started = time.monotonic()
             output = post_json(url, payload, timeout=TEACHER_TIMEOUT)
             request_seconds = time.monotonic() - request_started
@@ -1312,7 +1347,7 @@ def score_teacher_on_student(
                 # Fallback for old SGLang builds that only accept a
                 # request-level token_ids_logprob union.
                 payload["token_ids_logprob"] = token_ids_logprob
-        with teacher_endpoint_slot(name) as endpoint_wait_seconds:
+        with teacher_endpoint_slot(name, kind="score") as endpoint_wait_seconds:
             request_started = time.monotonic()
             output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
             request_seconds = time.monotonic() - request_started
@@ -1325,6 +1360,7 @@ def score_teacher_on_student(
         )
         timing = {
             "offset": offset,
+            "endpoint_kind": "score",
             "chunk_response_token_count": chunk_len,
             "request_seconds": request_seconds,
             "endpoint_wait_seconds": endpoint_wait_seconds,
@@ -2271,6 +2307,9 @@ def main() -> None:
     log(
         f"opd worker start XFER={XFER} namespace={NAMESPACE} mock={MOCK} "
         f"round_jobs={MAX_CONCURRENT_ROUND_JOBS} score_jobs={MAX_CONCURRENT_SCORE_JOBS} "
+        f"endpoint_total={TEACHER_ENDPOINT_MAX_INFLIGHT} "
+        f"endpoint_generate={TEACHER_GENERATE_MAX_INFLIGHT} "
+        f"endpoint_score={TEACHER_SCORE_MAX_INFLIGHT} "
         f"queue={QUEUE_TRANSPORT} worker_id={WORKER_ID}"
     )
     last_gc = 0.0
