@@ -633,7 +633,7 @@ _write_gpu_monitor_summary() {
             }
             END {
                 for (gpu in peak) {
-                    printf "[gpu-monitor] peak gpu=%d used_mib=%d total_mib=%d timestamp=%s\\n", gpu, peak[gpu], total[gpu], stamp[gpu]
+                    printf "[gpu-monitor] peak gpu=%d used_mib=%d total_mib=%d timestamp=%s\n", gpu, peak[gpu], total[gpu], stamp[gpu]
                 }
             }
         ' "${GPU_MONITOR_LOG}" | sort -t= -k2,2n
@@ -650,6 +650,7 @@ _start_gpu_monitor() {
         return 0
     fi
     (
+        set +x
         echo "timestamp,index,utilization_gpu_pct,memory_used_mib,memory_total_mib"
         while true; do
             nvidia-smi \
