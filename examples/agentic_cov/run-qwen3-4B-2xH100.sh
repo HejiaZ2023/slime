@@ -313,6 +313,11 @@ mkdir -p "${RUN_DIR}"
 RUN_SUBDIR=${RUN_SUBDIR:-"${_MODEL_BASENAME}_${_TIMESTAMP}"}
 HF_SYNC_REPO="${HF_SYNC_REPO_PREFIX}${RUN_SUBDIR}"
 LOCAL_LOG="${RUN_DIR}/main.log"
+GPU_MONITOR_ENABLED=${GPU_MONITOR_ENABLED:-1}
+GPU_MONITOR_INTERVAL_SEC=${GPU_MONITOR_INTERVAL_SEC:-2}
+GPU_MONITOR_LOG="${RUN_DIR}/gpu_memory.csv"
+GPU_MONITOR_SUMMARY="${RUN_DIR}/gpu_memory_summary.txt"
+GPU_MONITOR_PID=""
 echo "[run] $(date '+%Y-%m-%d %H:%M:%S') starting run" | tee -a "${LOCAL_LOG}"
 
 echo "[run] ─── PATH SUMMARY ──────────────────────────────────────" | tee -a "${LOCAL_LOG}"
@@ -333,6 +338,7 @@ echo "[run] EDA_REPO_DIR = ${EDA_REPO_DIR}"                          | tee -a "$
 echo "[run] RUN_SUBDIR   = ${RUN_SUBDIR}"                            | tee -a "${LOCAL_LOG}"
 echo "[run] DATASET_STEP_OFFSET = ${LLM4COV_DATASET_STEP_OFFSET}"     | tee -a "${LOCAL_LOG}"
 echo "[run] VERIFY_STUDENT_STAGE2_STEP999 = ${VERIFY_STUDENT_STAGE2_STEP999}" | tee -a "${LOCAL_LOG}"
+echo "[run] GPU_MONITOR enabled=${GPU_MONITOR_ENABLED} interval_sec=${GPU_MONITOR_INTERVAL_SEC} log=${GPU_MONITOR_LOG}" | tee -a "${LOCAL_LOG}"
 echo "[run] ───────────────────────────────────────────────────────" | tee -a "${LOCAL_LOG}"
 
 NO_FINAL_SAVE_ARGS=()
@@ -610,7 +616,67 @@ _sync_daemon() {
 
 _sync_daemon &
 SYNC_DAEMON_PID=$!
-trap '_sync_once; kill "${SYNC_DAEMON_PID}" 2>/dev/null; true' EXIT
+
+_write_gpu_monitor_summary() {
+    [ -f "${GPU_MONITOR_LOG}" ] || return 0
+    {
+        echo "[gpu-monitor] sampling_interval_sec=${GPU_MONITOR_INTERVAL_SEC}"
+        awk -F',' '
+            NR > 1 && NF >= 5 && $2 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
+                gpu = $2 + 0
+                used = $4 + 0
+                if (!(gpu in peak) || used > peak[gpu]) {
+                    peak[gpu] = used
+                    total[gpu] = $5 + 0
+                    stamp[gpu] = $1
+                }
+            }
+            END {
+                for (gpu in peak) {
+                    printf "[gpu-monitor] peak gpu=%d used_mib=%d total_mib=%d timestamp=%s\\n", gpu, peak[gpu], total[gpu], stamp[gpu]
+                }
+            }
+        ' "${GPU_MONITOR_LOG}" | sort -t= -k2,2n
+    } | tee -a "${LOCAL_LOG}" > "${GPU_MONITOR_SUMMARY}"
+}
+
+_start_gpu_monitor() {
+    if [ "${GPU_MONITOR_ENABLED}" != "1" ]; then
+        echo "[gpu-monitor] disabled" | tee -a "${LOCAL_LOG}"
+        return 0
+    fi
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "[gpu-monitor] nvidia-smi unavailable; monitor disabled" | tee -a "${LOCAL_LOG}"
+        return 0
+    fi
+    (
+        echo "timestamp,index,utilization_gpu_pct,memory_used_mib,memory_total_mib"
+        while true; do
+            nvidia-smi \
+                --query-gpu=timestamp,index,utilization.gpu,memory.used,memory.total \
+                --format=csv,noheader,nounits | sed 's/, */,/g'
+            sleep "${GPU_MONITOR_INTERVAL_SEC}"
+        done
+    ) >> "${GPU_MONITOR_LOG}" 2>&1 &
+    GPU_MONITOR_PID=$!
+    echo "[gpu-monitor] started pid=${GPU_MONITOR_PID} interval_sec=${GPU_MONITOR_INTERVAL_SEC}" | tee -a "${LOCAL_LOG}"
+}
+
+_stop_gpu_monitor() {
+    if [ -n "${GPU_MONITOR_PID}" ] && kill -0 "${GPU_MONITOR_PID}" 2>/dev/null; then
+        kill "${GPU_MONITOR_PID}" 2>/dev/null || true
+        wait "${GPU_MONITOR_PID}" 2>/dev/null || true
+    fi
+    _write_gpu_monitor_summary
+}
+
+_cleanup_on_exit() {
+    _stop_gpu_monitor
+    _sync_once
+    kill "${SYNC_DAEMON_PID}" 2>/dev/null || true
+}
+
+trap '_cleanup_on_exit' EXIT
 
 # -------------------- launch --------------------
 export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
@@ -665,6 +731,7 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
+_start_gpu_monitor
 echo "[run] $(date '+%Y-%m-%d %H:%M:%S') submitting ray job..." | tee -a "${LOCAL_LOG}"
 ray job submit --address="http://127.0.0.1:8265" \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
