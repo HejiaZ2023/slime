@@ -2,6 +2,7 @@ import asyncio
 import copy
 import inspect
 import logging
+import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -32,7 +33,7 @@ from slime.utils.types import Sample
 
 from .rm_hub import async_rm, batched_async_rm
 
-__all__ = ["generate_rollout", "get_model_url"]
+__all__ = ["fetch_posthoc_opd_topk_ids", "generate_rollout", "get_model_url"]
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,112 @@ def _extract_output_top_logprobs(meta: dict[str, Any], expected_len: int) -> tup
     if len(token_ids) != expected_len or any(len(ids) == 0 for ids in token_ids):
         return [], []
     return token_ids, log_probs
+
+
+def _extract_input_top_logprob_ids(meta: dict[str, Any], expected_len: int, width: int) -> list[list[int]]:
+    """Return the final response-sized rows from a prefill-only top-k response."""
+    if expected_len <= 0 or width <= 0:
+        return []
+    rows = meta.get("input_top_logprobs_idx") or meta.get("input_top_logprobs_token_ids")
+    if not isinstance(rows, list):
+        return []
+    token_ids: list[list[int]] = []
+    for row in rows[-expected_len:]:
+        if not isinstance(row, list):
+            return []
+        try:
+            ids = [int(token_id) for token_id in row[:width]]
+        except (TypeError, ValueError):
+            return []
+        if len(ids) != width:
+            return []
+        token_ids.append(ids)
+    return token_ids if len(token_ids) == expected_len else []
+
+
+async def _fetch_posthoc_opd_topk_ids(
+    *,
+    url: str,
+    prompt_ids: list[int],
+    response_ids: list[int],
+    topk: int,
+    headers: dict[str, str] | None,
+) -> tuple[list[list[int]], float]:
+    """Score the generated sequence once to recover exact student top-k ids."""
+    started = time.monotonic()
+    payload = {
+        "input_ids": prompt_ids + response_ids,
+        "sampling_params": {
+            # Ranking is invariant under positive temperature and log-softmax.
+            # Do not apply the rollout's top-p filter when recovering support.
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "max_new_tokens": 0,
+            "skip_special_tokens": False,
+        },
+        "return_logprob": True,
+        # SGLang emits a leading None row at this boundary. Keeping one prompt
+        # token makes the final len(response_ids) rows align with the response.
+        "logprob_start_len": max(0, len(prompt_ids) - 1),
+        "top_logprobs_num": topk,
+        "top_logprobs_ids_only": True,
+    }
+    output = await post(url, payload, headers=headers)
+    meta = output.get("meta_info") if isinstance(output, dict) else None
+    token_ids = _extract_input_top_logprob_ids(
+        meta if isinstance(meta, dict) else {},
+        len(response_ids),
+        topk,
+    )
+    if len(token_ids) != len(response_ids):
+        raise ValueError(
+            "posthoc OPD top-k length mismatch "
+            f"expected={len(response_ids)} actual={len(token_ids)}"
+        )
+    return token_ids, time.monotonic() - started
+
+
+async def fetch_posthoc_opd_topk_ids(args: Namespace, sample: Sample) -> float:
+    """Populate exact OPD support after generation without slowing decode."""
+    topk = int(getattr(args, "opd_topk", 0) or 0)
+    response_len = int(sample.response_length or 0)
+    input_ids = [int(token_id) for token_id in (sample.tokens or [])]
+    if topk <= 0 or response_len <= 0 or len(input_ids) <= response_len:
+        raise ValueError(
+            "posthoc OPD top-k requires prompt and response token ids "
+            f"topk={topk} response_len={response_len} input_len={len(input_ids)}"
+        )
+
+    prompt_ids = input_ids[:-response_len]
+    response_ids = input_ids[-response_len:]
+    headers = None
+    if sample.session_id and getattr(args, "router_policy", None) == "consistent_hashing":
+        headers = {"X-SMG-Routing-Key": sample.session_id}
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    token_ids, request_seconds = await _fetch_posthoc_opd_topk_ids(
+        url=url,
+        prompt_ids=prompt_ids,
+        response_ids=response_ids,
+        topk=topk,
+        headers=headers,
+    )
+    sample.rollout_topk_token_ids = token_ids
+    sample.rollout_topk_log_probs = []
+    if sample.metadata is None:
+        sample.metadata = {}
+    sample.metadata["opd_student_topk_mode"] = "posthoc"
+    sample.metadata["opd_student_topk_request_seconds"] = request_seconds
+    logger.info(
+        "OPD_STUDENT_POSTHOC_TOPK_TIMING prompt_tokens=%d response_tokens=%d "
+        "topk=%d rows=%d request=%.3f",
+        len(prompt_ids),
+        response_len,
+        topk,
+        len(token_ids),
+        request_seconds,
+    )
+    return request_seconds
 
 
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
@@ -252,14 +359,17 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "return_logprob": True,
     }
     opd_topk = int(getattr(args, "opd_topk", 0) or 0)
+    opd_topk_mode = str(getattr(args, "opd_student_topk_mode", "decode") or "decode").lower()
     if bool(getattr(args, "use_opd_relay", False)) and opd_topk > 0:
-        # SGLang 0.5.x expects top_logprobs_num at the /generate payload level,
-        # not inside sampling_params.
-        payload["top_logprobs_num"] = opd_topk
-        # OPD teacher scoring only needs the exact student top-k token ids.
-        # Student top-k logprobs are recomputed by the Megatron loss from the
-        # rollout-provided ids, so avoid returning per-token top-k values here.
-        payload["top_logprobs_ids_only"] = True
+        if opd_topk_mode == "decode":
+            # SGLang 0.5.x expects top_logprobs_num at the /generate payload
+            # level, not inside sampling_params.
+            payload["top_logprobs_num"] = opd_topk
+            # OPD teacher scoring only needs exact student top-k token ids.
+            # Student top-k logprobs are recomputed by the Megatron loss.
+            payload["top_logprobs_ids_only"] = True
+        elif opd_topk_mode != "posthoc":
+            raise ValueError(f"unsupported OPD student top-k mode: {opd_topk_mode!r}")
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True

@@ -185,6 +185,12 @@ def add_agentic_args(parser):
         help="Student top-k tokens per generated position used for OPD KL; <=1 uses sampled-token fallback.",
     )
     parser.add_argument(
+        "--opd-student-topk-mode",
+        choices=("decode", "posthoc"),
+        default="decode",
+        help="Recover student OPD top-k ids during decode or with an exact posthoc prefill.",
+    )
+    parser.add_argument(
         "--opd-gate-eps",
         type=float,
         default=0.0,

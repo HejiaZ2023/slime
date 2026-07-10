@@ -44,7 +44,7 @@ from argparse import Namespace
 from typing import Any
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
-from slime.rollout.sglang_rollout import GenerateState, generate
+from slime.rollout.sglang_rollout import GenerateState, fetch_posthoc_opd_topk_ids, generate
 from slime.utils.async_utils import run
 from slime.utils.types import Sample
 
@@ -1361,6 +1361,14 @@ async def _generate_and_dispatch_opd_students(
         student_rollout = _student_rollout_payload(sample, slot)
         student_id = str(student_rollout["id"])
         score_job_id = f"{opd_request['job_id']}_{student_id}_score"
+        topk_mode = str(getattr(args, "opd_student_topk_mode", "decode") or "decode").lower()
+        posthoc_topk_task = None
+        if (
+            topk_mode == "posthoc"
+            and int(getattr(args, "opd_topk", 0) or 0) > 0
+            and int(sample.response_length or 0) > 0
+        ):
+            posthoc_topk_task = asyncio.create_task(fetch_posthoc_opd_topk_ids(args, sample))
 
         async def _run_eda() -> Sample:
             eda_started = time.monotonic()
@@ -1385,7 +1393,26 @@ async def _generate_and_dispatch_opd_students(
 
         async def _run_score() -> dict[str, Any]:
             score_started = time.monotonic()
+            topk_wait_seconds = 0.0
             try:
+                if posthoc_topk_task is not None:
+                    topk_wait_started = time.monotonic()
+                    try:
+                        await posthoc_topk_task
+                    except Exception as exc:
+                        if sample.metadata is None:
+                            sample.metadata = {}
+                        sample.metadata["opd_student_topk_error"] = str(exc)
+                        logger.exception(
+                            "OPD_STUDENT_POSTHOC_TOPK_FAILED step=%d dataset_id=%s round=%d sample_id=%s",
+                            opd_request["rollout_id"],
+                            opd_request["dataset_id"],
+                            opd_request["round_idx"] + 1,
+                            student_id,
+                        )
+                        raise
+                    topk_wait_seconds = _seconds_since(topk_wait_started)
+                score_rollout = _student_rollout_payload(sample, slot)
                 result = await asyncio.to_thread(
                     _run_opd_student_score_sync,
                     args=args,
@@ -1393,7 +1420,7 @@ async def _generate_and_dispatch_opd_students(
                     dataset_id=opd_request["dataset_id"],
                     rollout_id=opd_request["rollout_id"],
                     round_idx=opd_request["round_idx"],
-                    student_rollout=student_rollout,
+                    student_rollout=score_rollout,
                     score_teacher_names=score_teacher_names,
                 )
             except Exception:
@@ -1410,13 +1437,14 @@ async def _generate_and_dispatch_opd_students(
             entry = next((item for item in entries if str(item.get("id") or "") == student_id), {})
             logger.info(
                 "OPD_STUDENT_SCORE_READY step=%d dataset_id=%s round=%d sample_id=%s score_job=%s "
-                "teacher_scores=%d worker_elapsed=%.3f total=%.3f",
+                "teacher_scores=%d topk_wait=%.3f worker_elapsed=%.3f total=%.3f",
                 opd_request["rollout_id"],
                 opd_request["dataset_id"],
                 opd_request["round_idx"] + 1,
                 student_id,
                 score_job_id,
                 len(entry.get("teacher_scores") or []) if isinstance(entry, dict) else 0,
+                topk_wait_seconds,
                 float(result.get("elapsed_s", 0.0) or 0.0),
                 _seconds_since(score_started),
             )
@@ -1426,7 +1454,7 @@ async def _generate_and_dispatch_opd_students(
         score_task = asyncio.create_task(_run_score())
         logger.info(
             "OPD_STUDENT_DISPATCH step=%d dataset_id=%s round=%d sample_id=%s score_job=%s "
-            "generate=%.3f response_tokens=%d topk_rows=%d",
+            "generate=%.3f response_tokens=%d topk_mode=%s topk_rows=%d",
             opd_request["rollout_id"],
             opd_request["dataset_id"],
             opd_request["round_idx"] + 1,
@@ -1434,6 +1462,7 @@ async def _generate_and_dispatch_opd_students(
             score_job_id,
             generation_seconds,
             int(sample.response_length or 0),
+            topk_mode,
             len(student_rollout.get("topk_token_ids") or []),
         )
         return {
