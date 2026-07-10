@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import json
 import logging
 import os
 import re
@@ -51,6 +53,7 @@ from .opd_remote_client import (
     OpdRelayClient,
     build_job_id,
     build_round_files,
+    build_student_score_files,
     load_result_tree,
     parse_teacher_specs,
 )
@@ -65,6 +68,15 @@ def _seconds_since(started: float) -> float:
 
 def _payload_bytes(files: dict[str, bytes]) -> int:
     return sum(len(data) for data in files.values())
+
+
+def _sha256_json(value: Any) -> str:
+    data = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _result_timing(result: dict[str, Any] | None, key: str, default: float = 0.0) -> float:
@@ -514,6 +526,7 @@ def _student_rollout_payload(sample: Sample, slot: int) -> dict[str, Any]:
         "id": sid,
         "sample_index": sample.index,
         "assistant_response": sample.response or "",
+        "assistant_response_sha256": _sha256_text(sample.response or ""),
         "filename": filename,
         "input_token_ids": list(sample.tokens or []),
         "response_token_ids": _sample_response_token_ids(sample),
@@ -525,6 +538,7 @@ def _student_rollout_payload(sample: Sample, slot: int) -> dict[str, Any]:
     }
     if testbench is not None:
         payload["testbench"] = testbench
+        payload["testbench_sha256"] = _sha256_text(testbench)
     return payload
 
 
@@ -932,6 +946,64 @@ def _run_opd_score_round_sync(
         client.close()
 
 
+def _run_opd_student_score_sync(
+    *,
+    args: Namespace,
+    job_id: str,
+    dataset_id: str,
+    rollout_id: int,
+    round_idx: int,
+    student_rollout: dict[str, Any],
+    score_teacher_names: list[str],
+) -> dict[str, Any]:
+    """Submit one completed student rollout for parallel teacher forced scoring."""
+    total_started = time.monotonic()
+    build_started = time.monotonic()
+    files = build_student_score_files(
+        job_id=job_id,
+        dataset_id=dataset_id,
+        rollout_id=rollout_id,
+        round_idx=round_idx,
+        student_rollout=student_rollout,
+        score_teacher_names=score_teacher_names,
+        topk_k=int(getattr(args, "opd_topk", 0) or 0),
+    )
+    build_seconds = _seconds_since(build_started)
+    client_started = time.monotonic()
+    client = OpdRelayClient(args)
+    client_init_seconds = _seconds_since(client_started)
+    try:
+        result_dir = client.submit_and_wait(
+            job_id,
+            files,
+            timeout_s=float(getattr(args, "opd_timeout", 1800.0) or 1800.0),
+            poll_s=float(getattr(args, "opd_poll", 1.0) or 1.0),
+        )
+        load_started = time.monotonic()
+        result = load_result_tree(result_dir)
+        load_seconds = _seconds_since(load_started)
+        result["_opd_score_job_id"] = job_id
+        client_timing = client.timing()
+        client_timing["client_init_seconds"] = client_init_seconds
+        result["_opd_client_timing"] = client_timing
+        _log_opd_client_timing(
+            stage="student_score",
+            rollout_id=rollout_id,
+            dataset_id=dataset_id,
+            round_idx=round_idx,
+            job_id=job_id,
+            payload_bytes=_payload_bytes(files),
+            build_seconds=build_seconds,
+            load_seconds=load_seconds,
+            total_seconds=_seconds_since(total_started),
+            client_timing=client_timing,
+            result=result,
+        )
+        return result
+    finally:
+        client.close()
+
+
 async def _score_group_with_opd_relay(
     *,
     args: Namespace,
@@ -945,6 +1017,8 @@ async def _score_group_with_opd_relay(
     sample_index_allocator,
     teacher_result: dict[str, Any] | None = None,
     opd_request: dict[str, Any] | None = None,
+    precomputed_result: dict[str, Any] | None = None,
+    apply_remote_student_scores: bool = True,
 ) -> tuple[list[Sample], list[Sample]]:
     total_started = time.monotonic()
     request = opd_request or _build_opd_round_request(
@@ -961,7 +1035,10 @@ async def _score_group_with_opd_relay(
     student_rollouts = [_student_rollout_payload(sample, i) for i, sample in enumerate(group)]
     payload_seconds = _seconds_since(payload_started)
     relay_started = time.monotonic()
-    if teacher_result is None:
+    if precomputed_result is not None:
+        relay_stage = "streamed"
+        result = precomputed_result
+    elif teacher_result is None:
         relay_stage = "combined"
         result = await asyncio.to_thread(
             _run_opd_relay_round_sync,
@@ -980,7 +1057,11 @@ async def _score_group_with_opd_relay(
     job_id = result.get("_opd_score_job_id") or result.get("job_id") or request["job_id"]
 
     apply_started = time.monotonic()
-    _apply_remote_student_scores(group, result)
+    if apply_remote_student_scores:
+        _apply_remote_student_scores(group, result)
+    else:
+        for sample in group:
+            _set_train_loss_type(sample, "rl")
     apply_seconds = _seconds_since(apply_started)
     gate_started = time.monotonic()
     teacher_entries = _result_entries(result, "teacher_rollouts", "teachers", "teacher")
@@ -1123,6 +1204,7 @@ async def _score_group_with_opd_relay(
                 return None
             topk_ids = _coerce_int_matrix(entry.get("topk_token_ids")) or copy.deepcopy(sample.rollout_topk_token_ids)
             student_topk = _coerce_float_matrix(entry.get("topk_student_log_probs")) or copy.deepcopy(sample.rollout_topk_log_probs)
+            expected_topk_sha = _sha256_json(topk_ids) if topk_ids is not None else ""
             teacher_topk = _coerce_float_matrix(entry.get("teacher_topk_log_probs"))
             teacher_masks = _coerce_float_matrix(entry.get("teacher_topk_logprob_masks"))
             if teacher_topk is not None:
@@ -1131,6 +1213,10 @@ async def _score_group_with_opd_relay(
                 if not isinstance(score, dict):
                     continue
                 if best_teacher_name and str(score.get("teacher") or "") != best_teacher_name:
+                    continue
+                score_topk_sha = str(score.get("topk_token_ids_sha256") or "")
+                if expected_topk_sha and score_topk_sha and score_topk_sha != expected_topk_sha:
+                    sample.metadata["opd_gate_reason"] = "teacher_topk_ids_sha_mismatch"
                     continue
                 teacher_topk = _coerce_float_matrix(score.get("teacher_topk_log_probs"))
                 teacher_masks = _coerce_float_matrix(score.get("teacher_topk_logprob_masks"))
@@ -1245,6 +1331,276 @@ async def _score_group_with_opd_relay(
 
     return group, group
 
+
+def _opd_score_teacher_names(args: Namespace) -> list[str]:
+    names = [spec.name for spec in parse_teacher_specs(getattr(args, "opd_teachers", "")) if spec.n > 0]
+    names = list(dict.fromkeys(name for name in names if name))
+    if not names:
+        raise ValueError("OPD score pipeline requires at least one teacher")
+    return names
+
+
+async def _generate_and_dispatch_opd_students(
+    *,
+    args: Namespace,
+    state: GenerateState,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    opd_request: dict[str, Any],
+    score_teacher_names: list[str],
+) -> list[dict[str, Any]]:
+    """Generate students, then immediately fan out EDA and teacher scores."""
+
+    async def _one(slot: int, sample: Sample) -> dict[str, Any]:
+        if sample.session_id is None:
+            sample.session_id = str(uuid.uuid4())
+        generation_started = time.monotonic()
+        async with state.semaphore:
+            await generate(args, sample, sampling_params.copy())
+        generation_seconds = _seconds_since(generation_started)
+        student_rollout = _student_rollout_payload(sample, slot)
+        student_id = str(student_rollout["id"])
+        score_job_id = f"{opd_request['job_id']}_{student_id}_score"
+
+        async def _run_eda() -> Sample:
+            eda_started = time.monotonic()
+            sample.reward = await compute_reward(args, sample, want_detail=opd_request["want_detail"])
+            eda_log = (sample.metadata or {}).get("_eda_log") or {}
+            logger.info(
+                "OPD_STUDENT_EDA_READY step=%d dataset_id=%s round=%d sample_id=%s score_job=%s "
+                "status=%s reward=%.4f coverage=%.4f is_pass_targets=%s total=%.3f testbench_sha=%s",
+                opd_request["rollout_id"],
+                opd_request["dataset_id"],
+                opd_request["round_idx"] + 1,
+                student_id,
+                score_job_id,
+                eda_log.get("status", ""),
+                float(sample.reward or 0.0),
+                float(eda_log.get("overall_coverage", 0.0) or 0.0),
+                bool(eda_log.get("is_pass_targets", False)),
+                _seconds_since(eda_started),
+                student_rollout.get("testbench_sha256", ""),
+            )
+            return sample
+
+        async def _run_score() -> dict[str, Any]:
+            score_started = time.monotonic()
+            try:
+                result = await asyncio.to_thread(
+                    _run_opd_student_score_sync,
+                    args=args,
+                    job_id=score_job_id,
+                    dataset_id=opd_request["dataset_id"],
+                    rollout_id=opd_request["rollout_id"],
+                    round_idx=opd_request["round_idx"],
+                    student_rollout=student_rollout,
+                    score_teacher_names=score_teacher_names,
+                )
+            except Exception:
+                logger.exception(
+                    "OPD_STUDENT_SCORE_FAILED step=%d dataset_id=%s round=%d sample_id=%s score_job=%s",
+                    opd_request["rollout_id"],
+                    opd_request["dataset_id"],
+                    opd_request["round_idx"] + 1,
+                    student_id,
+                    score_job_id,
+                )
+                raise
+            entries = _result_entries(result, "student_rollouts", "students", "student")
+            entry = next((item for item in entries if str(item.get("id") or "") == student_id), {})
+            logger.info(
+                "OPD_STUDENT_SCORE_READY step=%d dataset_id=%s round=%d sample_id=%s score_job=%s "
+                "teacher_scores=%d worker_elapsed=%.3f total=%.3f",
+                opd_request["rollout_id"],
+                opd_request["dataset_id"],
+                opd_request["round_idx"] + 1,
+                student_id,
+                score_job_id,
+                len(entry.get("teacher_scores") or []) if isinstance(entry, dict) else 0,
+                float(result.get("elapsed_s", 0.0) or 0.0),
+                _seconds_since(score_started),
+            )
+            return result
+
+        eda_task = asyncio.create_task(_run_eda())
+        score_task = asyncio.create_task(_run_score())
+        logger.info(
+            "OPD_STUDENT_DISPATCH step=%d dataset_id=%s round=%d sample_id=%s score_job=%s "
+            "generate=%.3f response_tokens=%d topk_rows=%d",
+            opd_request["rollout_id"],
+            opd_request["dataset_id"],
+            opd_request["round_idx"] + 1,
+            student_id,
+            score_job_id,
+            generation_seconds,
+            int(sample.response_length or 0),
+            len(student_rollout.get("topk_token_ids") or []),
+        )
+        return {
+            "sample": sample,
+            "student_id": student_id,
+            "student_rollout": student_rollout,
+            "score_job_id": score_job_id,
+            "generation_seconds": generation_seconds,
+            "eda_task": eda_task,
+            "score_task": score_task,
+        }
+
+    return await asyncio.gather(*[_one(slot, sample) for slot, sample in enumerate(group)])
+
+
+def _build_streamed_opd_result(
+    *,
+    record: dict[str, Any],
+    teacher_result: dict[str, Any],
+    score_results: list[dict[str, Any] | BaseException],
+    score_teacher_names: list[str],
+) -> dict[str, Any]:
+    """Join locally-scored students with independently completed teacher work."""
+    student_entries: list[dict[str, Any]] = []
+    score_errors = 0
+    for item, score_result in zip(record["student_records"], score_results, strict=True):
+        sample = item["sample"]
+        student_id = str(item["student_id"])
+        student_entry: dict[str, Any] = {
+            "id": student_id,
+            "sample_index": sample.index,
+            "assistant_response_sha256": item["student_rollout"].get("assistant_response_sha256", ""),
+            "testbench_sha256": item["student_rollout"].get("testbench_sha256", ""),
+            "teacher_scores": [],
+        }
+        if isinstance(score_result, BaseException):
+            score_errors += 1
+            student_entry["score_error"] = str(score_result)
+            student_entries.append(student_entry)
+            continue
+        remote_entries = _result_entries(score_result, "student_rollouts", "students", "student")
+        remote_entry = next(
+            (entry for entry in remote_entries if str(entry.get("id") or "") == student_id),
+            None,
+        )
+        if remote_entry is None:
+            raise RuntimeError(f"streamed score result missing student {student_id}")
+        scores = [score for score in remote_entry.get("teacher_scores") or [] if isinstance(score, dict)]
+        expected_topk_sha = _sha256_json(sample.rollout_topk_token_ids or [])
+        for score in scores:
+            if str(score.get("student_id") or "") != student_id:
+                raise RuntimeError(
+                    f"streamed score student mismatch: expected={student_id} got={score.get('student_id')}"
+                )
+            score_topk_sha = str(score.get("topk_token_ids_sha256") or "")
+            if expected_topk_sha and score_topk_sha and score_topk_sha != expected_topk_sha:
+                raise RuntimeError(
+                    f"streamed score top-k hash mismatch for {student_id}: {score_topk_sha} != {expected_topk_sha}"
+                )
+        seen_teachers = {str(score.get("teacher") or "") for score in scores}
+        missing_teachers = [name for name in score_teacher_names if name not in seen_teachers]
+        if missing_teachers:
+            student_entry["score_error"] = f"missing_teacher_scores={','.join(missing_teachers)}"
+        student_entry["teacher_scores"] = scores
+        student_entries.append(student_entry)
+
+    teacher_entries = _result_entries(teacher_result, "teacher_rollouts", "teachers", "teacher")
+    teacher_elapsed = float(teacher_result.get("elapsed_s", 0.0) or 0.0)
+    score_elapsed = max(
+        (
+            float(result.get("elapsed_s", 0.0) or 0.0)
+            for result in score_results
+            if isinstance(result, dict)
+        ),
+        default=0.0,
+    )
+    return {
+        "version": teacher_result.get("version", "opd_exchange_v1"),
+        "status": "success",
+        "job_kind": "streamed_round",
+        "job_id": teacher_result.get("job_id") or record["opd_request"]["job_id"],
+        "_opd_teacher_job_id": teacher_result.get("job_id") or record["opd_request"]["job_id"],
+        "_opd_score_job_id": f"{record['opd_request']['job_id']}_streamed_scores",
+        "dataset_id": record["opd_request"]["dataset_id"],
+        "rollout_id": record["opd_request"]["rollout_id"],
+        "round_idx": record["opd_request"]["round_idx"],
+        "student_rollouts": student_entries,
+        "teacher_rollouts": teacher_entries,
+        "teacher_model_paths": teacher_result.get("teacher_model_paths") or {},
+        "selection": teacher_result.get("selection") or {},
+        "elapsed_s": max(teacher_elapsed, score_elapsed),
+        "timing": {
+            "streamed_score_job_count": len(score_results),
+            "streamed_score_error_count": score_errors,
+            "teacher_elapsed_seconds": teacher_elapsed,
+            "score_elapsed_max_seconds": score_elapsed,
+        },
+    }
+
+
+async def _finalize_streamed_opd_round(
+    *,
+    args: Namespace,
+    state: GenerateState,
+    record: dict[str, Any],
+    sampling_params: dict[str, Any],
+    sample_index_allocator,
+    score_teacher_names: list[str],
+) -> None:
+    """Apply OPD only after all already-dispatched dependencies are available."""
+    finalize_started = time.monotonic()
+    group = record["group"]
+    request = record["opd_request"]
+    try:
+        teacher_result, score_results = await asyncio.gather(
+            record["teacher_task"],
+            asyncio.gather(*(item["score_task"] for item in record["student_records"]), return_exceptions=True),
+        )
+        result = _build_streamed_opd_result(
+            record=record,
+            teacher_result=teacher_result,
+            score_results=score_results,
+            score_teacher_names=score_teacher_names,
+        )
+        await _score_group_with_opd_relay(
+            args=args,
+            state=state,
+            group=group,
+            sampling_params=sampling_params,
+            rollout_id=request["rollout_id"],
+            round_idx=request["round_idx"],
+            dataset_id=request["dataset_id"],
+            want_detail=request["want_detail"],
+            sample_index_allocator=sample_index_allocator,
+            opd_request=request,
+            precomputed_result=result,
+            apply_remote_student_scores=False,
+        )
+        score_errors = sum(isinstance(value, BaseException) for value in score_results)
+        logger.info(
+            "OPD_PIPELINE_ROUND_TIMING step=%d dataset_id=%s round=%d "
+            "student_generate=%.3f local_eda_wait=%.3f teacher_wall=%.3f finalize_wait=%.3f "
+            "score_jobs=%d score_errors=%d total=%.3f",
+            request["rollout_id"],
+            request["dataset_id"],
+            request["round_idx"] + 1,
+            record["student_generate_seconds"],
+            record["local_eda_wait_seconds"],
+            _seconds_since(record["teacher_started"]),
+            _seconds_since(finalize_started),
+            len(score_results),
+            score_errors,
+            _seconds_since(record["round_started"]),
+        )
+    except Exception:
+        logger.exception(
+            "OPD pipeline finalization failed; retaining local RL samples step=%d dataset_id=%s round=%d",
+            request["rollout_id"],
+            request["dataset_id"],
+            request["round_idx"] + 1,
+        )
+        for sample in group:
+            sample.metadata["opd_gate_pass"] = False
+            sample.metadata["opd_gate_reason"] = "opd_pipeline_finalize_failed"
+            _set_train_loss_type(sample, "rl")
+
+
 async def _generate_and_score_group(
     args: Namespace,
     state: GenerateState,
@@ -1347,13 +1703,16 @@ async def _rollout_one_prompt(
     )
     rounds_output: list[list[Sample]] = []
     current_group = initial_group
+    use_opd_pipeline = bool(getattr(args, "use_opd_relay", False)) and not evaluation
+    opd_score_teacher_names = _opd_score_teacher_names(args) if use_opd_pipeline else []
+    opd_finalize_tasks: list[Any] = []
     for round_idx in range(num_rounds):
         round_started = time.monotonic()
         for s in current_group:
             s.metadata["round_number"] = round_idx
 
         train_group: list[Sample]
-        if bool(getattr(args, "use_opd_relay", False)) and not evaluation:
+        if use_opd_pipeline:
             request_started = time.monotonic()
             opd_request = _build_opd_round_request(
                 args=args,
@@ -1369,79 +1728,61 @@ async def _rollout_one_prompt(
             teacher_started = time.monotonic()
             teacher_task = asyncio.create_task(asyncio.to_thread(_run_opd_teacher_round_sync, **opd_request))
             student_started = time.monotonic()
-            current_group = await _generate_group_only(args, state, current_group, sampling_params)
-            student_seconds = _seconds_since(student_started)
-            try:
-                teacher_wait_started = time.monotonic()
-                teacher_result = await teacher_task
-                teacher_wait_after_student_seconds = _seconds_since(teacher_wait_started)
-                score_started = time.monotonic()
-                train_group, current_group = await _score_group_with_opd_relay(
-                    args=args,
-                    state=state,
-                    group=current_group,
-                    sampling_params=sampling_params,
-                    rollout_id=rollout_id,
-                    round_idx=round_idx,
-                    dataset_id=context_id,
-                    want_detail=_want_detail,
-                    sample_index_allocator=sample_index_allocator,
-                    teacher_result=teacher_result,
-                    opd_request=opd_request,
+            student_records = await _generate_and_dispatch_opd_students(
+                args=args,
+                state=state,
+                group=current_group,
+                sampling_params=sampling_params,
+                opd_request=opd_request,
+                score_teacher_names=opd_score_teacher_names,
+            )
+            student_generate_seconds = _seconds_since(student_started)
+            local_eda_wait_started = time.monotonic()
+            await asyncio.gather(*(item["eda_task"] for item in student_records))
+            local_eda_wait_seconds = _seconds_since(local_eda_wait_started)
+            if getattr(args, "use_uncovered_reward", False):
+                _apply_diversity_reward(current_group, args)
+            for sample in current_group:
+                _set_train_loss_type(sample, "rl")
+            response_lengths = [int(sample.response_length or 0) for sample in current_group]
+            record = {
+                "group": current_group,
+                "opd_request": opd_request,
+                "teacher_task": teacher_task,
+                "teacher_started": teacher_started,
+                "student_records": student_records,
+                "student_generate_seconds": student_generate_seconds,
+                "local_eda_wait_seconds": local_eda_wait_seconds,
+                "round_started": round_started,
+            }
+            opd_finalize_tasks.append(
+                asyncio.create_task(
+                    _finalize_streamed_opd_round(
+                        args=args,
+                        state=state,
+                        record=record,
+                        sampling_params=sampling_params,
+                        sample_index_allocator=sample_index_allocator,
+                        score_teacher_names=opd_score_teacher_names,
+                    )
                 )
-                score_seconds = _seconds_since(score_started)
-                response_lengths = [int(sample.response_length or 0) for sample in current_group]
-                logger.info(
-                    "OPD_ROUND_TIMING step=%d dataset_id=%s round=%d/%d "
-                    "request_build=%.3f teacher_wall=%.3f student_generate=%.3f "
-                    "teacher_wait_after_student=%.3f score=%.3f total=%.3f "
-                    "teacher_worker_elapsed=%.3f teacher_client_total=%.3f "
-                    "response_tokens_sum=%d response_tokens_max=%d",
-                    rollout_id,
-                    context_id,
-                    round_idx + 1,
-                    num_rounds,
-                    request_seconds,
-                    _seconds_since(teacher_started),
-                    student_seconds,
-                    teacher_wait_after_student_seconds,
-                    score_seconds,
-                    _seconds_since(round_started),
-                    float(teacher_result.get("elapsed_s", 0.0) or 0.0),
-                    sum(
-                        _client_timing_value(teacher_result.get("_opd_client_timing") or {}, section, key)
-                        for section, key in (
-                            ("submit", "seconds"),
-                            ("wait_result", "wait_seconds"),
-                            ("wait_result", "download_seconds"),
-                        )
-                    ),
-                    sum(response_lengths),
-                    max(response_lengths, default=0),
-                )
-            except Exception:
-                logger.exception(
-                    "OPD relay failed; falling back to local RL scoring "
-                    "step=%d dataset_id=%s round=%d",
-                    rollout_id, context_id, round_idx + 1,
-                )
-                fallback_started = time.monotonic()
-                current_group = await _score_existing_group_locally(args, current_group, _want_detail)
-                logger.info(
-                    "OPD_ROUND_TIMING step=%d dataset_id=%s round=%d/%d "
-                    "request_build=%.3f teacher_wall=%.3f student_generate=%.3f "
-                    "teacher_wait_after_student=nan fallback_local_score=%.3f total=%.3f",
-                    rollout_id,
-                    context_id,
-                    round_idx + 1,
-                    num_rounds,
-                    request_seconds,
-                    _seconds_since(teacher_started),
-                    student_seconds,
-                    _seconds_since(fallback_started),
-                    _seconds_since(round_started),
-                )
-                train_group = current_group
+            )
+            logger.info(
+                "OPD_PIPELINE_DISPATCH_TIMING step=%d dataset_id=%s round=%d/%d "
+                "request_build=%.3f student_generate=%.3f local_eda_wait=%.3f "
+                "teacher_wall_so_far=%.3f response_tokens_sum=%d response_tokens_max=%d",
+                rollout_id,
+                context_id,
+                round_idx + 1,
+                num_rounds,
+                request_seconds,
+                student_generate_seconds,
+                local_eda_wait_seconds,
+                _seconds_since(teacher_started),
+                sum(response_lengths),
+                max(response_lengths, default=0),
+            )
+            train_group = current_group
         else:
             round_generate_score_started = time.monotonic()
             current_group = await _generate_and_score_group(
@@ -1609,6 +1950,8 @@ async def _rollout_one_prompt(
             n_samples=len(initial_group),
         )
 
+    if opd_finalize_tasks:
+        await asyncio.gather(*opd_finalize_tasks)
     return rounds_output
 
 

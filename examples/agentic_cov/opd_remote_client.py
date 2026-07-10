@@ -594,6 +594,7 @@ def build_round_files(
 
     manifest = {
         "version": SCHEMA_VERSION,
+        "job_kind": "round",
         "job_id": job_id,
         "dataset_id": dataset_id,
         "rollout_id": rollout_id,
@@ -609,14 +610,84 @@ def build_round_files(
         "teacher_request": {
             "generate_teacher_rollouts": bool(generate_teacher_rollouts),
             "return_teacher_assistant_response": True,
-            "return_teacher_token_ids": True,
-            "return_teacher_logprobs": True,
+            # Teacher rollout logprobs are never consumed by the OPD loss.
+            # The exact teacher distribution is obtained later by forced
+            # scoring on the student's token support.
+            "return_teacher_token_ids": False,
+            "return_teacher_logprobs": False,
             "return_teacher_topk_logprobs": int(topk_k or 0) > 1,
             "student_topk_k": int(topk_k or 0),
             "score_student_rollouts": bool(score_student_rollouts),
         },
         "files": make_file_manifest(files),
     }
+    files["manifest.json"] = _encode_text(_json_dumps(manifest))
+    return files
+
+
+def build_student_score_files(
+    *,
+    job_id: str,
+    dataset_id: str,
+    rollout_id: int,
+    round_idx: int,
+    student_rollout: dict[str, Any],
+    score_teacher_names: list[str],
+    topk_k: int,
+) -> dict[str, bytes]:
+    """Build a minimal forced-score request for one completed student rollout.
+
+    A score-only job deliberately omits the prompt, full EDA context, and
+    teacher rollout request.  The student host runs EDA immediately in
+    parallel; this request only needs the student's response tokens and
+    top-k support to ask every teacher for exact forced probabilities.
+    """
+    names = list(dict.fromkeys(str(name) for name in score_teacher_names if str(name)))
+    if not names:
+        raise ValueError("student score request requires at least one teacher")
+
+    files = build_round_files(
+        job_id=job_id,
+        dataset_id=dataset_id,
+        rollout_id=rollout_id,
+        round_idx=round_idx,
+        prompt="",
+        state={},
+        context={},
+        student_rollouts=[student_rollout],
+        teachers=[],
+        sampling_params={},
+        want_detail=False,
+        score_student_rollouts=True,
+        topk_k=topk_k,
+        generate_teacher_rollouts=False,
+    )
+    manifest = json.loads(files.pop("manifest.json").decode("utf-8"))
+    for rel in ("prompt.txt", "state.json", "context.json"):
+        files.pop(rel, None)
+
+    manifest["job_kind"] = "student_score"
+    manifest["prompt_file"] = None
+    manifest["state_file"] = None
+    manifest["context_file"] = None
+    manifest["sampling_params"] = {}
+    manifest["eda"] = {"want_detail": False, "run_student_eda": False}
+    teacher_request = manifest.get("teacher_request")
+    if not isinstance(teacher_request, dict):
+        teacher_request = {}
+        manifest["teacher_request"] = teacher_request
+    teacher_request.update(
+        {
+            "generate_teacher_rollouts": False,
+            "return_teacher_assistant_response": False,
+            "return_teacher_token_ids": False,
+            "return_teacher_logprobs": False,
+            "score_student_rollouts": True,
+            "score_teacher_names": names,
+            "student_topk_k": int(topk_k or 0),
+        }
+    )
+    manifest["files"] = make_file_manifest(files)
     files["manifest.json"] = _encode_text(_json_dumps(manifest))
     return files
 

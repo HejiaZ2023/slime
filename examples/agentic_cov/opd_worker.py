@@ -69,6 +69,7 @@ TEACHER_SCORE_CHUNK_TOKENS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_TOKENS"
 TEACHER_SCORE_CHUNK_WORKERS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_WORKERS", "1"))
 TEACHER_SCORE_CONTEXT_MARGIN = int(os.environ.get("OPD_TEACHER_SCORE_CONTEXT_MARGIN", "16"))
 TEACHER_SCORE_POSITION_TOPK = os.environ.get("OPD_TEACHER_SCORE_POSITION_TOPK", "1") != "0"
+TEACHER_ENDPOINT_MAX_INFLIGHT = max(1, int(os.environ.get("OPD_TEACHER_ENDPOINT_MAX_INFLIGHT", "2")))
 TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sheng/final_ckpts")
 EDA_SERVER = os.environ.get("OPD_EDA_SERVER", "local")
 EDA_REPO_DIR = os.environ.get("OPD_EDA_REPO_DIR", "/workspace/llm4cov_eda")
@@ -82,6 +83,25 @@ _JOB_SEM = threading.Semaphore(MAX_CONCURRENT_JOBS)
 _LOCK = threading.Lock()
 _INFLIGHT: set[str] = set()
 QUEUE_BACKEND: Any | None = None
+_TEACHER_ENDPOINT_LOCK = threading.Lock()
+_TEACHER_ENDPOINT_SLOTS: dict[str, threading.BoundedSemaphore] = {}
+
+
+@contextlib.contextmanager
+def teacher_endpoint_slot(name: str):
+    """Bound in-flight requests per teacher while keeping teachers independent."""
+    with _TEACHER_ENDPOINT_LOCK:
+        slot = _TEACHER_ENDPOINT_SLOTS.get(name)
+        if slot is None:
+            slot = threading.BoundedSemaphore(TEACHER_ENDPOINT_MAX_INFLIGHT)
+            _TEACHER_ENDPOINT_SLOTS[name] = slot
+    queued_at = time.monotonic()
+    slot.acquire()
+    wait_seconds = time.monotonic() - queued_at
+    try:
+        yield wait_seconds
+    finally:
+        slot.release()
 
 _CODE_RE = re.compile(r"```(?:verilog|systemverilog|sv)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _MODULE_RE = re.compile(r"(module\s+[\s\S]*?endmodule)", re.IGNORECASE)
@@ -158,6 +178,7 @@ def summarize_result(obj: dict[str, Any], final_dir: Path) -> dict[str, Any]:
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "job_id": obj.get("job_id"),
         "status": obj.get("status"),
+        "job_kind": obj.get("job_kind", "round"),
         "dataset_id": obj.get("dataset_id"),
         "rollout_id": obj.get("rollout_id"),
         "round_idx": obj.get("round_idx"),
@@ -982,49 +1003,57 @@ def generate_teacher_rollout(name: str, slot: int, prompt: str, sampling_params:
         return {
             **base,
             "assistant_response": "",
-            "generated_token_ids": [],
-            "generated_token_logprobs": [],
             "finish_reason": skip_reason,
             "teacher_generation_status": skip_reason,
             "teacher_generation_timing": {
                 "total_seconds": time.monotonic() - started,
                 "request_seconds": 0.0,
+                "endpoint_wait_seconds": 0.0,
             },
         }
-    payload = {"text": prompt, "sampling_params": effective_sampling_params, "return_logprob": True}
+    # Teacher rollout output logprobs are not used for OPD.  Forced scoring on
+    # the student's exact top-k support below is the sole teacher distribution
+    # consumed by the loss, so avoid asking SGLang to serialize rollout LPs.
+    payload = {"text": prompt, "sampling_params": effective_sampling_params}
+    endpoint_wait_seconds = 0.0
+    request_seconds = 0.0
     try:
-        request_started = time.monotonic()
-        output = post_json(url, payload, timeout=TEACHER_TIMEOUT)
-        request_seconds = time.monotonic() - request_started
+        with teacher_endpoint_slot(name) as endpoint_wait_seconds:
+            request_started = time.monotonic()
+            output = post_json(url, payload, timeout=TEACHER_TIMEOUT)
+            request_seconds = time.monotonic() - request_started
     except Exception as exc:
         return {
             **base,
             "assistant_response": "",
-            "generated_token_ids": [],
-            "generated_token_logprobs": [],
             "finish_reason": "teacher_generate_error",
             "teacher_generation_status": "teacher_generate_error",
             "teacher_generation_error": str(exc),
             "teacher_generation_timing": {
                 "total_seconds": time.monotonic() - started,
-                "request_seconds": time.monotonic() - request_started,
+                "request_seconds": request_seconds,
+                "endpoint_wait_seconds": endpoint_wait_seconds,
             },
         }
     response = str(output.get("text") or output.get("response") or output.get("output") or "")
     meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
-    token_ids, logprobs = extract_token_logprobs(meta)
+    try:
+        generated_token_count = int(
+            meta.get("completion_tokens") or meta.get("generated_token_count") or 0
+        )
+    except (TypeError, ValueError):
+        generated_token_count = 0
     return {
         **base,
         "assistant_response": response,
-        "generated_token_ids": token_ids,
-        "generated_token_logprobs": logprobs,
         "finish_reason": meta.get("finish_reason"),
         "teacher_generation_status": "success",
         "teacher_generation_timing": {
             "total_seconds": time.monotonic() - started,
             "request_seconds": request_seconds,
+            "endpoint_wait_seconds": endpoint_wait_seconds,
             "response_chars": len(response),
-            "generated_token_count": len(token_ids),
+            "generated_token_count": generated_token_count,
         },
     }
 
@@ -1274,8 +1303,10 @@ def score_teacher_on_student(
                 # Fallback for old SGLang builds that only accept a
                 # request-level token_ids_logprob union.
                 payload["token_ids_logprob"] = token_ids_logprob
-        started = time.monotonic()
-        output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
+        with teacher_endpoint_slot(name) as endpoint_wait_seconds:
+            request_started = time.monotonic()
+            output = post_json(teacher_url(name, cfg), payload, timeout=TEACHER_TIMEOUT)
+            request_seconds = time.monotonic() - request_started
         meta = output.get("meta_info") if isinstance(output.get("meta_info"), dict) else {}
         chunk_log_probs = extract_input_logprobs(meta, chunk_len)
         chunk_topk, chunk_masks = _extract_requested_topk_logprobs(
@@ -1286,7 +1317,8 @@ def score_teacher_on_student(
         timing = {
             "offset": offset,
             "chunk_response_token_count": chunk_len,
-            "request_seconds": time.monotonic() - started,
+            "request_seconds": request_seconds,
+            "endpoint_wait_seconds": endpoint_wait_seconds,
             "input_token_count": len(chunk_input_ids),
             "window_start": window_start,
             "window_end": chunk_end,
@@ -1338,6 +1370,8 @@ def score_teacher_on_student(
                 "chunk_request_wall_seconds": chunk_wall_seconds,
                 "chunk_request_sum_seconds": sum(_timing(t, "request_seconds") for t in timings),
                 "chunk_request_max_seconds": max((_timing(t, "request_seconds") for t in timings), default=0.0),
+                "endpoint_wait_sum_seconds": sum(_timing(t, "endpoint_wait_seconds") for t in timings),
+                "endpoint_wait_max_seconds": max((_timing(t, "endpoint_wait_seconds") for t in timings), default=0.0),
                 "teacher_context_length": score_context_len,
                 "max_request_input_token_count": max(
                     (int(t.get("input_token_count") or 0) for t in timings),
@@ -1386,6 +1420,8 @@ def score_teacher_on_student(
             "chunk_request_wall_seconds": chunk_wall_seconds,
             "chunk_request_sum_seconds": sum(_timing(t, "request_seconds") for t in timings),
             "chunk_request_max_seconds": max((_timing(t, "request_seconds") for t in timings), default=0.0),
+            "endpoint_wait_sum_seconds": sum(_timing(t, "endpoint_wait_seconds") for t in timings),
+            "endpoint_wait_max_seconds": max((_timing(t, "endpoint_wait_seconds") for t in timings), default=0.0),
             "teacher_context_length": score_context_len,
             "max_request_input_token_count": max(
                 (int(t.get("input_token_count") or 0) for t in timings),
@@ -1436,7 +1472,12 @@ def _hydrate_student_tensor_sidecar(job: Path, base: Path, meta: dict[str, Any])
             meta[key] = arr.tolist()
 
 
-def score_student(job: Path, entry: dict[str, Any], context: SimpleNamespace, want_detail: bool) -> dict[str, Any]:
+def load_student_rollout(job: Path, entry: dict[str, Any]) -> dict[str, Any]:
+    """Load one student payload without running EDA.
+
+    Score-only jobs use this path so their forced teacher scoring can start as
+    soon as generation finishes, independently of the student-side EDA task.
+    """
     sid = str(entry.get("id"))
     base = job / str(entry.get("path", f"student/{sid}"))
     meta = read_json(base / "meta.json") if (base / "meta.json").exists() else {}
@@ -1447,7 +1488,6 @@ def score_student(job: Path, entry: dict[str, Any], context: SimpleNamespace, wa
         body = (base / "testbench.sv").read_text(encoding="utf-8")
     else:
         body = extract_verilog(response)
-    scored = run_eda(context, filename, body, want_detail)
     testbench = {"filename": safe_filename(filename), "content": body} if body else None
     return {
         "id": sid,
@@ -1461,9 +1501,19 @@ def score_student(job: Path, entry: dict[str, Any], context: SimpleNamespace, wa
         "rollout_log_probs": meta.get("rollout_log_probs") or [],
         "topk_token_ids": meta.get("topk_token_ids") or [],
         "topk_student_log_probs": meta.get("topk_student_log_probs") or [],
+        "assistant_response_sha256": meta.get("assistant_response_sha256") or "",
+        "testbench_sha256": meta.get("testbench_sha256") or "",
         "teacher_scores": [],
-        **scored,
     }
+
+
+def score_student(job: Path, entry: dict[str, Any], context: SimpleNamespace, want_detail: bool) -> dict[str, Any]:
+    loaded = load_student_rollout(job, entry)
+    testbench = loaded.get("testbench") if isinstance(loaded.get("testbench"), dict) else None
+    filename = testbench.get("filename") if testbench else None
+    body = testbench.get("content") if testbench else None
+    scored = run_eda(context, filename, body, want_detail)
+    return {**loaded, **scored}
 
 
 def score_teacher(entry: dict[str, Any], context: SimpleNamespace, want_detail: bool) -> dict[str, Any]:
@@ -1579,6 +1629,8 @@ def _compact_student_entry(entry: dict[str, Any]) -> dict[str, Any]:
     keep = {
         "id",
         "sample_index",
+        "assistant_response_sha256",
+        "testbench_sha256",
         "reward",
         "eda_summary",
         "eda_log",
@@ -1613,6 +1665,7 @@ def _compact_result_for_training(obj: dict[str, Any]) -> dict[str, Any]:
         "version": obj.get("version"),
         "status": obj.get("status"),
         "result_kind": "training_compact",
+        "job_kind": obj.get("job_kind", "round"),
         "job_id": obj.get("job_id"),
         "dataset_id": obj.get("dataset_id"),
         "rollout_id": obj.get("rollout_id"),
@@ -1681,6 +1734,170 @@ def publish(job_id: str, obj: dict[str, Any]) -> None:
         QUEUE_BACKEND.publish_result(job_id, final, summary)
 
 
+def _score_teacher_names(teacher_request: dict[str, Any], teacher_specs: list[dict[str, Any]], cfg: dict[str, Any]) -> list[str]:
+    requested = teacher_request.get("score_teacher_names")
+    if isinstance(requested, list):
+        names = [str(name) for name in requested if str(name)]
+    else:
+        names = [str(spec.get("name") or "") for spec in teacher_specs if isinstance(spec, dict)]
+    if not names:
+        names = [str(name) for name in cfg]
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def _log_teacher_score_timing(job_id: str, score: dict[str, Any]) -> None:
+    score_timing = score.get("teacher_score_timing") if isinstance(score.get("teacher_score_timing"), dict) else {}
+    log(
+        "OPD_TEACHER_SCORE_TIMING",
+        job_id,
+        f"student={score.get('student_id')}",
+        f"teacher={score.get('teacher')}",
+        f"status={score.get('status')}",
+        f"total={_timing(score_timing, 'request_seconds'):.3f}",
+        f"endpoint_wait={_timing(score_timing, 'endpoint_wait_sum_seconds'):.3f}",
+        f"chunk_wall={_timing(score_timing, 'chunk_request_wall_seconds'):.3f}",
+        f"chunk_sum={_timing(score_timing, 'chunk_request_sum_seconds'):.3f}",
+        f"chunk_max={_timing(score_timing, 'chunk_request_max_seconds'):.3f}",
+        f"chunks={int(score_timing.get('chunk_count') or 0)}",
+        f"chunk_workers={int(score_timing.get('chunk_workers') or 0)}",
+        f"prompt_tokens={int(score_timing.get('prompt_token_count') or 0)}",
+        f"response_tokens={int(score_timing.get('response_token_count') or 0)}",
+        f"max_input={int(score_timing.get('max_request_input_token_count') or 0)}",
+    )
+    for chunk in score_timing.get("chunks") or []:
+        if not isinstance(chunk, dict):
+            continue
+        log(
+            "OPD_TEACHER_SCORE_CHUNK_TIMING",
+            job_id,
+            f"student={score.get('student_id')}",
+            f"teacher={score.get('teacher')}",
+            f"offset={int(chunk.get('offset') or 0)}",
+            f"response_tokens={int(chunk.get('chunk_response_token_count') or 0)}",
+            f"input_tokens={int(chunk.get('input_token_count') or 0)}",
+            f"endpoint_wait={_timing(chunk, 'endpoint_wait_seconds'):.3f}",
+            f"request={_timing(chunk, 'request_seconds'):.3f}",
+            f"window_start={int(chunk.get('window_start') or 0)}",
+            f"logprob_start={int(chunk.get('logprob_start_len') or 0)}",
+        )
+
+
+def _process_student_score_job(
+    job: Path,
+    manifest: dict[str, Any],
+    *,
+    job_id: str,
+    started_wall: float,
+    started: float,
+    timing: dict[str, Any],
+) -> None:
+    """Process one student-only forced-score request without running EDA."""
+    phase_started = time.monotonic()
+    teacher_cfg = load_teacher_config()
+    teacher_request = manifest.get("teacher_request") if isinstance(manifest.get("teacher_request"), dict) else {}
+    teacher_specs = manifest.get("teachers") if isinstance(manifest.get("teachers"), list) else []
+    teacher_names = _score_teacher_names(teacher_request, teacher_specs, teacher_cfg)
+    if not teacher_names:
+        raise ValueError("student score job has no teacher names")
+    student_specs = manifest.get("student_rollouts") if isinstance(manifest.get("student_rollouts"), list) else []
+    if not student_specs:
+        raise ValueError("student score job has no student rollout")
+    student_entries = [load_student_rollout(job, entry) for entry in student_specs if isinstance(entry, dict)]
+    if not student_entries:
+        raise ValueError("student score job has no valid student rollout")
+    topk_k = int(teacher_request.get("student_topk_k") or 0)
+    timing["load_request_seconds"] = time.monotonic() - phase_started
+    timing["student_eda_seconds"] = 0.0
+    timing["teacher_generate_seconds"] = 0.0
+    timing["teacher_eda_seconds"] = 0.0
+    timing["teacher_pipeline_seconds"] = 0.0
+    timing["teacher_pipeline_overlap_saved_seconds"] = 0.0
+
+    phase_started = time.monotonic()
+    work = [(entry, name) for entry in student_entries for name in teacher_names]
+    score_workers = max(1, min(MAX_JOB_WORKERS, len(work) or 1))
+    score_order = {name: index for index, name in enumerate(teacher_names)}
+    with ThreadPoolExecutor(max_workers=score_workers) as pool:
+        futures = {
+            pool.submit(score_teacher_on_student, name, entry, teacher_cfg, topk_k): (entry, name)
+            for entry, name in work
+        }
+        for future in as_completed(futures):
+            entry, requested_name = futures[future]
+            score = future.result()
+            if str(score.get("student_id") or "") != str(entry.get("id") or ""):
+                raise ValueError(
+                    f"teacher score student mismatch: requested={entry.get('id')} got={score.get('student_id')}"
+                )
+            if str(score.get("teacher") or "") != requested_name:
+                raise ValueError(
+                    f"teacher score teacher mismatch: requested={requested_name} got={score.get('teacher')}"
+                )
+            entry.setdefault("teacher_scores", []).append(score)
+            _log_teacher_score_timing(job_id, score)
+    for entry in student_entries:
+        entry["teacher_scores"].sort(key=lambda item: score_order.get(str(item.get("teacher") or ""), len(score_order)))
+    timing["teacher_score_student_seconds"] = time.monotonic() - phase_started
+    timing["teacher_score_student_max_seconds"] = max(
+        (
+            _timing(score.get("teacher_score_timing") or {}, "request_seconds")
+            for entry in student_entries
+            for score in entry.get("teacher_scores") or []
+            if isinstance(score, dict)
+        ),
+        default=0.0,
+    )
+    timing["teacher_score_student_sum_seconds"] = sum(
+        _timing(score.get("teacher_score_timing") or {}, "request_seconds")
+        for entry in student_entries
+        for score in entry.get("teacher_scores") or []
+        if isinstance(score, dict)
+    )
+    timing["teacher_score_request_count"] = len(work)
+    timing["teacher_score_workers"] = score_workers
+
+    worker_before_publish = time.monotonic() - started
+    timing["worker_total_before_publish_seconds"] = worker_before_publish
+    timing["worker_accounted_before_publish_seconds"] = sum(
+        float(timing.get(key, 0.0) or 0.0)
+        for key in ("job_semaphore_wait_seconds", "load_request_seconds", "teacher_score_student_seconds")
+    )
+    timing["worker_unaccounted_before_publish_seconds"] = max(
+        0.0, worker_before_publish - timing["worker_accounted_before_publish_seconds"]
+    )
+    result = {
+        "version": SCHEMA_VERSION,
+        "status": "success",
+        "job_kind": "student_score",
+        "job_id": job_id,
+        "dataset_id": manifest.get("dataset_id"),
+        "rollout_id": manifest.get("rollout_id"),
+        "round_idx": manifest.get("round_idx"),
+        "student_rollouts": student_entries,
+        "teacher_rollouts": [],
+        "teacher_model_paths": teacher_model_paths(teacher_names, teacher_cfg),
+        "selection": selection([], []),
+        "elapsed_s": time.time() - started_wall,
+        "timing": timing,
+        "teacher_worker": {"id": WORKER_ID, "queue_transport": QUEUE_TRANSPORT},
+    }
+    publish_started = time.monotonic()
+    publish(job_id, result)
+    timing["publish_seconds"] = time.monotonic() - publish_started
+    timing["worker_total_seconds"] = time.monotonic() - started
+    log(
+        "OPD_WORKER_TIMING",
+        job_id,
+        "kind=student_score",
+        f"sem_wait={timing.get('job_semaphore_wait_seconds', 0.0):.3f}",
+        f"load={timing.get('load_request_seconds', 0.0):.3f}",
+        f"teacher_score={timing.get('teacher_score_student_seconds', 0.0):.3f}",
+        f"publish={timing.get('publish_seconds', 0.0):.3f}",
+        f"total={timing.get('worker_total_seconds', 0.0):.3f}",
+    )
+    log("done", job_id, "kind=student_score", f"students={len(student_entries)}", f"score_requests={len(work)}")
+
+
 def process(job: Path) -> None:
     job_id = job.name
     started_wall = time.time()
@@ -1694,6 +1911,16 @@ def process(job: Path) -> None:
             manifest = read_json(job / "manifest.json")
             if manifest.get("version") != SCHEMA_VERSION:
                 raise ValueError(f"bad schema version: {manifest.get('version')}")
+            if str(manifest.get("job_kind") or "round") == "student_score":
+                _process_student_score_job(
+                    job,
+                    manifest,
+                    job_id=job_id,
+                    started_wall=started_wall,
+                    started=started,
+                    timing=timing,
+                )
+                return
             prompt = (job / manifest.get("prompt_file", "prompt.txt")).read_text(encoding="utf-8")
             context = context_from_dict(read_json(job / manifest.get("context_file", "context.json")))
             want_detail = bool((manifest.get("eda") or {}).get("want_detail", False))
@@ -1858,82 +2085,69 @@ def process(job: Path) -> None:
 
             phase_started = time.monotonic()
             sel = selection(student_entries, teacher_entries)
-            best_teacher_entry = max(teacher_entries, key=lambda e: float(e.get("reward", 0.0)), default=None)
             timing["selection_seconds"] = time.monotonic() - phase_started
             timing["teacher_score_student_seconds"] = 0.0
             timing["teacher_score_student_max_seconds"] = 0.0
-            if teacher_request.get("score_student_rollouts") and best_teacher_entry is not None:
-                best_teacher_name = str(best_teacher_entry.get("teacher") or "")
-                if best_teacher_name:
-                    phase_started = time.monotonic()
-                    with ThreadPoolExecutor(max_workers=max(1, min(MAX_JOB_WORKERS, len(student_entries) or 1))) as pool:
-                        topk_k = int(teacher_request.get("student_topk_k") or 0)
-                        scores = list(pool.map(lambda e: score_teacher_on_student(best_teacher_name, e, teacher_cfg, topk_k), student_entries))
-                    timing["teacher_score_student_seconds"] = time.monotonic() - phase_started
-                    timing["teacher_score_student_max_seconds"] = max(
-                        (
-                            float((score.get("teacher_score_timing") or {}).get("request_seconds", 0.0) or 0.0)
-                            for score in scores
-                            if isinstance(score, dict)
-                        ),
-                        default=0.0,
-                    )
-                    timing["teacher_score_student_sum_seconds"] = sum(
-                        float((score.get("teacher_score_timing") or {}).get("request_seconds", 0.0) or 0.0)
-                        for score in scores
-                        if isinstance(score, dict)
-                    )
-                    for score in scores:
-                        score_timing = score.get("teacher_score_timing") if isinstance(score.get("teacher_score_timing"), dict) else {}
-                        log(
-                            "OPD_TEACHER_SCORE_TIMING",
-                            job_id,
-                            f"student={score.get('student_id')}",
-                            f"teacher={score.get('teacher')}",
-                            f"status={score.get('status')}",
-                            f"total={_timing(score_timing, 'request_seconds'):.3f}",
-                            f"chunk_wall={_timing(score_timing, 'chunk_request_wall_seconds'):.3f}",
-                            f"chunk_sum={_timing(score_timing, 'chunk_request_sum_seconds'):.3f}",
-                            f"chunk_max={_timing(score_timing, 'chunk_request_max_seconds'):.3f}",
-                            f"chunks={int(score_timing.get('chunk_count') or 0)}",
-                            f"chunk_workers={int(score_timing.get('chunk_workers') or 0)}",
-                            f"prompt_tokens={int(score_timing.get('prompt_token_count') or 0)}",
-                            f"response_tokens={int(score_timing.get('response_token_count') or 0)}",
-                            f"max_input={int(score_timing.get('max_request_input_token_count') or 0)}",
-                        )
-                        for chunk in score_timing.get("chunks") or []:
-                            if not isinstance(chunk, dict):
-                                continue
-                            log(
-                                "OPD_TEACHER_SCORE_CHUNK_TIMING",
-                                job_id,
-                                f"student={score.get('student_id')}",
-                                f"teacher={score.get('teacher')}",
-                                f"offset={int(chunk.get('offset') or 0)}",
-                                f"response_tokens={int(chunk.get('chunk_response_token_count') or 0)}",
-                                f"input_tokens={int(chunk.get('input_token_count') or 0)}",
-                                f"request={_timing(chunk, 'request_seconds'):.3f}",
-                                f"window_start={int(chunk.get('window_start') or 0)}",
-                                f"logprob_start={int(chunk.get('logprob_start_len') or 0)}",
+            score_teacher_names = _score_teacher_names(teacher_request, teacher_specs, teacher_cfg)
+            if teacher_request.get("score_student_rollouts") and score_teacher_names:
+                phase_started = time.monotonic()
+                work = [(entry, name) for entry in student_entries for name in score_teacher_names]
+                score_workers = max(1, min(MAX_JOB_WORKERS, len(work) or 1))
+                score_order = {name: index for index, name in enumerate(score_teacher_names)}
+                with ThreadPoolExecutor(max_workers=score_workers) as pool:
+                    futures = {
+                        pool.submit(score_teacher_on_student, name, entry, teacher_cfg, int(teacher_request.get("student_topk_k") or 0)): (entry, name)
+                        for entry, name in work
+                    }
+                    for future in as_completed(futures):
+                        entry, requested_name = futures[future]
+                        score = future.result()
+                        if str(score.get("student_id") or "") != str(entry.get("id") or ""):
+                            raise ValueError(
+                                f"teacher score student mismatch: requested={entry.get('id')} got={score.get('student_id')}"
                             )
-                    for entry, score in zip(student_entries, scores, strict=False):
+                        if str(score.get("teacher") or "") != requested_name:
+                            raise ValueError(
+                                f"teacher score teacher mismatch: requested={requested_name} got={score.get('teacher')}"
+                            )
                         entry.setdefault("teacher_scores", []).append(score)
-                        if score.get("status") in {"success", "topk_success", "partial_topk"}:
-                            entry["teacher_logprob_teacher"] = best_teacher_name
+                        _log_teacher_score_timing(job_id, score)
+                for entry in student_entries:
+                    entry["teacher_scores"].sort(
+                        key=lambda item: score_order.get(str(item.get("teacher") or ""), len(score_order))
+                    )
+                timing["teacher_score_student_seconds"] = time.monotonic() - phase_started
+                timing["teacher_score_student_max_seconds"] = max(
+                    (
+                        _timing(score.get("teacher_score_timing") or {}, "request_seconds")
+                        for entry in student_entries
+                        for score in entry.get("teacher_scores") or []
+                        if isinstance(score, dict)
+                    ),
+                    default=0.0,
+                )
+                timing["teacher_score_student_sum_seconds"] = sum(
+                    _timing(score.get("teacher_score_timing") or {}, "request_seconds")
+                    for entry in student_entries
+                    for score in entry.get("teacher_scores") or []
+                    if isinstance(score, dict)
+                )
+                timing["teacher_score_request_count"] = len(work)
+                timing["teacher_score_workers"] = score_workers
 
-                    # Training keeps these tensors locally and only needs the
-                    # teacher score payload from the relay.  Dropping them here
-                    # keeps Paladin audit data focused on testbenches/EDA while
-                    # avoiding a large SFTP download back to Brev.
-                    for entry in student_entries:
-                        for key in (
-                            "input_token_ids",
-                            "response_token_ids",
-                            "rollout_log_probs",
-                            "topk_token_ids",
-                            "topk_student_log_probs",
-                        ):
-                            entry.pop(key, None)
+                # Training keeps these tensors locally and only needs the
+                # teacher score payload from the relay.  Dropping them here
+                # keeps audit data focused on testbenches/EDA while avoiding a
+                # large transfer back to the student host.
+                for entry in student_entries:
+                    for key in (
+                        "input_token_ids",
+                        "response_token_ids",
+                        "rollout_log_probs",
+                        "topk_token_ids",
+                        "topk_student_log_probs",
+                    ):
+                        entry.pop(key, None)
 
             worker_before_publish = time.monotonic() - started
             accounted_before_publish = sum(
