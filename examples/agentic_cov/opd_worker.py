@@ -60,6 +60,14 @@ WORKER_ID = re.sub(
     os.environ.get("OPD_WORKER_ID", f"{os.uname().nodename}-{os.getpid()}"),
 )
 MAX_CONCURRENT_JOBS = int(os.environ.get("OPD_MAX_CONCURRENT_JOBS", "4"))
+MAX_CONCURRENT_ROUND_JOBS = max(
+    1,
+    int(os.environ.get("OPD_MAX_CONCURRENT_ROUND_JOBS", os.environ.get("OPD_MAX_CONCURRENT_JOBS", "4"))),
+)
+MAX_CONCURRENT_SCORE_JOBS = max(
+    1,
+    int(os.environ.get("OPD_MAX_CONCURRENT_SCORE_JOBS", "4")),
+)
 MAX_JOB_WORKERS = int(os.environ.get("OPD_MAX_JOB_WORKERS", "4"))
 TEACHER_TIMEOUT = float(os.environ.get("OPD_TEACHER_TIMEOUT", "900"))
 TEACHER_CONTEXT_LENGTH = int(os.environ.get("OPD_TEACHER_CONTEXT_LENGTH", "32768"))
@@ -79,7 +87,8 @@ AUDIT_RESULT_GZIP = os.environ.get("OPD_AUDIT_RESULT_GZIP", "1") != "0"
 SCORE_TENSOR_DTYPE = os.environ.get("OPD_SCORE_TENSOR_DTYPE", "float32")
 MOCK = os.environ.get("OPD_MOCK", "0") == "1"
 
-_JOB_SEM = threading.Semaphore(MAX_CONCURRENT_JOBS)
+_ROUND_JOB_SEM = threading.Semaphore(MAX_CONCURRENT_ROUND_JOBS)
+_SCORE_JOB_SEM = threading.Semaphore(MAX_CONCURRENT_SCORE_JOBS)
 _LOCK = threading.Lock()
 _INFLIGHT: set[str] = set()
 QUEUE_BACKEND: Any | None = None
@@ -1903,8 +1912,15 @@ def process(job: Path) -> None:
     started_wall = time.time()
     started = time.monotonic()
     timing: dict[str, Any] = {}
+    try:
+        job_kind = str(read_json(job / "manifest.json").get("job_kind") or "round")
+    except Exception:
+        job_kind = "round"
+    job_sem = _SCORE_JOB_SEM if job_kind == "student_score" else _ROUND_JOB_SEM
+    timing["job_kind"] = job_kind
+    timing["job_semaphore"] = "score" if job_kind == "student_score" else "round"
     sem_wait_started = time.monotonic()
-    with _JOB_SEM:
+    with job_sem:
         timing["job_semaphore_wait_seconds"] = time.monotonic() - sem_wait_started
         try:
             phase_started = time.monotonic()
@@ -2254,7 +2270,8 @@ def main() -> None:
     QUEUE_BACKEND.prepare()
     log(
         f"opd worker start XFER={XFER} namespace={NAMESPACE} mock={MOCK} "
-        f"max_jobs={MAX_CONCURRENT_JOBS} queue={QUEUE_TRANSPORT} worker_id={WORKER_ID}"
+        f"round_jobs={MAX_CONCURRENT_ROUND_JOBS} score_jobs={MAX_CONCURRENT_SCORE_JOBS} "
+        f"queue={QUEUE_TRANSPORT} worker_id={WORKER_ID}"
     )
     last_gc = 0.0
     while True:
