@@ -70,7 +70,10 @@ MAX_CONCURRENT_SCORE_JOBS = max(
 )
 MAX_JOB_WORKERS = int(os.environ.get("OPD_MAX_JOB_WORKERS", "4"))
 TEACHER_TIMEOUT = float(os.environ.get("OPD_TEACHER_TIMEOUT", "900"))
-TEACHER_CONTEXT_LENGTH = int(os.environ.get("OPD_TEACHER_CONTEXT_LENGTH", "32768"))
+# Each teacher owns an H100 and does no training, so use a larger context than
+# the old colocated-era default.  The stage0/stage1 checkpoints support 262k;
+# 64k keeps two in-flight requests practical while avoiding prefix truncation.
+TEACHER_CONTEXT_LENGTH = int(os.environ.get("OPD_TEACHER_CONTEXT_LENGTH", "65536"))
 TEACHER_TOKEN_BUDGET_MARGIN = int(os.environ.get("OPD_TEACHER_TOKEN_BUDGET_MARGIN", "256"))
 TEACHER_MIN_NEW_TOKENS = int(os.environ.get("OPD_TEACHER_MIN_NEW_TOKENS", "16"))
 TEACHER_SCORE_CHUNK_TOKENS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_TOKENS", "1024"))

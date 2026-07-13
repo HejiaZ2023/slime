@@ -21,7 +21,9 @@ STAGE1_PORT=${OPD_TEACHER_STAGE1_PORT:-18081}
 HOST_BIND=${OPD_TEACHER_HOST_BIND:-127.0.0.1}
 CONTAINER_PORT=${OPD_TEACHER_CONTAINER_PORT:-8000}
 MEM_FRACTION=${OPD_TEACHER_MEM_FRACTION_STATIC:-0.82}
-CONTEXT_LENGTH=${OPD_TEACHER_CONTEXT_LENGTH:-32768}
+# Each teacher has a dedicated H100.  The checkpoints support 262k, while 64k
+# leaves enough KV headroom for the worker's default two in-flight requests.
+CONTEXT_LENGTH=${OPD_TEACHER_CONTEXT_LENGTH:-65536}
 VERIFY_STEP999=${OPD_TEACHER_VERIFY_STEP999:-1}
 
 check_model() {
@@ -94,7 +96,7 @@ start_teacher() {
         --trust-remote-code \
         --mem-fraction-static "${MEM_FRACTION}" \
         --context-length "${CONTEXT_LENGTH}"
-    echo "[opd] started ${name}: ${HOST_BIND}:${port} -> ${model_dir}"
+    echo "[opd] started ${name}: ${HOST_BIND}:${port} -> ${model_dir} context_length=${CONTEXT_LENGTH} mem_fraction=${MEM_FRACTION}"
 }
 
 start_teacher stage0 "${STAGE0_GPU}" "${STAGE0_PORT}" "${STAGE0_MODEL}"
