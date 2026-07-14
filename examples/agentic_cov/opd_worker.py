@@ -66,7 +66,7 @@ MAX_CONCURRENT_ROUND_JOBS = max(
 )
 MAX_CONCURRENT_SCORE_JOBS = max(
     1,
-    int(os.environ.get("OPD_MAX_CONCURRENT_SCORE_JOBS", "4")),
+    int(os.environ.get("OPD_MAX_CONCURRENT_SCORE_JOBS", "8")),
 )
 MAX_JOB_WORKERS = int(os.environ.get("OPD_MAX_JOB_WORKERS", "4"))
 TEACHER_TIMEOUT = float(os.environ.get("OPD_TEACHER_TIMEOUT", "900"))
@@ -80,19 +80,19 @@ TEACHER_SCORE_CHUNK_TOKENS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_TOKENS"
 TEACHER_SCORE_CHUNK_WORKERS = int(os.environ.get("OPD_TEACHER_SCORE_CHUNK_WORKERS", "1"))
 TEACHER_SCORE_CONTEXT_MARGIN = int(os.environ.get("OPD_TEACHER_SCORE_CONTEXT_MARGIN", "16"))
 TEACHER_SCORE_POSITION_TOPK = os.environ.get("OPD_TEACHER_SCORE_POSITION_TOPK", "1") != "0"
-TEACHER_ENDPOINT_MAX_INFLIGHT = max(1, int(os.environ.get("OPD_TEACHER_ENDPOINT_MAX_INFLIGHT", "2")))
+TEACHER_ENDPOINT_MAX_INFLIGHT = max(1, int(os.environ.get("OPD_TEACHER_ENDPOINT_MAX_INFLIGHT", "8")))
 TEACHER_GENERATE_MAX_INFLIGHT = max(
     1,
     min(
         TEACHER_ENDPOINT_MAX_INFLIGHT,
-        int(os.environ.get("OPD_TEACHER_GENERATE_MAX_INFLIGHT", "2")),
+        int(os.environ.get("OPD_TEACHER_GENERATE_MAX_INFLIGHT", "4")),
     ),
 )
 TEACHER_SCORE_MAX_INFLIGHT = max(
     1,
     min(
         TEACHER_ENDPOINT_MAX_INFLIGHT,
-        int(os.environ.get("OPD_TEACHER_SCORE_MAX_INFLIGHT", "2")),
+        int(os.environ.get("OPD_TEACHER_SCORE_MAX_INFLIGHT", "4")),
     ),
 )
 TEACHER_MODEL_ROOT = os.environ.get("OPD_TEACHER_MODEL_ROOT", "/mnt/raid0_ssd/sheng/final_ckpts")
