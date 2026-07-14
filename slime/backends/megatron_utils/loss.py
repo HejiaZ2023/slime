@@ -1259,7 +1259,7 @@ def policy_loss_function(
                 support_coverage_values = []
                 teacher_coverage_values = []
                 for i, loss_type in enumerate(loss_types):
-                    zeros = torch.zeros_like(per_sample_log_probs[i], dtype=torch.float32)
+                    zeros = torch.zeros_like(log_probs_by_sample[i], dtype=torch.float32)
                     if loss_type != "opd":
                         sampled_values.append(zeros)
                         baseline_values.append(zeros)
@@ -1273,11 +1273,11 @@ def policy_loss_function(
 
                     rollout_lp = batch["rollout_log_probs"][i].to(device=log_probs.device, dtype=torch.float32)
                     teacher_lp = batch["teacher_log_probs"][i].to(device=log_probs.device, dtype=torch.float32)
-                    if rollout_lp.shape != teacher_lp.shape or rollout_lp.shape != per_sample_log_probs[i].shape:
+                    if rollout_lp.shape != teacher_lp.shape or rollout_lp.shape != log_probs_by_sample[i].shape:
                         raise ValueError(
                             f"vOPD sampled log-prob shape mismatch sample={i}: "
                             f"rollout={tuple(rollout_lp.shape)} teacher={tuple(teacher_lp.shape)} "
-                            f"expected={tuple(per_sample_log_probs[i].shape)}"
+                            f"expected={tuple(log_probs_by_sample[i].shape)}"
                         )
                     if batch.get("teacher_logprob_masks") is None:
                         teacher_valid = torch.ones_like(rollout_lp, dtype=torch.bool)

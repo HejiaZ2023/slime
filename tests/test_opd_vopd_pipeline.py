@@ -9,8 +9,8 @@ os.environ.setdefault("OPD_SLIME_DIR", str(Path(__file__).resolve().parents[1]))
 
 from examples.agentic_cov.opd_remote_client import _hydrate_teacher_topk_sidecars, _load_teacher_topk_sidecar
 from examples.agentic_cov.opd_worker import _write_teacher_topk_sidecar
-from slime.backends.megatron_utils import data as megatron_data
-from slime.backends.megatron_utils.loss import apply_vopd_topk_to_advantages
+from slime.backends.megatron_utils import data as megatron_data, loss as loss_module
+from slime.backends.megatron_utils.loss import apply_vopd_topk_to_advantages, policy_loss_function
 from slime.utils.opd import vopd_topk_statistics
 
 
@@ -65,6 +65,94 @@ def test_vopd_accepts_actor_forward_topk_without_rollout_values():
 
     expected = -2.0 * ((-0.7 - -1.0) - baseline)
     assert torch.allclose(advantages[0], expected, atol=1e-6)
+
+
+def test_policy_loss_vopd_metrics_use_current_per_sample_log_probs(monkeypatch):
+    actor_log_probs = [
+        torch.tensor([-0.2], dtype=torch.float32, requires_grad=True),
+        torch.tensor([-0.6], dtype=torch.float32, requires_grad=True),
+    ]
+    actor_topk = [_log([[0.6, 0.4]]), _log([[0.5, 0.5]])]
+    teacher_topk = [_log([[0.6, 0.4]]), _log([[0.2, 0.8]])]
+
+    def _get_log_probs_and_entropy(*_args, **_kwargs):
+        return torch.empty(0), {
+            "log_probs": actor_log_probs,
+            "entropy": [torch.zeros_like(value) for value in actor_log_probs],
+        }
+
+    def _get_topk_log_probs(*_args, **_kwargs):
+        return actor_topk
+
+    def _get_sum_of_sample_mean(_total_lengths, response_lengths, loss_masks, *_args, **_kwargs):
+        def _reduce(values):
+            result = values.new_zeros(())
+            for value, mask in zip(values.split(response_lengths, dim=0), loss_masks, strict=False):
+                mask = mask.to(device=values.device, dtype=values.dtype)
+                result = result + (value * mask).sum() / torch.clamp_min(mask.sum(), 1)
+            return result
+
+        return _reduce
+
+    def _compute_policy_loss(ppo_kl, advantages, *_args, **_kwargs):
+        return -torch.exp(-ppo_kl) * advantages, torch.zeros_like(ppo_kl)
+
+    monkeypatch.setattr(loss_module, "get_log_probs_and_entropy", _get_log_probs_and_entropy)
+    monkeypatch.setattr(loss_module, "get_topk_log_probs", _get_topk_log_probs)
+    monkeypatch.setattr(loss_module, "get_sum_of_sample_mean", _get_sum_of_sample_mean)
+    monkeypatch.setattr(loss_module, "compute_policy_loss", _compute_policy_loss)
+
+    response_lengths = [1, 1]
+    total_lengths = [2, 2]
+    loss_masks = [torch.ones(1), torch.ones(1)]
+    batch = {
+        "response_lengths": response_lengths,
+        "total_lengths": total_lengths,
+        "loss_masks": loss_masks,
+        "loss_types": ["rl", "opd"],
+        "unconcat_tokens": [torch.tensor([1, 2]), torch.tensor([1, 2])],
+        "advantages": [torch.ones(1), torch.zeros(1)],
+        "log_probs": [torch.tensor([-0.3]), torch.tensor([-0.7])],
+        "rollout_log_probs": [torch.tensor([-0.3]), torch.tensor([-0.7])],
+        "teacher_log_probs": [torch.zeros(1), torch.tensor([-1.0])],
+        "teacher_logprob_masks": [torch.zeros(1), torch.ones(1)],
+        "opd_topk_token_ids": [torch.tensor([[0, 1]]), torch.tensor([[0, 1]])],
+        "opd_topk_teacher_log_probs": teacher_topk,
+        "opd_topk_masks": [torch.ones_like(value) for value in teacher_topk],
+        "opd_weights": [0.0, 1.0],
+    }
+    args = Namespace(
+        use_rollout_logprobs=False,
+        opd_algorithm="vopd_topk",
+        opd_lambda=1.0,
+        opd_kl_coef=0.0,
+        calculate_per_token_loss=False,
+        qkv_format="thd",
+        use_opsm=False,
+        advantage_estimator="grpo",
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        get_mismatch_metrics=False,
+        use_tis=False,
+        custom_pg_loss_reducer_function_path=None,
+        entropy_coef=0.0,
+        use_kl_loss=False,
+    )
+    reducer = _get_sum_of_sample_mean(total_lengths, response_lengths, loss_masks)
+
+    loss, metrics = policy_loss_function(
+        args,
+        batch,
+        logits=torch.zeros((1, sum(total_lengths), 2), dtype=torch.float32),
+        sum_of_sample_mean=reducer,
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.allclose(metrics["opd_vopd_sampled_kl"], torch.tensor(0.3), atol=1e-6)
+    assert torch.allclose(metrics["opd_vopd_support_coverage"], torch.tensor(1.0), atol=1e-6)
+    assert torch.equal(batch["advantages"][1], torch.zeros(1))
+    loss.backward()
+    assert all(value.grad is not None for value in actor_log_probs)
 
 
 def test_vopd_sidecar_v2_round_trip_preserves_sampled_vector(tmp_path):
