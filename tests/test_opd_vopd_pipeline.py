@@ -122,6 +122,7 @@ def test_policy_loss_vopd_metrics_use_current_per_sample_log_probs(monkeypatch):
         "opd_weights": [0.0, 1.0],
     }
     args = Namespace(
+        use_opd_relay=True,
         use_rollout_logprobs=False,
         opd_algorithm="vopd_topk",
         opd_lambda=1.0,
@@ -153,6 +154,43 @@ def test_policy_loss_vopd_metrics_use_current_per_sample_log_probs(monkeypatch):
     assert torch.equal(batch["advantages"][1], torch.zeros(1))
     loss.backward()
     assert all(value.grad is not None for value in actor_log_probs)
+
+    rl_batch = {
+        key: value
+        for key, value in batch.items()
+        if key
+        not in {
+            "teacher_log_probs",
+            "teacher_logprob_masks",
+            "opd_topk_token_ids",
+            "opd_topk_teacher_log_probs",
+            "opd_topk_masks",
+            "opd_weights",
+        }
+    }
+    rl_batch["loss_types"] = ["rl", "rl"]
+    _, rl_metrics = policy_loss_function(
+        args,
+        rl_batch,
+        logits=torch.zeros((1, sum(total_lengths), 2), dtype=torch.float32),
+        sum_of_sample_mean=reducer,
+    )
+
+    assert list(rl_metrics) == list(metrics)
+    for key in (
+        "opd_teacher_logprob_coverage",
+        "opd_vopd_sampled_kl",
+        "opd_vopd_baseline_kl",
+        "opd_vopd_centered_kl",
+        "opd_vopd_advantage",
+        "opd_student_support_mass",
+        "opd_teacher_support_mass",
+        "opd_vopd_support_coverage",
+        "opd_topk_kl",
+        "opd_topk_mass",
+        "opd_topk_teacher_coverage",
+    ):
+        assert torch.equal(rl_metrics[key], torch.zeros(()))
 
 
 def test_vopd_sidecar_v2_round_trip_preserves_sampled_vector(tmp_path):

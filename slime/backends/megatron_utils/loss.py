@@ -1395,27 +1395,41 @@ def policy_loss_function(
     if opd_topk_teacher_coverage is not None:
         reported_loss["opd_topk_teacher_coverage"] = opd_topk_teacher_coverage.clone().detach()
 
-    if (
+    is_vopd_topk_run = (
+        bool(getattr(args, "use_opd_relay", False)) and _opd_algorithm(args) == "vopd_topk"
+    )
+    if is_vopd_topk_run:
+        # Megatron adds metric vectors from separate microbatches positionally.
+        # A vOPD run can contain RL-only and mixed RL/OPD microbatches, so every
+        # microbatch must expose the same zero-filled keys in the same order.
+        zero_opd_metric = log_probs.new_zeros(())
+        vopd_metric_keys = (
+            "opd_teacher_logprob_coverage",
+            "opd_vopd_sampled_kl",
+            "opd_vopd_baseline_kl",
+            "opd_vopd_centered_kl",
+            "opd_vopd_advantage",
+            "opd_student_support_mass",
+            "opd_teacher_support_mass",
+            "opd_vopd_support_coverage",
+            "opd_topk_kl",
+            "opd_topk_mass",
+            "opd_topk_teacher_coverage",
+        )
+        ordered_vopd_metrics = {
+            key: reported_loss.pop(key, zero_opd_metric) for key in vopd_metric_keys
+        }
+        reported_loss.update(ordered_vopd_metrics)
+    elif (
         batch.get("opd_topk_token_ids") is not None
         and batch.get("opd_topk_teacher_log_probs") is not None
     ):
-        # Keep the microbatch logging schema stable when top-k OPD fields are present
+        # Keep the legacy top-k logging schema stable when sidecars are present
         # but no sample in this microbatch used the OPD loss.
         zero_opd_topk_metric = log_probs.new_zeros(())
         reported_loss.setdefault("opd_topk_kl", zero_opd_topk_metric)
         reported_loss.setdefault("opd_topk_mass", zero_opd_topk_metric)
         reported_loss.setdefault("opd_topk_teacher_coverage", zero_opd_topk_metric)
-        if has_vopd_topk:
-            for key in (
-                "opd_vopd_sampled_kl",
-                "opd_vopd_baseline_kl",
-                "opd_vopd_centered_kl",
-                "opd_vopd_advantage",
-                "opd_student_support_mass",
-                "opd_teacher_support_mass",
-                "opd_vopd_support_coverage",
-            ):
-                reported_loss.setdefault(key, zero_opd_topk_metric)
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
