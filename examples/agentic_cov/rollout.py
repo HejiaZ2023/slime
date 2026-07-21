@@ -577,6 +577,123 @@ def _best_entry(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
     return max(entries, key=_entry_reward)
 
 
+def _teacher_entry_name(entry: dict[str, Any] | None) -> str:
+    if entry is None:
+        return ""
+    return str(entry.get("teacher") or entry.get("teacher_name") or "").strip()
+
+
+def _stable_opd_choice(
+    *,
+    args: Namespace,
+    options: list[str],
+    rollout_id: int,
+    round_idx: int,
+    dataset_id: str,
+    policy: str,
+) -> tuple[str | None, int | None, str]:
+    """Choose an OPD policy arm reproducibly across async execution and resume."""
+    if not options:
+        return None, None, ""
+    key = "\x1f".join(
+        (
+            str(int(getattr(args, "seed", 0) or 0)),
+            str(int(rollout_id)),
+            str(dataset_id),
+            str(int(round_idx)),
+            str(policy),
+        )
+    )
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    index = int(digest[:16], 16) % len(options)
+    return options[index], index, digest[:16]
+
+
+def _select_opd_routing_decision(
+    *,
+    args: Namespace,
+    teacher_entries: list[dict[str, Any]],
+    teacher_names: list[str],
+    best_student_reward: float,
+    rollout_id: int,
+    round_idx: int,
+    dataset_id: str,
+) -> dict[str, Any]:
+    """Select RL or one teacher after the existing reward pipeline completes."""
+    policy = str(getattr(args, "opd_routing_policy", "reward_gate") or "reward_gate")
+    teacher_names = list(
+        dict.fromkeys(str(name).strip() for name in teacher_names if str(name).strip())
+    )
+    best_teacher = _best_entry(teacher_entries)
+    best_teacher_name = _teacher_entry_name(best_teacher)
+    best_teacher_reward = _entry_reward(best_teacher) if best_teacher is not None else -float("inf")
+    gate_eps = float(getattr(args, "opd_gate_eps", 0.0) or 0.0)
+
+    arm = "rl"
+    gate_pass = False
+    reward_used_for_decision = False
+    random_choice_index = None
+    random_choice_hash = ""
+    random_choices: list[str] = []
+
+    if policy == "reward_gate":
+        gate_pass = bool(best_teacher_name) and best_teacher_reward > best_student_reward + gate_eps
+        arm = best_teacher_name if gate_pass else "rl"
+        reward_used_for_decision = True
+    elif policy == "always_best":
+        arm = best_teacher_name or "rl"
+        gate_pass = bool(best_teacher_name)
+        reward_used_for_decision = True
+    elif policy == "random_teacher":
+        random_choices = teacher_names
+        selected, random_choice_index, random_choice_hash = _stable_opd_choice(
+            args=args,
+            options=random_choices,
+            rollout_id=rollout_id,
+            round_idx=round_idx,
+            dataset_id=dataset_id,
+            policy=policy,
+        )
+        arm = selected or "rl"
+        gate_pass = selected is not None
+    elif policy == "random_source":
+        random_choices = ["rl", *teacher_names]
+        selected, random_choice_index, random_choice_hash = _stable_opd_choice(
+            args=args,
+            options=random_choices,
+            rollout_id=rollout_id,
+            round_idx=round_idx,
+            dataset_id=dataset_id,
+            policy=policy,
+        )
+        arm = selected or "rl"
+        gate_pass = selected is not None and selected != "rl"
+    else:
+        raise ValueError(f"unsupported OPD routing policy: {policy}")
+
+    selected_teacher_name = arm if gate_pass else ""
+    selected_entries = [
+        entry for entry in teacher_entries if _teacher_entry_name(entry) == selected_teacher_name
+    ]
+    selected_teacher_entry = _best_entry(selected_entries)
+    selected_teacher_reward = (
+        _entry_reward(selected_teacher_entry) if selected_teacher_entry is not None else None
+    )
+    return {
+        "policy": policy,
+        "arm": arm,
+        "gate_pass": bool(gate_pass),
+        "reward_used_for_decision": bool(reward_used_for_decision),
+        "selected_teacher_name": selected_teacher_name,
+        "selected_teacher_reward": selected_teacher_reward,
+        "best_teacher_name": best_teacher_name,
+        "best_teacher_reward": best_teacher_reward,
+        "random_choice_index": random_choice_index,
+        "random_choice_hash": random_choice_hash,
+        "random_choices": random_choices,
+    }
+
+
 def _make_teacher_sample(
     *,
     args: Namespace,
@@ -1074,23 +1191,49 @@ async def _score_group_with_opd_relay(
     apply_seconds = _seconds_since(apply_started)
     gate_started = time.monotonic()
     teacher_entries = _result_entries(result, "teacher_rollouts", "teachers", "teacher")
-    best_teacher = _best_entry(teacher_entries)
     best_student = max(group, key=lambda s: float(s.reward or 0.0))
     best_student_reward = float(best_student.reward or 0.0)
-    best_teacher_reward = _entry_reward(best_teacher) if best_teacher is not None else -float("inf")
+    decision = _select_opd_routing_decision(
+        args=args,
+        teacher_entries=teacher_entries,
+        teacher_names=_opd_score_teacher_names(args),
+        best_student_reward=best_student_reward,
+        rollout_id=rollout_id,
+        round_idx=round_idx,
+        dataset_id=dataset_id,
+    )
+    routing_policy = str(decision["policy"])
+    policy_arm = str(decision["arm"])
+    selected_teacher_name = str(decision["selected_teacher_name"])
+    selected_teacher_reward = decision["selected_teacher_reward"]
+    best_teacher_reward = float(decision["best_teacher_reward"])
     gate_eps = float(getattr(args, "opd_gate_eps", 0.0) or 0.0)
-    gate_pass = best_teacher is not None and best_teacher_reward > best_student_reward + gate_eps
+    gate_pass = bool(decision["gate_pass"])
 
     for sample in group:
         sample.metadata["opd_job_id"] = job_id
         sample.metadata["opd_best_student_reward"] = best_student_reward
         sample.metadata["opd_best_teacher_reward"] = best_teacher_reward
+        sample.metadata["opd_routing_policy"] = routing_policy
+        sample.metadata["opd_policy_arm"] = policy_arm
+        sample.metadata["opd_policy_gate_pass"] = gate_pass
+        sample.metadata["opd_reward_used_for_decision"] = bool(decision["reward_used_for_decision"])
+        sample.metadata["opd_selected_teacher"] = selected_teacher_name
+        sample.metadata["opd_random_choice_index"] = decision["random_choice_index"]
+        sample.metadata["opd_random_choice_hash"] = decision["random_choice_hash"]
+        sample.metadata["opd_random_choices"] = list(decision["random_choices"])
+        if selected_teacher_reward is not None:
+            sample.metadata["opd_selected_teacher_reward"] = float(selected_teacher_reward)
+        if routing_policy == "random_source" and policy_arm == "rl":
+            sample.metadata["opd_gate_reason"] = "routing_policy_rl"
         sample.metadata["opd_group_gate_pass"] = bool(gate_pass)
         sample.metadata["opd_gate_pass"] = bool(gate_pass)
 
     logger.info(
         "OPD_GATE step=%d dataset_id=%s round=%d job=%s gate=%s "
-        "best_student=%.4f best_teacher=%.4f eps=%.4f n_teachers=%d teacher_job=%s",
+        "best_student=%.4f best_teacher=%.4f eps=%.4f n_teachers=%d teacher_job=%s "
+        "policy=%s arm=%s selected_teacher=%s selected_teacher_reward=%s "
+        "reward_used=%s random_index=%s random_hash=%s choices=%s",
         rollout_id,
         dataset_id,
         round_idx + 1,
@@ -1101,6 +1244,14 @@ async def _score_group_with_opd_relay(
         gate_eps,
         len(teacher_entries),
         result.get("_opd_teacher_job_id") or result.get("job_id") or "",
+        routing_policy,
+        policy_arm,
+        selected_teacher_name or "none",
+        "n/a" if selected_teacher_reward is None else f"{float(selected_teacher_reward):.4f}",
+        bool(decision["reward_used_for_decision"]),
+        decision["random_choice_index"],
+        decision["random_choice_hash"] or "none",
+        ",".join(decision["random_choices"]) or "none",
     )
 
     def _log_score_timing(outcome: str) -> None:
@@ -1136,13 +1287,12 @@ async def _score_group_with_opd_relay(
             len(teacher_entries),
         )
 
-    if gate_pass and best_teacher is not None:
+    if gate_pass and selected_teacher_name:
         student_entries_by_id = {
             str(entry.get("id")): entry
             for entry in _result_entries(result, "student_rollouts", "students", "student")
             if entry.get("id") is not None
         }
-        best_teacher_name = str(best_teacher.get("teacher") or best_teacher.get("teacher_name") or "")
         requested_topk = int(getattr(args, "opd_topk", 0) or 0)
         require_topk = requested_topk > 1
         opd_algorithm = str(getattr(args, "opd_algorithm", "vopd_topk") or "vopd_topk")
@@ -1195,12 +1345,15 @@ async def _score_group_with_opd_relay(
             if entry is None:
                 return None
             direct = _coerce_float_list(entry.get("teacher_log_probs"))
-            if direct is not None and (not best_teacher_name or entry.get("teacher_logprob_teacher") == best_teacher_name):
+            if direct is not None and (
+                not selected_teacher_name
+                or entry.get("teacher_logprob_teacher") == selected_teacher_name
+            ):
                 return direct
             for score in entry.get("teacher_scores") or []:
                 if not isinstance(score, dict):
                     continue
-                if best_teacher_name and str(score.get("teacher") or "") != best_teacher_name:
+                if selected_teacher_name and str(score.get("teacher") or "") != selected_teacher_name:
                     continue
                 if score.get("status") not in {"success", "topk_success", "partial_topk"}:
                     continue
@@ -1223,7 +1376,7 @@ async def _score_group_with_opd_relay(
             for score in entry.get("teacher_scores") or []:
                 if not isinstance(score, dict):
                     continue
-                if best_teacher_name and str(score.get("teacher") or "") != best_teacher_name:
+                if selected_teacher_name and str(score.get("teacher") or "") != selected_teacher_name:
                     continue
                 score_topk_sha = str(score.get("topk_token_ids_sha256") or "")
                 if expected_topk_sha and score_topk_sha and score_topk_sha != expected_topk_sha:
@@ -1242,14 +1395,14 @@ async def _score_group_with_opd_relay(
             for score in entry.get("teacher_scores") or []:
                 if not isinstance(score, dict):
                     continue
-                if best_teacher_name and str(score.get("teacher") or "") != best_teacher_name:
+                if selected_teacher_name and str(score.get("teacher") or "") != selected_teacher_name:
                     continue
                 if score.get("status") == "context_overflow":
                     return True
             return False
 
         topk_by_index = {}
-        topk_valid = bool(best_teacher_name) and require_topk
+        topk_valid = bool(selected_teacher_name) and require_topk
         if require_topk:
             for sample in eligible_samples:
                 expected = int(sample.response_length or 0)
@@ -1324,7 +1477,7 @@ async def _score_group_with_opd_relay(
                     sample.teacher_log_probs = teacher_log_probs
                     sample.metadata["opd_student_topk_source"] = "actor_forward_detached"
                 sample.metadata["opd_gate_pass"] = True
-                sample.metadata["opd_teacher_logprob_teacher"] = best_teacher_name
+                sample.metadata["opd_teacher_logprob_teacher"] = selected_teacher_name
                 sample.metadata["opd_topk"] = requested_topk
                 sample.metadata["opd_algorithm"] = opd_algorithm
                 sample.metadata["opd_topk_teacher_coverage"] = (
@@ -1336,7 +1489,10 @@ async def _score_group_with_opd_relay(
                     opd_weight=float(getattr(args, "opd_lambda", 1.0) or 0.0),
                     best_student_reward=best_student_reward,
                     best_teacher_reward=best_teacher_reward,
-                    teacher=best_teacher_name,
+                    selected_teacher_reward=selected_teacher_reward,
+                    routing_policy=routing_policy,
+                    reward_used_for_decision=bool(decision["reward_used_for_decision"]),
+                    teacher=selected_teacher_name,
                     opd_topk=requested_topk,
                     opd_algorithm=opd_algorithm,
                 )
@@ -1348,7 +1504,7 @@ async def _score_group_with_opd_relay(
                     dataset_id,
                     round_idx + 1,
                     job_id,
-                    best_teacher_name,
+                    selected_teacher_name,
                     len(eligible_samples),
                     requested_topk,
                 )
@@ -1356,7 +1512,7 @@ async def _score_group_with_opd_relay(
             return group, group
 
         if not require_topk:
-            valid_opd = bool(best_teacher_name)
+            valid_opd = bool(selected_teacher_name)
             teacher_log_probs_by_index: dict[int, list[float]] = {}
             for sample in eligible_samples:
                 teacher_log_probs = _student_teacher_log_probs(sample)
@@ -1375,7 +1531,7 @@ async def _score_group_with_opd_relay(
                     teacher_log_probs = teacher_log_probs_by_index[int(sample.index)]
                     sample.teacher_log_probs = teacher_log_probs
                     sample.metadata["opd_gate_pass"] = True
-                    sample.metadata["opd_teacher_logprob_teacher"] = best_teacher_name
+                    sample.metadata["opd_teacher_logprob_teacher"] = selected_teacher_name
                     sample.metadata["opd_teacher_logprob_tokens"] = len(teacher_log_probs)
                     _set_train_loss_type(
                         sample,
@@ -1383,7 +1539,10 @@ async def _score_group_with_opd_relay(
                         opd_weight=float(getattr(args, "opd_lambda", 1.0) or 0.0),
                         best_student_reward=best_student_reward,
                         best_teacher_reward=best_teacher_reward,
-                        teacher=best_teacher_name,
+                        selected_teacher_reward=selected_teacher_reward,
+                        routing_policy=routing_policy,
+                        reward_used_for_decision=bool(decision["reward_used_for_decision"]),
+                        teacher=selected_teacher_name,
                     )
                 _log_score_timing("opd_logprob")
                 return group, group
@@ -1397,7 +1556,8 @@ async def _score_group_with_opd_relay(
             _set_train_loss_type(sample, "rl")
         _log_score_timing("gate_pass_but_missing_teacher_logprobs")
     else:
-        _log_score_timing("rl_fallback")
+        outcome = "policy_rl" if routing_policy == "random_source" and policy_arm == "rl" else "rl_fallback"
+        _log_score_timing(outcome)
 
     return group, group
 

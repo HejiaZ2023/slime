@@ -78,6 +78,9 @@ set -ex
 #   --save-final-rollout     Force the legacy behavior: always save on the final
 #                            rollout even when --steps < --interval.
 #   --n-student N            Number of student rollouts per prompt. Smoke uses 2.
+#   --opd-routing-policy P   Final OPD routing strategy after all rewards and
+#                            teacher scores are collected. One of reward_gate,
+#                            always_best, random_teacher, or random_source.
 OFFLOAD=0
 EDA_LOG_FEEDBACK_TRAIN=${EDA_LOG_FEEDBACK_TRAIN:-1}
 EDA_LOG_FEEDBACK_EVAL=${EDA_LOG_FEEDBACK_EVAL:-1}
@@ -139,9 +142,9 @@ while [ $# -gt 0 ]; do
         --opd-algorithm=*)        OPD_ALGORITHM="${1#--opd-algorithm=}"; OPD_ALGORITHM_SPECIFIED=1; OPD_ARGS+=("$1") ;;
         --opd-poll)               OPD_POLL="${2:?--opd-poll requires a value}"; OPD_POLL_SPECIFIED=1; OPD_ARGS+=("$1" "${OPD_POLL}"); shift ;;
         --opd-poll=*)             OPD_POLL="${1#--opd-poll=}"; OPD_POLL_SPECIFIED=1; OPD_ARGS+=("$1") ;;
-        --opd-teachers|--opd-lambda|--opd-topk|--opd-student-topk-mode|--opd-gate-eps|--opd-timeout|--opd-namespace|--opd-server|--opd-transport|--opd-http-url|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
+        --opd-teachers|--opd-lambda|--opd-topk|--opd-student-topk-mode|--opd-gate-eps|--opd-routing-policy|--opd-timeout|--opd-namespace|--opd-server|--opd-transport|--opd-http-url|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
                                   OPD_ARGS+=("$1" "${2:?$1 requires a value}"); shift ;;
-        --opd-teachers=*|--opd-lambda=*|--opd-topk=*|--opd-student-topk-mode=*|--opd-gate-eps=*|--opd-timeout=*|--opd-namespace=*|--opd-server=*|--opd-transport=*|--opd-http-url=*|--opd-xfer-dir=*|--opd-sftp-host=*|--opd-sftp-port=*|--opd-sftp-user=*|--opd-sftp-key=*)
+        --opd-teachers=*|--opd-lambda=*|--opd-topk=*|--opd-student-topk-mode=*|--opd-gate-eps=*|--opd-routing-policy=*|--opd-timeout=*|--opd-namespace=*|--opd-server=*|--opd-transport=*|--opd-http-url=*|--opd-xfer-dir=*|--opd-sftp-host=*|--opd-sftp-port=*|--opd-sftp-user=*|--opd-sftp-key=*)
                                   OPD_ARGS+=("$1") ;;
         *) echo "[run] Unknown argument: $1" >&2; exit 1 ;;
     esac

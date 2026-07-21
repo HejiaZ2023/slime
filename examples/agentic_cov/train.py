@@ -162,8 +162,8 @@ def add_agentic_args(parser):
         help=(
             "Enable OPD relay training. Student rollouts are generated locally, "
             "student/teacher EDA is delegated to the paladin relay, and a gated "
-            "sampled-token vOPD objective is used instead of RL loss for that prompt-round "
-            "when the best teacher beats the best student."
+            "sampled-token vOPD objective is selected for each prompt-round according "
+            "to --opd-routing-policy."
         ),
     )
     parser.add_argument(
@@ -205,6 +205,19 @@ def add_agentic_args(parser):
         type=float,
         default=0.0,
         help="Require best_teacher_reward > best_student_reward + eps to use OPD.",
+    )
+    parser.add_argument(
+        "--opd-routing-policy",
+        choices=("reward_gate", "always_best", "random_teacher", "random_source"),
+        default="reward_gate",
+        help=(
+            "How completed student/teacher rewards select the training source. "
+            "reward_gate preserves the current reward comparison; always_best "
+            "always uses the highest-reward teacher; random_teacher uniformly "
+            "chooses a configured teacher; random_source uniformly chooses RL or "
+            "one configured teacher. All policies retain the existing reward and "
+            "teacher-score collection pipeline."
+        ),
     )
     parser.add_argument(
         "--opd-timeout",
@@ -323,11 +336,12 @@ if __name__ == "__main__":
                 args.eda_server, args.eda_repo_dir,
                 getattr(args, "eda_stage_timeout", 30))
 
-    logger.info("  OPD relay enabled=%s  teachers=%s  lambda=%s  gate_eps=%s",
+    logger.info("  OPD relay enabled=%s  teachers=%s  lambda=%s  gate_eps=%s  routing_policy=%s",
                 getattr(args, "use_opd_relay", False),
                 getattr(args, "opd_teachers", ""),
                 getattr(args, "opd_lambda", None),
-                getattr(args, "opd_gate_eps", None))
+                getattr(args, "opd_gate_eps", None),
+                getattr(args, "opd_routing_policy", "reward_gate"))
     logger.info("  OPD relay transport=%s  server=%s  namespace=%s  timeout=%ss",
                 getattr(args, "opd_transport", "") or "auto",
                 getattr(args, "opd_server", ""),
