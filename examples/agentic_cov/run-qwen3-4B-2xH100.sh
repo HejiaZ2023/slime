@@ -81,6 +81,8 @@ set -ex
 #   --opd-routing-policy P   Final OPD routing strategy after all rewards and
 #                            teacher scores are collected. One of reward_gate,
 #                            always_best, random_teacher, or random_source.
+#   --opd-gate-stat S        reward_gate statistic: best (legacy) or median.
+#   --opd-gate-fail-action A reward_gate rejection action: rl (legacy) or skip.
 OFFLOAD=0
 EDA_LOG_FEEDBACK_TRAIN=${EDA_LOG_FEEDBACK_TRAIN:-1}
 EDA_LOG_FEEDBACK_EVAL=${EDA_LOG_FEEDBACK_EVAL:-1}
@@ -142,9 +144,9 @@ while [ $# -gt 0 ]; do
         --opd-algorithm=*)        OPD_ALGORITHM="${1#--opd-algorithm=}"; OPD_ALGORITHM_SPECIFIED=1; OPD_ARGS+=("$1") ;;
         --opd-poll)               OPD_POLL="${2:?--opd-poll requires a value}"; OPD_POLL_SPECIFIED=1; OPD_ARGS+=("$1" "${OPD_POLL}"); shift ;;
         --opd-poll=*)             OPD_POLL="${1#--opd-poll=}"; OPD_POLL_SPECIFIED=1; OPD_ARGS+=("$1") ;;
-        --opd-teachers|--opd-lambda|--opd-topk|--opd-student-topk-mode|--opd-gate-eps|--opd-routing-policy|--opd-timeout|--opd-namespace|--opd-server|--opd-transport|--opd-http-url|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
+        --opd-teachers|--opd-lambda|--opd-topk|--opd-student-topk-mode|--opd-gate-eps|--opd-gate-stat|--opd-gate-fail-action|--opd-routing-policy|--opd-timeout|--opd-namespace|--opd-server|--opd-transport|--opd-http-url|--opd-xfer-dir|--opd-sftp-host|--opd-sftp-port|--opd-sftp-user|--opd-sftp-key)
                                   OPD_ARGS+=("$1" "${2:?$1 requires a value}"); shift ;;
-        --opd-teachers=*|--opd-lambda=*|--opd-topk=*|--opd-student-topk-mode=*|--opd-gate-eps=*|--opd-routing-policy=*|--opd-timeout=*|--opd-namespace=*|--opd-server=*|--opd-transport=*|--opd-http-url=*|--opd-xfer-dir=*|--opd-sftp-host=*|--opd-sftp-port=*|--opd-sftp-user=*|--opd-sftp-key=*)
+        --opd-teachers=*|--opd-lambda=*|--opd-topk=*|--opd-student-topk-mode=*|--opd-gate-eps=*|--opd-gate-stat=*|--opd-gate-fail-action=*|--opd-routing-policy=*|--opd-timeout=*|--opd-namespace=*|--opd-server=*|--opd-transport=*|--opd-http-url=*|--opd-xfer-dir=*|--opd-sftp-host=*|--opd-sftp-port=*|--opd-sftp-user=*|--opd-sftp-key=*)
                                   OPD_ARGS+=("$1") ;;
         *) echo "[run] Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -213,8 +215,15 @@ GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_STUDENT))
 # never overwrite each other.  Set REMOTE_SYNC_SSH_KEY to an SSH identity
 # file when the host requires an explicit key (e.g. when running on brev,
 # use /home/nvidia/.ssh/id_paladin).  Leave empty to rely on the SSH agent.
-# Sync target: "hf" (upload to a private HF repo, default) or "paladin" (rsync).
+# Sync target: "hf" (private HF repo, default), "paladin"/"local" (rsync), or "none".
 REMOTE_SYNC_TARGET=${REMOTE_SYNC_TARGET:-hf}
+case "${REMOTE_SYNC_TARGET}" in
+    hf|paladin|local|none) ;;
+    *)
+        echo "ERROR: REMOTE_SYNC_TARGET must be hf, paladin, local, or none" >&2
+        exit 1
+        ;;
+esac
 # HF mode: repo = ${HF_SYNC_REPO_PREFIX}${RUN_SUBDIR} (private). The upload uses a
 # dedicated WRITE token from env HF_SYNC_TOKEN (kept separate from HF_TOKEN, which
 # the Makefile sets for model download). Pass -e HF_SYNC_TOKEN=<write> at launch.
@@ -342,9 +351,11 @@ echo "[run] RUN_DIR      = ${RUN_DIR}  (logs + step_N checkpoints)"  | tee -a "$
 echo "[run] LOCAL_LOG    = ${LOCAL_LOG}"                             | tee -a "${LOCAL_LOG}"
 if [ "${REMOTE_SYNC_TARGET}" = "hf" ]; then
 echo "[run] SYNC TARGET  = HF private: ${HF_SYNC_REPO}"             | tee -a "${LOCAL_LOG}"
-else
-echo "[run] SYNC TARGET  = paladin: ${REMOTE_SYNC_BASE}/${RUN_SUBDIR}/" | tee -a "${LOCAL_LOG}"
+elif [ "${REMOTE_SYNC_TARGET}" != "none" ]; then
+echo "[run] SYNC TARGET  = ${REMOTE_SYNC_TARGET}: ${REMOTE_SYNC_BASE}/${RUN_SUBDIR}/" | tee -a "${LOCAL_LOG}"
 echo "[run] SSH_KEY      = ${REMOTE_SYNC_SSH_KEY:-'(ssh-agent)'}"   | tee -a "${LOCAL_LOG}"
+else
+echo "[run] SYNC TARGET  = disabled (REMOTE_SYNC_TARGET=none)"      | tee -a "${LOCAL_LOG}"
 fi
 echo "[run] EDA_SERVER   = ${EDA_SERVER}"                            | tee -a "${LOCAL_LOG}"
 echo "[run] EDA_REPO_DIR = ${EDA_REPO_DIR}"                          | tee -a "${LOCAL_LOG}"
@@ -847,7 +858,10 @@ _sync_once() {
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     [ -d "${RUN_DIR}" ] || return 0
-    if [ "${REMOTE_SYNC_TARGET}" = "hf" ]; then
+    if [ "${REMOTE_SYNC_TARGET}" = "none" ]; then
+        echo "[sync] ${ts} disabled (REMOTE_SYNC_TARGET=none)" | tee -a "${LOCAL_LOG}"
+        return 0
+    elif [ "${REMOTE_SYNC_TARGET}" = "hf" ]; then
         echo "[sync] ${ts} uploading completed checkpoint pairs → HF ${HF_SYNC_REPO} (private)" \
             | tee -a "${LOCAL_LOG}"
         _hf_upload_completed_artifacts 2>&1 | tee -a "${LOCAL_LOG}" || true
@@ -870,8 +884,11 @@ _sync_daemon() {
     done
 }
 
-_sync_daemon &
-SYNC_DAEMON_PID=$!
+SYNC_DAEMON_PID=""
+if [ "${REMOTE_SYNC_TARGET}" != "none" ]; then
+    _sync_daemon &
+    SYNC_DAEMON_PID=$!
+fi
 
 _write_gpu_monitor_summary() {
     [ -f "${GPU_MONITOR_LOG}" ] || return 0
@@ -930,7 +947,9 @@ _stop_gpu_monitor() {
 _cleanup_on_exit() {
     _stop_gpu_monitor
     _sync_once
-    kill "${SYNC_DAEMON_PID}" 2>/dev/null || true
+    if [ -n "${SYNC_DAEMON_PID}" ]; then
+        kill "${SYNC_DAEMON_PID}" 2>/dev/null || true
+    fi
 }
 
 trap '_cleanup_on_exit' EXIT

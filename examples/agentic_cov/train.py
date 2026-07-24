@@ -204,7 +204,28 @@ def add_agentic_args(parser):
         "--opd-gate-eps",
         type=float,
         default=0.0,
-        help="Require best_teacher_reward > best_student_reward + eps to use OPD.",
+        help="Require the selected teacher gate statistic > the student statistic + eps.",
+    )
+    parser.add_argument(
+        "--opd-gate-stat",
+        choices=("best", "median"),
+        default="best",
+        help=(
+            "Reward statistic used by reward_gate. best preserves the existing "
+            "best-teacher versus best-student comparison. median compares the "
+            "median student reward with each teacher's median reward, requires "
+            "every configured candidate, and selects the teacher with the highest median."
+        ),
+    )
+    parser.add_argument(
+        "--opd-gate-fail-action",
+        choices=("rl", "skip"),
+        default="rl",
+        help=(
+            "Action when a valid reward_gate comparison rejects OPD. rl preserves "
+            "the existing fallback; skip masks the whole prompt-round from gradient. "
+            "Pipeline or candidate-integrity failures always retain the safe RL fallback."
+        ),
     )
     parser.add_argument(
         "--opd-routing-policy",
@@ -310,6 +331,18 @@ if __name__ == "__main__":
             raise ValueError("--use-opd-relay requires --opd-teachers")
         if args.opd_algorithm == "vopd_topk" and int(args.opd_topk or 0) <= 1:
             raise ValueError("--opd-algorithm vopd_topk requires --opd-topk >= 2")
+        if (
+            args.opd_routing_policy != "reward_gate"
+            and args.opd_gate_stat != "best"
+        ):
+            raise ValueError("--opd-gate-stat only applies to --opd-routing-policy reward_gate")
+        if (
+            args.opd_routing_policy != "reward_gate"
+            and args.opd_gate_fail_action != "rl"
+        ):
+            raise ValueError(
+                "--opd-gate-fail-action only applies to --opd-routing-policy reward_gate"
+            )
 
     logger.info("=== llm4cov slime RL training config ===")
 
@@ -336,12 +369,16 @@ if __name__ == "__main__":
                 args.eda_server, args.eda_repo_dir,
                 getattr(args, "eda_stage_timeout", 30))
 
-    logger.info("  OPD relay enabled=%s  teachers=%s  lambda=%s  gate_eps=%s  routing_policy=%s",
+    logger.info(
+                "  OPD relay enabled=%s  teachers=%s  lambda=%s  gate_eps=%s  "
+                "routing_policy=%s  gate_stat=%s  gate_fail_action=%s",
                 getattr(args, "use_opd_relay", False),
                 getattr(args, "opd_teachers", ""),
                 getattr(args, "opd_lambda", None),
                 getattr(args, "opd_gate_eps", None),
-                getattr(args, "opd_routing_policy", "reward_gate"))
+                getattr(args, "opd_routing_policy", "reward_gate"),
+                getattr(args, "opd_gate_stat", "best"),
+                getattr(args, "opd_gate_fail_action", "rl"))
     logger.info("  OPD relay transport=%s  server=%s  namespace=%s  timeout=%ss",
                 getattr(args, "opd_transport", "") or "auto",
                 getattr(args, "opd_server", ""),

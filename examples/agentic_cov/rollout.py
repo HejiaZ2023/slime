@@ -577,6 +577,14 @@ def _best_entry(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
     return max(entries, key=_entry_reward)
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(float(value) for value in values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
 def _teacher_entry_name(entry: dict[str, Any] | None) -> str:
     if entry is None:
         return ""
@@ -615,6 +623,7 @@ def _select_opd_routing_decision(
     teacher_entries: list[dict[str, Any]],
     teacher_names: list[str],
     best_student_reward: float,
+    student_rewards: list[float] | None = None,
     rollout_id: int,
     round_idx: int,
     dataset_id: str,
@@ -628,21 +637,118 @@ def _select_opd_routing_decision(
     best_teacher_name = _teacher_entry_name(best_teacher)
     best_teacher_reward = _entry_reward(best_teacher) if best_teacher is not None else -float("inf")
     gate_eps = float(getattr(args, "opd_gate_eps", 0.0) or 0.0)
+    gate_stat = str(getattr(args, "opd_gate_stat", "best") or "best")
+    gate_fail_action = str(getattr(args, "opd_gate_fail_action", "rl") or "rl")
 
     arm = "rl"
     gate_pass = False
+    gate_reason = ""
+    gate_teacher_name = ""
+    student_gate_reward: float | None = best_student_reward
+    selected_teacher_gate_reward: float | None = None
+    teacher_gate_rewards: dict[str, float] = {}
+    gate_invalid_reasons: list[str] = []
     reward_used_for_decision = False
     random_choice_index = None
     random_choice_hash = ""
     random_choices: list[str] = []
 
     if policy == "reward_gate":
-        gate_pass = bool(best_teacher_name) and best_teacher_reward > best_student_reward + gate_eps
-        arm = best_teacher_name if gate_pass else "rl"
         reward_used_for_decision = True
+        if gate_stat == "best":
+            gate_teacher_name = best_teacher_name
+            selected_teacher_gate_reward = (
+                best_teacher_reward if best_teacher_name else None
+            )
+            gate_pass = (
+                bool(gate_teacher_name)
+                and selected_teacher_gate_reward is not None
+                and selected_teacher_gate_reward > best_student_reward + gate_eps
+            )
+            gate_reason = (
+                "teacher_better"
+                if gate_pass
+                else "teacher_not_better"
+                if gate_teacher_name
+                else "no_teacher"
+            )
+            arm = gate_teacher_name if gate_pass else "rl"
+        elif gate_stat == "median":
+            configured_counts: dict[str, int] = {}
+            for spec in parse_teacher_specs(getattr(args, "opd_teachers", "")):
+                if spec.n > 0:
+                    configured_counts[spec.name] = configured_counts.get(spec.name, 0) + spec.n
+
+            values = [
+                float(value)
+                for value in (
+                    student_rewards
+                    if student_rewards is not None
+                    else [best_student_reward]
+                )
+            ]
+            expected_students = int(
+                getattr(args, "n_samples_per_prompt", len(values)) or len(values)
+            )
+            if len(values) != expected_students:
+                gate_invalid_reasons.append(
+                    f"student_count={len(values)} expected={expected_students}"
+                )
+            elif not values or not all(math.isfinite(value) for value in values):
+                gate_invalid_reasons.append("student_rewards_nonfinite_or_empty")
+            else:
+                student_gate_reward = _median(values)
+
+            for teacher_name in teacher_names:
+                entries = [
+                    entry
+                    for entry in teacher_entries
+                    if _teacher_entry_name(entry) == teacher_name
+                ]
+                expected = configured_counts.get(teacher_name)
+                rewards = [_entry_reward(entry) for entry in entries]
+                if expected is None or expected <= 0:
+                    gate_invalid_reasons.append(
+                        f"{teacher_name}_count={len(entries)} expected=missing"
+                    )
+                    continue
+                if len(entries) != expected:
+                    gate_invalid_reasons.append(
+                        f"{teacher_name}_count={len(entries)} expected={expected}"
+                    )
+                    continue
+                if not rewards or not all(math.isfinite(value) for value in rewards):
+                    gate_invalid_reasons.append(f"{teacher_name}_rewards_nonfinite_or_empty")
+                    continue
+                teacher_gate_rewards[teacher_name] = _median(rewards)
+
+            if not teacher_names:
+                gate_invalid_reasons.append("teacher_names_empty")
+            if gate_invalid_reasons:
+                gate_reason = "median_inputs_invalid"
+            else:
+                gate_teacher_name = max(
+                    teacher_names,
+                    key=lambda name: teacher_gate_rewards[name],
+                )
+                selected_teacher_gate_reward = teacher_gate_rewards[gate_teacher_name]
+                gate_pass = (
+                    student_gate_reward is not None
+                    and (
+                        selected_teacher_gate_reward
+                        - student_gate_reward
+                        - gate_eps
+                    )
+                    > 1e-12
+                )
+                gate_reason = "teacher_better" if gate_pass else "teacher_not_better"
+                arm = gate_teacher_name if gate_pass else "rl"
+        else:
+            raise ValueError(f"unsupported OPD gate statistic: {gate_stat}")
     elif policy == "always_best":
         arm = best_teacher_name or "rl"
         gate_pass = bool(best_teacher_name)
+        gate_reason = "policy_teacher" if gate_pass else "no_teacher"
         reward_used_for_decision = True
     elif policy == "random_teacher":
         random_choices = teacher_names
@@ -656,6 +762,7 @@ def _select_opd_routing_decision(
         )
         arm = selected or "rl"
         gate_pass = selected is not None
+        gate_reason = "policy_teacher" if gate_pass else "no_teacher"
     elif policy == "random_source":
         random_choices = ["rl", *teacher_names]
         selected, random_choice_index, random_choice_hash = _stable_opd_choice(
@@ -668,6 +775,7 @@ def _select_opd_routing_decision(
         )
         arm = selected or "rl"
         gate_pass = selected is not None and selected != "rl"
+        gate_reason = "policy_teacher" if gate_pass else "routing_policy_rl"
     else:
         raise ValueError(f"unsupported OPD routing policy: {policy}")
 
@@ -683,6 +791,14 @@ def _select_opd_routing_decision(
         "policy": policy,
         "arm": arm,
         "gate_pass": bool(gate_pass),
+        "gate_stat": gate_stat,
+        "gate_fail_action": gate_fail_action,
+        "gate_reason": gate_reason,
+        "gate_teacher_name": gate_teacher_name,
+        "student_gate_reward": student_gate_reward,
+        "teacher_gate_rewards": teacher_gate_rewards,
+        "selected_teacher_gate_reward": selected_teacher_gate_reward,
+        "gate_invalid_reasons": gate_invalid_reasons,
         "reward_used_for_decision": bool(reward_used_for_decision),
         "selected_teacher_name": selected_teacher_name,
         "selected_teacher_reward": selected_teacher_reward,
@@ -692,6 +808,35 @@ def _select_opd_routing_decision(
         "random_choice_hash": random_choice_hash,
         "random_choices": random_choices,
     }
+
+
+def _apply_opd_gate_fail_action(
+    *,
+    args: Namespace,
+    group: list[Sample],
+    routing_policy: str,
+    gate_reason: str,
+) -> bool:
+    """Skip only a valid reward-gate rejection; infrastructure failures remain RL."""
+    action = str(getattr(args, "opd_gate_fail_action", "rl") or "rl")
+    if not (
+        routing_policy == "reward_gate"
+        and gate_reason == "teacher_not_better"
+        and action == "skip"
+    ):
+        return False
+
+    for sample in group:
+        sample.metadata = dict(sample.metadata or {})
+        sample.metadata["opd_gate_skip"] = True
+        sample.metadata["opd_skip_reason"] = gate_reason
+        sample.remove_sample = True
+        _set_train_loss_type(
+            sample,
+            "skip",
+            skip_reason=f"opd_gate_{gate_reason}",
+        )
+    return True
 
 
 def _make_teacher_sample(
@@ -1198,6 +1343,7 @@ async def _score_group_with_opd_relay(
         teacher_entries=teacher_entries,
         teacher_names=_opd_score_teacher_names(args),
         best_student_reward=best_student_reward,
+        student_rewards=[float(sample.reward or 0.0) for sample in group],
         rollout_id=rollout_id,
         round_idx=round_idx,
         dataset_id=dataset_id,
@@ -1209,6 +1355,9 @@ async def _score_group_with_opd_relay(
     best_teacher_reward = float(decision["best_teacher_reward"])
     gate_eps = float(getattr(args, "opd_gate_eps", 0.0) or 0.0)
     gate_pass = bool(decision["gate_pass"])
+    gate_reason = str(decision["gate_reason"])
+    student_gate_reward = decision["student_gate_reward"]
+    selected_teacher_gate_reward = decision["selected_teacher_gate_reward"]
 
     for sample in group:
         sample.metadata["opd_job_id"] = job_id
@@ -1217,6 +1366,14 @@ async def _score_group_with_opd_relay(
         sample.metadata["opd_routing_policy"] = routing_policy
         sample.metadata["opd_policy_arm"] = policy_arm
         sample.metadata["opd_policy_gate_pass"] = gate_pass
+        sample.metadata["opd_gate_stat"] = decision["gate_stat"]
+        sample.metadata["opd_gate_fail_action"] = decision["gate_fail_action"]
+        sample.metadata["opd_gate_reason"] = gate_reason
+        sample.metadata["opd_gate_teacher"] = decision["gate_teacher_name"]
+        sample.metadata["opd_student_gate_reward"] = student_gate_reward
+        sample.metadata["opd_teacher_gate_rewards"] = dict(decision["teacher_gate_rewards"])
+        sample.metadata["opd_selected_teacher_gate_reward"] = selected_teacher_gate_reward
+        sample.metadata["opd_gate_invalid_reasons"] = list(decision["gate_invalid_reasons"])
         sample.metadata["opd_reward_used_for_decision"] = bool(decision["reward_used_for_decision"])
         sample.metadata["opd_selected_teacher"] = selected_teacher_name
         sample.metadata["opd_random_choice_index"] = decision["random_choice_index"]
@@ -1224,8 +1381,6 @@ async def _score_group_with_opd_relay(
         sample.metadata["opd_random_choices"] = list(decision["random_choices"])
         if selected_teacher_reward is not None:
             sample.metadata["opd_selected_teacher_reward"] = float(selected_teacher_reward)
-        if routing_policy == "random_source" and policy_arm == "rl":
-            sample.metadata["opd_gate_reason"] = "routing_policy_rl"
         sample.metadata["opd_group_gate_pass"] = bool(gate_pass)
         sample.metadata["opd_gate_pass"] = bool(gate_pass)
 
@@ -1233,7 +1388,9 @@ async def _score_group_with_opd_relay(
         "OPD_GATE step=%d dataset_id=%s round=%d job=%s gate=%s "
         "best_student=%.4f best_teacher=%.4f eps=%.4f n_teachers=%d teacher_job=%s "
         "policy=%s arm=%s selected_teacher=%s selected_teacher_reward=%s "
-        "reward_used=%s random_index=%s random_hash=%s choices=%s",
+        "gate_stat=%s gate_action=%s gate_reason=%s gate_teacher=%s "
+        "student_gate_reward=%s selected_teacher_gate_reward=%s teacher_gate_rewards=%s "
+        "gate_invalid=%s reward_used=%s random_index=%s random_hash=%s choices=%s",
         rollout_id,
         dataset_id,
         round_idx + 1,
@@ -1248,6 +1405,18 @@ async def _score_group_with_opd_relay(
         policy_arm,
         selected_teacher_name or "none",
         "n/a" if selected_teacher_reward is None else f"{float(selected_teacher_reward):.4f}",
+        decision["gate_stat"],
+        decision["gate_fail_action"],
+        gate_reason,
+        decision["gate_teacher_name"] or "none",
+        "n/a" if student_gate_reward is None else f"{float(student_gate_reward):.4f}",
+        (
+            "n/a"
+            if selected_teacher_gate_reward is None
+            else f"{float(selected_teacher_gate_reward):.4f}"
+        ),
+        json.dumps(decision["teacher_gate_rewards"], sort_keys=True),
+        ",".join(decision["gate_invalid_reasons"]) or "none",
         bool(decision["reward_used_for_decision"]),
         decision["random_choice_index"],
         decision["random_choice_hash"] or "none",
@@ -1549,14 +1718,45 @@ async def _score_group_with_opd_relay(
 
         for sample in eligible_samples:
             sample.metadata["opd_gate_pass"] = False
-            sample.metadata.setdefault(
-                "opd_gate_reason",
-                "missing_teacher_topk_log_probs" if require_topk else "missing_teacher_log_probs",
+            fallback_reason = (
+                "missing_teacher_topk_log_probs"
+                if require_topk
+                else "missing_teacher_log_probs"
             )
+            if sample.metadata.get("opd_gate_reason") in {
+                None,
+                "teacher_better",
+                "policy_teacher",
+            }:
+                sample.metadata["opd_gate_reason"] = fallback_reason
             _set_train_loss_type(sample, "rl")
         _log_score_timing("gate_pass_but_missing_teacher_logprobs")
     else:
-        outcome = "policy_rl" if routing_policy == "random_source" and policy_arm == "rl" else "rl_fallback"
+        skipped = _apply_opd_gate_fail_action(
+            args=args,
+            group=group,
+            routing_policy=routing_policy,
+            gate_reason=gate_reason,
+        )
+        if skipped:
+            logger.info(
+                "OPD_GATE_SKIP step=%d dataset_id=%s round=%d job=%s samples=%d "
+                "gate_stat=%s gate_reason=%s",
+                rollout_id,
+                dataset_id,
+                round_idx + 1,
+                job_id,
+                len(group),
+                decision["gate_stat"],
+                gate_reason,
+            )
+            outcome = "gate_skip"
+        else:
+            outcome = (
+                "policy_rl"
+                if routing_policy == "random_source" and policy_arm == "rl"
+                else "rl_fallback"
+            )
         _log_score_timing(outcome)
 
     return group, group
